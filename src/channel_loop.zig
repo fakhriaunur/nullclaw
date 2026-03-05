@@ -75,7 +75,10 @@ fn processTelegramMessage(
         .group_id = if (is_group) sender else null,
     };
 
-    const reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
+    var stream_ctx = telegram.TelegramChannel.StreamCtx{ .tg_ptr = tg_ptr, .chat_id = sender };
+    const sink = tg_ptr.makeSink(&stream_ctx);
+
+    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
         log.err("Agent error: {}", .{err});
         const err_msg: []const u8 = switch (err) {
             error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
@@ -85,16 +88,27 @@ fn processTelegramMessage(
             error.OutOfMemory => "Out of memory.",
             else => "An error occurred. Try again or /new for a fresh session.",
         };
+        if (sink != null) {
+            tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch {};
+        }
         tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
         return;
     };
     defer allocator.free(reply);
 
     if (shouldSuppressGroupReply(is_group, reply)) {
+        if (sink != null) {
+            tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch {};
+        }
         log.info("Smart reply: skipping non-essential message", .{});
         return;
     }
 
+    if (sink != null) {
+        tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch |err| {
+            log.warn("Draft cleanup error: {}", .{err});
+        };
+    }
     tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
         log.warn("Send error: {}", .{err});
     };
@@ -143,6 +157,7 @@ fn messageTaskWorker(task_ptr: *MessageTask) void {
     }
     task_ptr.run();
 }
+
 const TELEGRAM_OFFSET_STORE_VERSION: i64 = 1;
 
 fn extractTelegramBotId(bot_token: []const u8) ?[]const u8 {
