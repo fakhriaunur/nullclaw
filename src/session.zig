@@ -11,7 +11,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
-const Agent = @import("agent/root.zig").Agent;
+const agent_mod = @import("agent/root.zig");
+const Agent = agent_mod.Agent;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
@@ -36,15 +37,11 @@ fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bo
     return .{ .slice = text[0..MESSAGE_LOG_MAX_BYTES], .truncated = true };
 }
 
-fn estimateTextTokens(text: []const u8) u32 {
-    return @intCast((text.len + 3) / 4);
-}
-
 fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
     var total: u64 = 0;
     for (entries) |entry| {
         if (!std.mem.eql(u8, entry.role, "assistant")) continue;
-        total += estimateTextTokens(entry.content);
+        total += agent_mod.estimate_text_tokens(entry.content);
     }
     return total;
 }
@@ -1280,7 +1277,7 @@ test "restored session reconstructs token count from persisted assistant replies
     });
     defer testing.allocator.free(reply);
 
-    const expected_tokens = estimateTextTokens("assistant reply");
+    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
     const first_session = try sm.getOrCreate(session_key);
     try testing.expectEqual(@as(u64, expected_tokens), first_session.agent.total_tokens);
 
@@ -1339,7 +1336,7 @@ test "restored session token reconstruction ignores usage footer decorations" {
     try testing.expectEqualStrings("assistant", entries[1].role);
     try testing.expectEqualStrings("assistant reply", entries[1].content);
 
-    const expected_tokens = estimateTextTokens("assistant reply");
+    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
     session.last_active = 0;
     try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
 

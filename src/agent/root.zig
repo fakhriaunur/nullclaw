@@ -49,7 +49,7 @@ const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
 
-fn estimate_text_tokens(text: []const u8) u32 {
+pub fn estimate_text_tokens(text: []const u8) u32 {
     return @intCast((text.len + 3) / 4);
 }
 
