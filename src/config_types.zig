@@ -209,11 +209,26 @@ pub const ToolsConfig = struct {
     web_fetch_max_chars: u32 = 100_000,
 };
 
+pub const ModelRouteCostClass = enum {
+    free,
+    cheap,
+    standard,
+    premium,
+};
+
+pub const ModelRouteQuotaClass = enum {
+    unlimited,
+    normal,
+    constrained,
+};
+
 pub const ModelRouteConfig = struct {
     hint: []const u8,
     provider: []const u8,
     model: []const u8,
     api_key: ?[]const u8 = null,
+    cost_class: ModelRouteCostClass = .standard,
+    quota_class: ModelRouteQuotaClass = .normal,
 };
 
 pub const HeartbeatConfig = struct {

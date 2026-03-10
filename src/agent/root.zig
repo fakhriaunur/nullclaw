@@ -862,6 +862,25 @@ pub const Agent = struct {
         return self.findUsableModelRouteByHint(hint, now_ms) != null;
     }
 
+    fn routeCostClassLabel(route: config_types.ModelRouteConfig) []const u8 {
+        return @tagName(route.cost_class);
+    }
+
+    fn routeQuotaClassLabel(route: config_types.ModelRouteConfig) []const u8 {
+        return @tagName(route.quota_class);
+    }
+
+    fn activeDegradedRouteForStatus(
+        self: *const Agent,
+        route: config_types.ModelRouteConfig,
+        now_ms: i64,
+    ) ?*const DegradedRoute {
+        for (self.degraded_routes.items) |*entry| {
+            if (entry.until_ms > now_ms and degradedRouteMatches(entry, route)) return entry;
+        }
+        return null;
+    }
+
     const RouteSelection = struct {
         hint: []const u8,
         route: config_types.ModelRouteConfig,
@@ -1239,6 +1258,27 @@ pub const Agent = struct {
         }
 
         const now_ms = std.time.milliTimestamp();
+        if (self.model_routes.len > 0) {
+            try w.writeAll("\nAuto routes:");
+            for (self.model_routes) |route| {
+                try w.print(
+                    "\n  - {s} -> {s}/{s} (cost={s}, quota={s})",
+                    .{
+                        route.hint,
+                        route.provider,
+                        route.model,
+                        routeCostClassLabel(route),
+                        routeQuotaClassLabel(route),
+                    },
+                );
+                if (self.activeDegradedRouteForStatus(route, now_ms)) |entry| {
+                    const remaining_ms = @max(@as(i64, 0), entry.until_ms - now_ms);
+                    const remaining_secs: u64 = @intCast(@divFloor(remaining_ms + 999, 1000));
+                    try w.print(" [degraded: {s}; {d}s remaining]", .{ entry.reason, remaining_secs });
+                }
+            }
+        }
+
         var wrote_degraded_routes = false;
         for (self.degraded_routes.items) |entry| {
             if (entry.until_ms <= now_ms) continue;
@@ -4200,8 +4240,20 @@ test "auto route records last route trace for short structured prompt" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
     agent.model_routes = &.{
-        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
-        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+        .{
+            .hint = "fast",
+            .provider = "groq",
+            .model = "llama-3.3-8b",
+            .cost_class = .free,
+            .quota_class = .unlimited,
+        },
+        .{
+            .hint = "balanced",
+            .provider = "openrouter",
+            .model = "anthropic/claude-sonnet-4",
+            .cost_class = .standard,
+            .quota_class = .normal,
+        },
     };
 
     const routed = (try agent.routeModelNameForTurn(
@@ -4226,8 +4278,20 @@ test "model status reports last auto-route trace" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
     agent.model_routes = &.{
-        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
-        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+        .{
+            .hint = "fast",
+            .provider = "groq",
+            .model = "llama-3.3-8b",
+            .cost_class = .free,
+            .quota_class = .unlimited,
+        },
+        .{
+            .hint = "balanced",
+            .provider = "openrouter",
+            .model = "anthropic/claude-sonnet-4",
+            .cost_class = .standard,
+            .quota_class = .normal,
+        },
     };
 
     const routed = (try agent.routeModelNameForTurn(
@@ -4241,6 +4305,8 @@ test "model status reports last auto-route trace" {
 
     try std.testing.expect(std.mem.indexOf(u8, status, "Auto-routing: configured") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "Last auto-route: fast -> groq/llama-3.3-8b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Auto routes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "cost=free, quota=unlimited") != null);
 }
 
 test "auto route skips degraded fast route after rate limit" {

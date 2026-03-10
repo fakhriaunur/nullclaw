@@ -116,16 +116,18 @@ Example:
 - Recognized routing hints in the current daemon are `fast`, `balanced`, `deep`, `reasoning`, and `vision`.
 - `balanced` is the normal fallback when configured. `fast` is preferred for short status/list/check prompts and other short structured tasks such as extraction, counting, classification, or narrow return-only transforms. `deep` and `reasoning` are preferred for investigation, planning, tradeoff analysis, and longer contexts. `vision` is used for image turns.
 - `api_key` is optional. If omitted, NullClaw uses the normal credential from `models.providers.<provider>`.
+- `cost_class` is optional metadata with values `free`, `cheap`, `standard`, or `premium`.
+- `quota_class` is optional metadata with values `unlimited`, `normal`, or `constrained`.
 
 Example:
 
 ```json
 {
   "model_routes": [
-    { "hint": "fast", "provider": "groq", "model": "llama-3.3-70b" },
-    { "hint": "balanced", "provider": "openrouter", "model": "anthropic/claude-sonnet-4" },
-    { "hint": "deep", "provider": "openrouter", "model": "anthropic/claude-opus-4" },
-    { "hint": "vision", "provider": "openrouter", "model": "openai/gpt-4.1" }
+    { "hint": "fast", "provider": "groq", "model": "llama-3.3-70b", "cost_class": "free", "quota_class": "unlimited" },
+    { "hint": "balanced", "provider": "openrouter", "model": "anthropic/claude-sonnet-4", "cost_class": "standard", "quota_class": "normal" },
+    { "hint": "deep", "provider": "openrouter", "model": "anthropic/claude-opus-4", "cost_class": "premium", "quota_class": "constrained" },
+    { "hint": "vision", "provider": "openrouter", "model": "openai/gpt-4.1", "cost_class": "standard", "quota_class": "normal" }
   ]
 }
 ```

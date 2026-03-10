@@ -102,16 +102,18 @@ nullclaw onboard --interactive
 - 当前 daemon 识别的路由提示词包括：`fast`、`balanced`、`deep`、`reasoning`、`vision`。
 - 配置了 `balanced` 时，它会作为常规兜底路线。`fast` 更适合简短的状态/列表/检查类请求，以及提取、计数、分类、只返回结果这类边界清晰的短结构化任务。`deep` 和 `reasoning` 更适合调查、规划、权衡分析和长上下文。`vision` 用于图片输入回合。
 - `api_key` 是可选的；如果不填，会继续使用 `models.providers.<provider>` 里的常规凭据。
+- `cost_class` 是可选元数据，可选值为 `free`、`cheap`、`standard`、`premium`。
+- `quota_class` 是可选元数据，可选值为 `unlimited`、`normal`、`constrained`。
 
 示例：
 
 ```json
 {
   "model_routes": [
-    { "hint": "fast", "provider": "groq", "model": "llama-3.3-70b" },
-    { "hint": "balanced", "provider": "openrouter", "model": "anthropic/claude-sonnet-4" },
-    { "hint": "deep", "provider": "openrouter", "model": "anthropic/claude-opus-4" },
-    { "hint": "vision", "provider": "openrouter", "model": "openai/gpt-4.1" }
+    { "hint": "fast", "provider": "groq", "model": "llama-3.3-70b", "cost_class": "free", "quota_class": "unlimited" },
+    { "hint": "balanced", "provider": "openrouter", "model": "anthropic/claude-sonnet-4", "cost_class": "standard", "quota_class": "normal" },
+    { "hint": "deep", "provider": "openrouter", "model": "anthropic/claude-opus-4", "cost_class": "premium", "quota_class": "constrained" },
+    { "hint": "vision", "provider": "openrouter", "model": "openai/gpt-4.1", "cost_class": "standard", "quota_class": "normal" }
   ]
 }
 ```

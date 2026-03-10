@@ -36,6 +36,7 @@
 - 在 `nullclaw agent` 里，`/model` 会显示当前模型以及已配置的路由/回退状态。
 - 如果配置了自动路由，`/model` 还会显示最近一次自动路由决策以及选择原因。
 - 如果某条自动路由命中的提供方暂时被限流或额度耗尽，`/model` 会把这条路线标成 degraded，直到冷却结束。
+- `/model` 还会列出已配置的自动路由及其 `cost_class`、`quota_class` 元数据。
 - `/model <provider/model>` 会把当前会话 pin 到该模型，并关闭自动路由。
 - `/model auto` 会清除这个用户 pin，把会话恢复到配置里的默认模型，并让后续回合重新使用 `model_routes`。
 - 如果没有配置 `model_routes`，`/model auto` 仍然会清除 pin，并把会话切回配置里的默认模型。
