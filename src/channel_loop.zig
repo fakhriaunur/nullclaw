@@ -69,8 +69,11 @@ fn processTelegramMessage(
     message_sender_id: []const u8,
 ) void {
     const typing_target = sender;
-    tg_ptr.startTyping(typing_target) catch {};
-    defer tg_ptr.stopTyping(typing_target) catch {};
+    const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
+    defer {
+        tg_ptr.stopTyping(typing_target) catch {};
+        if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
+    }
 
     // Set ScheduleTool context for delivery.
     setScheduleToolContext(runtime.tools, "telegram", tg_ptr.account_id, sender);
@@ -83,7 +86,11 @@ fn processTelegramMessage(
         .group_id = if (is_group) sender else null,
     };
 
-    var stream_ctx = telegram.TelegramChannel.StreamCtx{ .tg_ptr = tg_ptr, .chat_id = sender };
+    var stream_ctx = telegram.TelegramChannel.StreamCtx{
+        .tg_ptr = tg_ptr,
+        .chat_id = sender,
+        .draft_id = draft_turn_id,
+    };
     const sink = tg_ptr.makeSink(&stream_ctx);
 
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
@@ -96,27 +103,16 @@ fn processTelegramMessage(
             error.OutOfMemory => "Out of memory.",
             else => "An error occurred. Try again or /new for a fresh session.",
         };
-        if (sink != null) {
-            tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch {};
-        }
         tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
         return;
     };
     defer allocator.free(reply);
 
     if (shouldSuppressGroupReply(is_group, reply)) {
-        if (sink != null) {
-            tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch {};
-        }
         log.info("Smart reply: skipping non-essential message", .{});
         return;
     }
 
-    if (sink != null) {
-        tg_ptr.channel().sendEvent(sender, "", &.{}, .final) catch |err| {
-            log.warn("Draft cleanup error: {}", .{err});
-        };
-    }
     tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
         log.warn("Send error: {}", .{err});
     };

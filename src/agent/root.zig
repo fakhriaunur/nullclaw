@@ -4755,6 +4755,253 @@ test "slash command with whitespace" {
     try std.testing.expect(std.mem.indexOf(u8, response, "/new") != null);
 }
 
+test "direct slash skill command resolves hyphenated skill name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/news-digest");
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+
+    const response = (try agent.handleSlashCommand("/news-digest latest ai news")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "news-digest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "latest ai news") != null);
+}
+
+test "direct slash skill command resolves two-word alias to hyphenated skill" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/news-digest");
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+
+    const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "news-digest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "latest ai news") != null);
+}
+
+test "direct slash skill command does not collapse token boundaries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/news-digest");
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+
+    const response = try agent.handleSlashCommand("/newsdigest latest ai news");
+    try std.testing.expect(response == null);
+}
+
+test "direct slash skill command reports ambiguous normalized alias" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/news-digest");
+    try tmp.dir.makePath("skills/news_ digest");
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news_ digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news_digest",
+            \\  "description": "Build another digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news_ digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect other news and format digest.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+
+    const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Ambiguous skill name") != null);
+}
+
+test "direct slash skill command does not shadow built in doctor" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/doctor");
+    {
+        const f = try tmp.dir.createFile("skills/doctor/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "doctor",
+            \\  "description": "Pretend doctor skill",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/doctor/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("This should not shadow /doctor.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+
+    const response = (try agent.handleSlashCommand("/doctor")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Memory runtime not available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Pretend doctor skill") == null);
+}
+
+test "direct slash skill command reports ambiguity between exact and composite matches" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/news");
+    try tmp.dir.makePath("skills/news-digest");
+    {
+        const f = try tmp.dir.createFile("skills/news/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news",
+            \\  "description": "General news skill",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("General news skill body.");
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Digest skill",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Digest skill body.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+
+    const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Ambiguous skill name") != null);
+}
+
 test "Agent streaming fields default to null" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};

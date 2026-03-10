@@ -14,6 +14,7 @@ const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
 const version = @import("../version.zig");
+const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
 const parseSlashCommand = control_plane.parseSlashCommand;
@@ -603,6 +604,183 @@ fn splitFirstToken(arg: []const u8) struct { head: []const u8, tail: []const u8 
         .head = trimmed[0..i],
         .tail = std.mem.trim(u8, trimmed[i + 1 ..], " \t"),
     };
+}
+
+fn isSkillNameSeparator(ch: u8) bool {
+    return ch == '-' or ch == '_' or std.ascii.isWhitespace(ch);
+}
+
+fn nextSkillNameToken(name: []const u8, index: *usize) ?[]const u8 {
+    while (index.* < name.len and isSkillNameSeparator(name[index.*])) : (index.* += 1) {}
+    if (index.* >= name.len) return null;
+
+    const start = index.*;
+    while (index.* < name.len and !isSkillNameSeparator(name[index.*])) : (index.* += 1) {}
+    return name[start..index.*];
+}
+
+fn skillNamesEqualNormalized(left: []const u8, right: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+
+    while (true) {
+        const left_token = nextSkillNameToken(left, &i);
+        const right_token = nextSkillNameToken(right, &j);
+
+        if (left_token == null or right_token == null) {
+            return left_token == null and right_token == null;
+        }
+        if (!std.ascii.eqlIgnoreCase(left_token.?, right_token.?)) return false;
+    }
+}
+
+const SkillLookup = union(enum) {
+    not_found,
+    ambiguous,
+    unique: *const skills_mod.Skill,
+};
+
+fn findSkillByExactName(skills: []const skills_mod.Skill, name: []const u8) ?*const skills_mod.Skill {
+    for (skills) |*skill| {
+        if (std.ascii.eqlIgnoreCase(skill.name, name)) return skill;
+    }
+    return null;
+}
+
+fn findSkillByNameNormalized(skills: []const skills_mod.Skill, name: []const u8) SkillLookup {
+    if (findSkillByExactName(skills, name)) |skill| {
+        return .{ .unique = skill };
+    }
+
+    var match: ?*const skills_mod.Skill = null;
+    for (skills) |*skill| {
+        if (!skillNamesEqualNormalized(skill.name, name)) continue;
+        if (match != null) return .ambiguous;
+        match = skill;
+    }
+
+    if (match) |skill| return .{ .unique = skill };
+    return .not_found;
+}
+
+fn formatAmbiguousSkillName(self: anytype, name: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(self.allocator, "Ambiguous skill name: {s}", .{name});
+}
+
+const DirectSkillCommandMatch = struct {
+    skill: *const skills_mod.Skill,
+    user_input: []const u8,
+};
+
+fn registerDirectSkillCommandMatch(
+    match: *?DirectSkillCommandMatch,
+    skill: *const skills_mod.Skill,
+    user_input: []const u8,
+) bool {
+    if (match.*) |existing| {
+        if (existing.skill != skill) return false;
+        return true;
+    }
+    match.* = .{
+        .skill = skill,
+        .user_input = user_input,
+    };
+    return true;
+}
+
+fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_input: []const u8) ![]const u8 {
+    if (!skill.available) {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Skill {s} is unavailable: {s}",
+            .{ skill.name, skill.missing_deps },
+        );
+    }
+
+    if (user_input.len == 0) {
+        if (skill.instructions.len > 0) {
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Skill {s}: {s}\nUsage: /skill {s} <task>",
+                .{ skill.name, if (skill.description.len > 0) skill.description else "no description", skill.name },
+            );
+        }
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Skill {s} has no instructions. Usage: /skill {s} <task>",
+            .{ skill.name, skill.name },
+        );
+    }
+
+    const composed = if (skill.instructions.len > 0)
+        try std.fmt.allocPrint(
+            self.allocator,
+            "Apply the skill `{s}`.\n\nSkill instructions:\n{s}\n\nTask:\n{s}",
+            .{ skill.name, skill.instructions, user_input },
+        )
+    else
+        try std.fmt.allocPrint(
+            self.allocator,
+            "Apply the skill `{s}`.\n\nTask:\n{s}",
+            .{ skill.name, user_input },
+        );
+    defer self.allocator.free(composed);
+
+    if (findSubagentManager(self) != null) {
+        return try spawnSubagentTask(self, composed, skill.name, null);
+    }
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "Skill prompt prepared for `{s}` (spawn tool is disabled):\n{s}",
+        .{ skill.name, composed },
+    );
+}
+
+fn tryHandleDirectSkillCommand(self: anytype, cmd: SlashCommand) !?[]const u8 {
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch return null;
+    defer skills_mod.freeSkills(self.allocator, skills);
+
+    var resolved: ?DirectSkillCommandMatch = null;
+
+    switch (findSkillByNameNormalized(skills, cmd.name)) {
+        .unique => |skill| {
+            if (!registerDirectSkillCommandMatch(&resolved, skill, cmd.arg)) {
+                return try formatAmbiguousSkillName(self, cmd.name);
+            }
+        },
+        .ambiguous => return try formatAmbiguousSkillName(self, cmd.name),
+        .not_found => {},
+    }
+
+    var composite = std.ArrayListUnmanaged(u8).empty;
+    defer composite.deinit(self.allocator);
+    try composite.appendSlice(self.allocator, cmd.name);
+
+    var remaining = cmd.arg;
+    while (true) {
+        const parsed_arg = splitFirstToken(remaining);
+        if (parsed_arg.head.len == 0) break;
+
+        try composite.append(self.allocator, ' ');
+        try composite.appendSlice(self.allocator, parsed_arg.head);
+
+        switch (findSkillByNameNormalized(skills, composite.items)) {
+            .unique => |skill| {
+                if (!registerDirectSkillCommandMatch(&resolved, skill, parsed_arg.tail)) {
+                    return try formatAmbiguousSkillName(self, composite.items);
+                }
+            },
+            .ambiguous => return try formatAmbiguousSkillName(self, composite.items),
+            .not_found => {},
+        }
+
+        remaining = parsed_arg.tail;
+    }
+
+    if (resolved) |match| {
+        return try executeSkillInvocation(self, match.skill, match.user_input);
+    }
+    return null;
 }
 
 const SUBAGENTS_SPAWN_USAGE = "Usage: /subagents spawn [--agent <name>|--agent=<name>] <task>";
@@ -1518,6 +1696,7 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     if (self.exec_security == .allowlist) {
         if (self.policy) |pol| {
             if (!pol.isCommandAllowed(command)) {
+                log.warn("exec blocked by allowlist policy: {s}", .{command});
                 return try self.allocator.dupe(u8, "Exec blocked by allowlist policy");
             }
         }
@@ -2340,62 +2519,11 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try out.toOwnedSlice(self.allocator);
     }
 
-    var selected: ?*const skills_mod.Skill = null;
-    for (skills) |*skill| {
-        if (std.ascii.eqlIgnoreCase(skill.name, action_or_name)) {
-            selected = skill;
-            break;
-        }
+    switch (findSkillByNameNormalized(skills, action_or_name)) {
+        .unique => |skill| return try executeSkillInvocation(self, skill, std.mem.trim(u8, parsed.tail, " \t")),
+        .ambiguous => return try formatAmbiguousSkillName(self, action_or_name),
+        .not_found => return try std.fmt.allocPrint(self.allocator, "Skill not found: {s}", .{action_or_name}),
     }
-    const skill = selected orelse
-        return try std.fmt.allocPrint(self.allocator, "Skill not found: {s}", .{action_or_name});
-
-    if (!skill.available) {
-        return try std.fmt.allocPrint(
-            self.allocator,
-            "Skill {s} is unavailable: {s}",
-            .{ skill.name, skill.missing_deps },
-        );
-    }
-
-    const user_input = std.mem.trim(u8, parsed.tail, " \t");
-    if (user_input.len == 0) {
-        if (skill.instructions.len > 0) {
-            return try std.fmt.allocPrint(
-                self.allocator,
-                "Skill {s}: {s}\nUsage: /skill {s} <task>",
-                .{ skill.name, if (skill.description.len > 0) skill.description else "no description", skill.name },
-            );
-        }
-        return try std.fmt.allocPrint(
-            self.allocator,
-            "Skill {s} has no instructions. Usage: /skill {s} <task>",
-            .{ skill.name, skill.name },
-        );
-    }
-
-    const composed = if (skill.instructions.len > 0)
-        try std.fmt.allocPrint(
-            self.allocator,
-            "Apply the skill `{s}`.\n\nSkill instructions:\n{s}\n\nTask:\n{s}",
-            .{ skill.name, skill.instructions, user_input },
-        )
-    else
-        try std.fmt.allocPrint(
-            self.allocator,
-            "Apply the skill `{s}`.\n\nTask:\n{s}",
-            .{ skill.name, user_input },
-        );
-    defer self.allocator.free(composed);
-
-    if (findSubagentManager(self) != null) {
-        return try spawnSubagentTask(self, composed, skill.name, null);
-    }
-    return try std.fmt.allocPrint(
-        self.allocator,
-        "Skill prompt prepared for `{s}` (spawn tool is disabled):\n{s}",
-        .{ skill.name, composed },
-    );
 }
 
 fn handleBashCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -2438,6 +2566,7 @@ pub fn execBlockMessage(self: anytype, args: std.json.ObjectMap) ?[]const u8 {
                 const command = v.string;
                 if (self.policy) |pol| {
                     if (!pol.isCommandAllowed(command)) {
+                        log.warn("tool exec blocked by allowlist policy: {s}", .{command});
                         return "Exec blocked by allowlist policy";
                     }
                 }
@@ -2586,7 +2715,10 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .skill => return try handleSkillCommand(self, cmd.arg),
         .doctor => return try handleDoctorCommand(self),
         .memory => return try handleMemoryCommand(self, cmd.arg),
-        .unknown => return null,
+        .unknown => {
+            if (try tryHandleDirectSkillCommand(self, cmd)) |response| return response;
+            return null;
+        },
     }
 }
 

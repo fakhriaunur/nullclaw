@@ -278,6 +278,26 @@ pub fn responseHasTelegramError(resp: []const u8) bool {
         std.mem.indexOf(u8, resp, "\"ok\":false") != null;
 }
 
+pub fn responseIsMessageTooLong(resp: []const u8) bool {
+    return std.mem.indexOf(u8, resp, "MESSAGE_TOO_LONG") != null or
+        std.mem.indexOf(u8, resp, "message is too long") != null;
+}
+
+pub fn parseRetryAfterSecs(allocator: std.mem.Allocator, resp: []const u8) ?u32 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const parameters_val = parsed.value.object.get("parameters") orelse return null;
+    if (parameters_val != .object) return null;
+
+    const retry_after_val = parameters_val.object.get("retry_after") orelse return null;
+    return switch (retry_after_val) {
+        .integer => |value| if (value >= 0) @as(u32, @intCast(value)) else null,
+        else => null,
+    };
+}
+
 pub fn parseSentMessageMeta(allocator: std.mem.Allocator, resp: []const u8) ?SentMessageMeta {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return null;
     defer parsed.deinit();
@@ -328,6 +348,23 @@ test "telegram api client builds method url" {
 test "telegram api responseHasTelegramError matches error payloads" {
     try std.testing.expect(responseHasTelegramError("{\"ok\":false,\"error_code\":400}"));
     try std.testing.expect(!responseHasTelegramError("{\"ok\":true,\"result\":{}}"));
+}
+
+test "telegram api responseIsMessageTooLong matches telegram payloads" {
+    try std.testing.expect(responseIsMessageTooLong(
+        "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: MESSAGE_TOO_LONG\"}",
+    ));
+    try std.testing.expect(!responseIsMessageTooLong(
+        "{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests\"}",
+    ));
+}
+
+test "telegram api parseRetryAfterSecs extracts retry_after" {
+    const retry_after = parseRetryAfterSecs(
+        std.testing.allocator,
+        "{\"ok\":false,\"error_code\":429,\"parameters\":{\"retry_after\":12}}",
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 12), retry_after);
 }
 
 test "telegram api parseSentMessageMeta extracts message id" {
