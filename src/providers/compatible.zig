@@ -12,6 +12,7 @@ const ToolCall = root.ToolCall;
 const TokenUsage = root.TokenUsage;
 
 const log = std.log.scoped(.compatible);
+const MAX_STREAMING_PROMPT_BYTES: usize = 32 * 1024;
 
 fn logCompatibleApiError(
     allocator: std.mem.Allocator,
@@ -53,6 +54,8 @@ pub const AuthStyle = enum {
 pub const OpenAiCompatibleProvider = struct {
     name: []const u8,
     base_url: []const u8,
+    /// Optional owned copy of base_url when the caller had to normalize/build it.
+    owned_base_url: ?[]u8 = null,
     api_key: ?[]const u8,
     auth_style: AuthStyle,
     /// Custom header name when auth_style is .custom (e.g. "X-Custom-Key").
@@ -184,6 +187,22 @@ pub const OpenAiCompatibleProvider = struct {
             }
         }
         return capped_request;
+    }
+
+    fn estimateRequestTextBytes(request: ChatRequest) usize {
+        var total: usize = 0;
+        for (request.messages) |msg| {
+            total += msg.content.len;
+            if (msg.content_parts) |parts| {
+                for (parts) |part| {
+                    switch (part) {
+                        .text => |t| total += t.len,
+                        else => {},
+                    }
+                }
+            }
+        }
+        return total;
     }
 
     /// Build a Responses API request JSON body.
@@ -598,6 +617,7 @@ pub const OpenAiCompatibleProvider = struct {
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
         .supports_vision = supportsVisionImpl,
+        .supports_vision_for_model = supportsVisionForModelImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .stream_chat = streamChatImpl,
@@ -615,6 +635,24 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror!root.StreamChatResult {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
+        const request_text_bytes = estimateRequestTextBytes(request);
+
+        if (request_text_bytes >= MAX_STREAMING_PROMPT_BYTES) {
+            log.warn(
+                "{s} streaming skipped for large request ({d} bytes >= {d}); using non-streaming",
+                .{ self.name, request_text_bytes, MAX_STREAMING_PROMPT_BYTES },
+            );
+            const fallback = try chatImpl(ptr, allocator, request, model, temperature);
+            if (fallback.content) |text| {
+                callback(callback_ctx, root.StreamChunk.textDelta(text));
+            }
+            callback(callback_ctx, root.StreamChunk.finalChunk());
+            return .{
+                .content = fallback.content,
+                .usage = fallback.usage,
+                .model = fallback.model,
+            };
+        }
 
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
@@ -659,7 +697,7 @@ pub const OpenAiCompatibleProvider = struct {
             .downstream_ctx = callback_ctx,
         };
 
-        var result = try sse.curlStream(
+        var result = sse.curlStream(
             allocator,
             url,
             body,
@@ -668,7 +706,22 @@ pub const OpenAiCompatibleProvider = struct {
             request.timeout_secs,
             streamThinkSanitizeCallback,
             @ptrCast(&sanitize_ctx),
-        );
+        ) catch |err| {
+            if (err == error.CurlWaitError or err == error.CurlFailed) {
+                log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
+                const fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                if (fallback.content) |text| {
+                    callback(callback_ctx, root.StreamChunk.textDelta(text));
+                }
+                callback(callback_ctx, root.StreamChunk.finalChunk());
+                return .{
+                    .content = fallback.content,
+                    .usage = fallback.usage,
+                    .model = fallback.model,
+                };
+            }
+            return err;
+        };
 
         if (result.content) |raw| {
             const cleaned = try stripThinkBlocks(allocator, raw);
@@ -824,12 +877,24 @@ pub const OpenAiCompatibleProvider = struct {
         return true;
     }
 
+    fn supportsVisionForModelImpl(_: *anyopaque, _: []const u8) bool {
+        // Vision capability is managed by Agent's vision_disabled_models.
+        // Provider assumes all models support vision by default.
+        return true;
+    }
+
     fn getNameImpl(ptr: *anyopaque) []const u8 {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         return self.name;
     }
 
-    fn deinitImpl(_: *anyopaque) void {}
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        if (self.owned_base_url) |owned| {
+            self.allocator.free(owned);
+            self.owned_base_url = null;
+        }
+    }
 };
 
 /// Serialize a single message's content field — delegates to shared helper in providers/helpers.zig.

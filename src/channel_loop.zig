@@ -23,6 +23,8 @@ const subagent_mod = @import("subagent.zig");
 const subagent_runner = @import("subagent_runner.zig");
 const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
+const thread_stacks = @import("thread_stacks.zig");
+const control_plane = @import("control_plane.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -32,11 +34,16 @@ const Atomic = @import("portable_atomic.zig").Atomic;
 const log = std.log.scoped(.channel_loop);
 
 /// Set ScheduleTool's default chat_id for delivery context.
-fn setScheduleToolContext(tools: []const tools_mod.Tool, chat_id: []const u8) void {
+fn setScheduleToolContext(
+    tools: []const tools_mod.Tool,
+    channel: ?[]const u8,
+    account_id: ?[]const u8,
+    chat_id: ?[]const u8,
+) void {
     for (tools) |tool| {
         if (std.mem.eql(u8, tool.name(), "schedule")) {
             const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-            schedule_tool.setContext("telegram", chat_id);
+            schedule_tool.setContext(channel, account_id, chat_id);
             break;
         }
     }
@@ -48,26 +55,6 @@ fn setScheduleToolContext(tools: []const tools_mod.Tool, chat_id: []const u8) vo
 
 fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
     return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
-}
-
-fn isStopLikeCommand(content: []const u8) bool {
-    const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    if (trimmed.len < 5 or trimmed[0] != '/') return false;
-
-    const body = trimmed[1..];
-    var split_idx: usize = 0;
-    while (split_idx < body.len) : (split_idx += 1) {
-        const ch = body[split_idx];
-        if (ch == ':' or ch == ' ' or ch == '\t') break;
-    }
-    if (split_idx == 0) return false;
-
-    const raw_name = body[0..split_idx];
-    const name = if (std.mem.indexOfScalar(u8, raw_name, '@')) |mention_sep|
-        raw_name[0..mention_sep]
-    else
-        raw_name;
-    return std.ascii.eqlIgnoreCase(name, "stop") or std.ascii.eqlIgnoreCase(name, "abort");
 }
 
 fn processTelegramMessage(
@@ -85,8 +72,9 @@ fn processTelegramMessage(
     tg_ptr.startTyping(typing_target) catch {};
     defer tg_ptr.stopTyping(typing_target) catch {};
 
-    // Set ScheduleTool context for delivery
-    setScheduleToolContext(runtime.tools, sender);
+    // Set ScheduleTool context for delivery.
+    setScheduleToolContext(runtime.tools, "telegram", tg_ptr.account_id, sender);
+    defer setScheduleToolContext(runtime.tools, null, null, null);
 
     // Build conversation context for Telegram
     const conversation_context: ?ConversationContext = .{
@@ -636,7 +624,7 @@ pub fn runTelegramLoop(
             if (enable_parallel) {
                 var handled_in_worker = false;
                 parallel_attempt: {
-                    if (isStopLikeCommand(msg.content) and active_worker_threads.get(session_key) != null) {
+                    if (control_plane.isStopLikeCommand(msg.content) and active_worker_threads.get(session_key) != null) {
                         var interrupt = runtime.session_mgr.requestTurnInterrupt(session_key);
                         defer interrupt.deinit(allocator);
                         var dynamic_notice: ?[]u8 = null;
@@ -732,7 +720,7 @@ pub fn runTelegramLoop(
                         .message_sender_id = task_message_sender_id,
                     };
 
-                    const thread = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, messageTaskWorker, .{task}) catch |err| {
+                    const thread = std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, messageTaskWorker, .{task}) catch |err| {
                         log.err("Failed to spawn worker thread: {}, falling back to synchronous", .{err});
                         task.deinit();
                         allocator.destroy(task);
@@ -868,6 +856,10 @@ pub fn runSignalLoop(
         loop_state.last_activity.store(std.time.timestamp(), .release);
 
         for (messages) |msg| {
+            const schedule_chat_id = msg.reply_target orelse msg.sender;
+            setScheduleToolContext(runtime.tools, "signal", sg_ptr.account_id, schedule_chat_id);
+            defer setScheduleToolContext(runtime.tools, null, null, null);
+
             // Session key — always resolve through agent routing (falls back on errors)
             var key_buf: [128]u8 = undefined;
             const group_peer_id = signalGroupPeerId(msg.reply_target);
@@ -993,7 +985,7 @@ pub fn spawnTelegramPolling(
 
     const tg_ptr: *telegram.TelegramChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 2 * 1024 * 1024 },
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
         runTelegramLoop,
         .{ allocator, config, runtime, tg_ls, tg_ptr },
     );
@@ -1017,7 +1009,7 @@ pub fn spawnSignalPolling(
 
     const sg_ptr: *signal.SignalChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 2 * 1024 * 1024 },
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
         runSignalLoop,
         .{ allocator, config, runtime, sg_ls, sg_ptr },
     );
@@ -1041,7 +1033,7 @@ pub fn spawnMatrixPolling(
 
     const mx_ptr: *matrix.MatrixChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 2 * 1024 * 1024 },
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
         runMatrixLoop,
         .{ allocator, config, runtime, mx_ls, mx_ptr },
     );
@@ -1081,6 +1073,10 @@ pub fn runMatrixLoop(
         loop_state.last_activity.store(std.time.timestamp(), .release);
 
         for (messages) |msg| {
+            const schedule_chat_id = msg.reply_target orelse msg.sender;
+            setScheduleToolContext(runtime.tools, "matrix", mx_ptr.account_id, schedule_chat_id);
+            defer setScheduleToolContext(runtime.tools, null, null, null);
+
             var key_buf: [192]u8 = undefined;
             const room_peer_id = matrixRoomPeerId(msg.reply_target);
             var routed_session_key: ?[]const u8 = null;
@@ -1179,21 +1175,21 @@ test "shouldSuppressGroupReply suppresses only group replies with marker" {
 }
 
 test "isStopLikeCommand matches stop and abort variants" {
-    try std.testing.expect(isStopLikeCommand("/stop"));
-    try std.testing.expect(isStopLikeCommand("  /stop  "));
-    try std.testing.expect(isStopLikeCommand("/abort"));
-    try std.testing.expect(isStopLikeCommand("/STOP"));
-    try std.testing.expect(isStopLikeCommand("/abort@nullclaw_bot"));
-    try std.testing.expect(isStopLikeCommand("/stop: now"));
-    try std.testing.expect(isStopLikeCommand("/abort please"));
+    try std.testing.expect(control_plane.isStopLikeCommand("/stop"));
+    try std.testing.expect(control_plane.isStopLikeCommand("  /stop  "));
+    try std.testing.expect(control_plane.isStopLikeCommand("/abort"));
+    try std.testing.expect(control_plane.isStopLikeCommand("/STOP"));
+    try std.testing.expect(control_plane.isStopLikeCommand("/abort@nullclaw_bot"));
+    try std.testing.expect(control_plane.isStopLikeCommand("/stop: now"));
+    try std.testing.expect(control_plane.isStopLikeCommand("/abort please"));
 }
 
 test "isStopLikeCommand rejects non-control commands" {
-    try std.testing.expect(!isStopLikeCommand("stop"));
-    try std.testing.expect(!isStopLikeCommand("/stopping"));
-    try std.testing.expect(!isStopLikeCommand("/aborted"));
-    try std.testing.expect(!isStopLikeCommand("/help"));
-    try std.testing.expect(!isStopLikeCommand(""));
+    try std.testing.expect(!control_plane.isStopLikeCommand("stop"));
+    try std.testing.expect(!control_plane.isStopLikeCommand("/stopping"));
+    try std.testing.expect(!control_plane.isStopLikeCommand("/aborted"));
+    try std.testing.expect(!control_plane.isStopLikeCommand("/help"));
+    try std.testing.expect(!control_plane.isStopLikeCommand(""));
 }
 
 test "ProviderHolder tagged union fields" {

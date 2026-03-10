@@ -24,20 +24,17 @@ const security = @import("../security/policy.zig");
 const auth_mod = @import("../auth.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
-const commands = @import("commands.zig");
+const verbose = @import("../verbose.zig");
 
 const Agent = @import("root.zig").Agent;
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
+    emitted_text: bool = false,
 };
 
-fn shouldHandleSlashCommandLocally(message: []const u8) bool {
-    const trimmed = std.mem.trim(u8, message, " \t\r\n");
-    if (trimmed.len <= 1 or trimmed[0] != '/') return false;
-    // Bare /new and /reset are intentionally routed through Agent.turn()
-    // to trigger fresh-session startup behavior.
-    return commands.bareSessionResetPrompt(trimmed) == null;
+fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
+    return !supports_streaming or !emitted_text;
 }
 
 fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
@@ -52,6 +49,9 @@ fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
 /// Streaming callback that forwards provider chunks into unified stream sink events.
 fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    if (!chunk.is_final and chunk.delta.len > 0) {
+        stream_ctx.emitted_text = true;
+    }
     streaming.forwardProviderChunk(stream_ctx.sink, chunk);
 }
 
@@ -99,6 +99,7 @@ const ParsedAgentArgs = struct {
     provider_override: ?[]const u8 = null,
     model_override: ?[]const u8 = null,
     temperature_override: ?f64 = null,
+    verbose: bool = false,
 };
 
 const AgentArgParseResult = union(enum) {
@@ -133,6 +134,8 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             i += 1;
             const temp = std.fmt.parseFloat(f64, args[i]) catch return .{ .invalid_temperature = args[i] };
             parsed.temperature_override = temp;
+        } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+            parsed.verbose = true;
         }
     }
     return .{ .ok = parsed };
@@ -167,6 +170,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (parsed_args.temperature_override) |temp| {
         cfg.default_temperature = temp;
         cfg.temperature = temp;
+    }
+    if (parsed_args.verbose) {
+        log.warn("Verbose flag detected, enabling verbose logging", .{});
+        verbose.setVerbose(true);
     }
 
     cfg.validate() catch |err| {
@@ -264,6 +271,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .web_search_provider = cfg.http_request.search_provider,
         .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
         .browser_enabled = cfg.browser.enabled,
+        .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = cfg.agents,
         .fallback_api_key = resolved_api_key,
@@ -320,15 +328,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             agent.stream_ctx = @ptrCast(&stream_ctx);
         }
 
-        if (shouldHandleSlashCommandLocally(message)) {
-            if (try agent.handleSlashCommand(message)) |slash_response| {
-                defer allocator.free(slash_response);
-                try w.print("{s}\n", .{slash_response});
-                try w.flush();
-                return;
-            }
-        }
-
+        stream_ctx.emitted_text = false;
         const response = agent.turn(message) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -344,10 +344,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
-        if (supports_streaming) {
-            try w.print("\n", .{});
-        } else {
+        if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("{s}\n", .{response});
+        } else {
+            try w.print("\n", .{});
         }
         try w.flush();
         return;
@@ -447,15 +447,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Append to history
         repl_history.append(allocator, allocator.dupe(u8, line) catch continue) catch {};
 
-        if (shouldHandleSlashCommandLocally(line)) {
-            if (try agent.handleSlashCommand(line)) |slash_response| {
-                defer allocator.free(slash_response);
-                try w.print("\n{s}\n\n", .{slash_response});
-                try w.flush();
-                continue;
-            }
-        }
-
+        stream_ctx.emitted_text = false;
         const response = agent.turn(line) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -471,10 +463,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
-        if (supports_streaming) {
-            try w.print("\n\n", .{});
-        } else {
+        if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("\n{s}\n\n", .{response});
+        } else {
+            try w.print("\n\n", .{});
         }
         try w.flush();
     }
@@ -496,13 +488,23 @@ test "cliStreamCallback handles empty delta" {
     };
     const chunk = providers.StreamChunk.finalChunk();
     cliStreamCallback(@ptrCast(&ctx), chunk);
+    try std.testing.expect(!ctx.emitted_text);
 }
 
 test "cliStreamCallback text delta chunk" {
+    var sink_ctx: u8 = 0;
+    var ctx = CliStreamCtx{
+        .sink = .{
+            .callback = noopSinkEvent,
+            .ctx = @ptrCast(&sink_ctx),
+        },
+    };
     const chunk = providers.StreamChunk.textDelta("hello");
+    cliStreamCallback(@ptrCast(&ctx), chunk);
     try std.testing.expectEqualStrings("hello", chunk.delta);
     try std.testing.expect(!chunk.is_final);
     try std.testing.expectEqual(@as(u32, 2), chunk.token_count);
+    try std.testing.expect(ctx.emitted_text);
 }
 
 test "parseAgentArgs parses provider and model overrides" {
@@ -526,13 +528,13 @@ test "parseAgentArgs parses provider and model overrides" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), parsed.temperature_override.?, 0.000001);
 }
 
-test "shouldHandleSlashCommandLocally recognizes local slash commands" {
-    try std.testing.expect(shouldHandleSlashCommandLocally("/help"));
-    try std.testing.expect(shouldHandleSlashCommandLocally(" /status "));
-    try std.testing.expect(!shouldHandleSlashCommandLocally("hello"));
-    try std.testing.expect(!shouldHandleSlashCommandLocally("/new"));
-    try std.testing.expect(!shouldHandleSlashCommandLocally("/reset"));
-    try std.testing.expect(shouldHandleSlashCommandLocally("/new gpt-4o"));
+test "shouldPrintTurnResponse prints fallback when streaming emits no text" {
+    try std.testing.expect(shouldPrintTurnResponse(true, false));
+    try std.testing.expect(shouldPrintTurnResponse(false, false));
+}
+
+test "shouldPrintTurnResponse suppresses duplicate output after streamed text" {
+    try std.testing.expect(!shouldPrintTurnResponse(true, true));
 }
 
 test "parseAgentArgs keeps the last override value" {
