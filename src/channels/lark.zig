@@ -99,6 +99,9 @@ pub const LarkChannel = struct {
 
     pub const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
     pub const LARK_BASE_URL = "https://open.larksuite.com/open-apis";
+    /// Host root for callback endpoints (e.g. websocket config). Path is /callback/ws/endpoint, not under /open-apis.
+    pub const FEISHU_CALLBACK_HOST = "https://open.feishu.cn";
+    pub const LARK_CALLBACK_HOST = "https://open.larksuite.com";
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -436,8 +439,9 @@ pub const LarkChannel = struct {
     }
 
     fn buildWebsocketConfigUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
+        const host = if (self.use_feishu) FEISHU_CALLBACK_HOST else LARK_CALLBACK_HOST;
         var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("{s}/callback/ws/endpoint", .{self.apiBase()});
+        try fbs.writer().print("{s}/callback/ws/endpoint", .{host});
         return fbs.getWritten();
     }
 
@@ -1649,14 +1653,14 @@ test "lark buildWebsocketConfigUrl follows region" {
     ch.use_feishu = true;
     var feishu_buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "https://open.feishu.cn/open-apis/callback/ws/endpoint",
+        "https://open.feishu.cn/callback/ws/endpoint",
         try ch.buildWebsocketConfigUrl(&feishu_buf),
     );
 
     ch.use_feishu = false;
     var lark_buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "https://open.larksuite.com/open-apis/callback/ws/endpoint",
+        "https://open.larksuite.com/callback/ws/endpoint",
         try ch.buildWebsocketConfigUrl(&lark_buf),
     );
 }
