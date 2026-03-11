@@ -13,8 +13,8 @@ const config_mutator = @import("../config_mutator.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
+const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
-const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
 const parseSlashCommand = control_plane.parseSlashCommand;
@@ -214,7 +214,7 @@ fn setDefaultProvider(self: anytype, provider_name: []const u8) !void {
 fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
     if (!@hasField(@TypeOf(self.*), "configured_providers")) return false;
     for (self.configured_providers) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.name, provider_name)) return true;
+        if (provider_names.providerNamesMatchIgnoreCase(entry.name, provider_name)) return true;
     }
     return false;
 }
@@ -272,6 +272,10 @@ fn invalidateSystemPromptCache(self: anytype) void {
     }
     if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
         self.system_prompt_has_conversation_context = false;
+    }
+    if (@hasField(@TypeOf(self.*), "system_prompt_model_name")) {
+        if (self.system_prompt_model_name) |model_name| self.allocator.free(model_name);
+        self.system_prompt_model_name = null;
     }
 }
 
@@ -1143,8 +1147,8 @@ fn resetRuntimeCommandState(self: anytype) void {
     self.reasoning_mode = .off;
     self.usage_mode = .off;
     self.exec_host = .gateway;
-    self.exec_security = .allowlist;
-    self.exec_ask = .on_miss;
+    self.exec_security = self.default_exec_security;
+    self.exec_ask = self.default_exec_ask;
     if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
     self.exec_node_id = null;
     self.exec_node_id_owned = false;
@@ -1696,7 +1700,6 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     if (self.exec_security == .allowlist) {
         if (self.policy) |pol| {
             if (!pol.isCommandAllowed(command)) {
-                log.warn("exec blocked by allowlist policy: {s}", .{command});
                 return try self.allocator.dupe(u8, "Exec blocked by allowlist policy");
             }
         }
@@ -2566,7 +2569,6 @@ pub fn execBlockMessage(self: anytype, args: std.json.ObjectMap) ?[]const u8 {
                 const command = v.string;
                 if (self.policy) |pol| {
                     if (!pol.isCommandAllowed(command)) {
-                        log.warn("tool exec blocked by allowlist policy: {s}", .{command});
                         return "Exec blocked by allowlist policy";
                     }
                 }
@@ -2631,6 +2633,10 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             clearSessionState(self);
             if (cmd.arg.len > 0) {
                 try setModelName(self, cmd.arg);
+                if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                    self.model_pinned_by_user = true;
+                }
+                invalidateSystemPromptCache(self);
                 return try std.fmt.allocPrint(self.allocator, "Session cleared. Switched to model: {s}", .{cmd.arg});
             }
             return try self.allocator.dupe(u8, "Session cleared.");
@@ -2640,6 +2646,10 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             resetRuntimeCommandState(self);
             if (cmd.arg.len > 0) {
                 try setModelName(self, cmd.arg);
+                if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                    self.model_pinned_by_user = true;
+                }
+                invalidateSystemPromptCache(self);
                 return try std.fmt.allocPrint(self.allocator, "Session restarted. Switched to model: {s}", .{cmd.arg});
             }
             return try self.allocator.dupe(u8, "Session restarted.");
@@ -2654,7 +2664,37 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             {
                 return try self.formatModelStatus();
             }
+            if (std.ascii.eqlIgnoreCase(cmd.arg, "auto")) {
+                if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                    self.model_pinned_by_user = false;
+                }
+                if (@hasDecl(@TypeOf(self.*), "clearLastRouteTrace")) {
+                    self.clearLastRouteTrace();
+                }
+                if (@hasField(@TypeOf(self.*), "default_model")) {
+                    try setModelName(self, self.default_model);
+                }
+                invalidateSystemPromptCache(self);
+                if (@hasField(@TypeOf(self.*), "model_routes") and self.model_routes.len == 0) {
+                    return try std.fmt.allocPrint(
+                        self.allocator,
+                        "Automatic model routing is not configured. Reverted to the configured default model: {s}",
+                        .{self.model_name},
+                    );
+                }
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Automatic model routing enabled. Reverted to the configured default model: {s}",
+                    .{self.model_name},
+                );
+            }
             try setModelName(self, cmd.arg);
+            if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                self.model_pinned_by_user = true;
+            }
+            if (@hasDecl(@TypeOf(self.*), "clearLastRouteTrace")) {
+                self.clearLastRouteTrace();
+            }
             if (@hasField(@TypeOf(self.*), "default_model")) {
                 self.default_model = self.model_name;
             }

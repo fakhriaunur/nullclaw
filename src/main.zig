@@ -273,7 +273,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    // Check both sub_args and global args for --verbose flag 
+    // Check both sub_args and global args for --verbose flag
     var verbose = hasVerboseFlag(sub_args);
     if (!verbose) {
         // Also check global args for --verbose flag
@@ -367,7 +367,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Commands:
             \\  list                          List all scheduled tasks
             \\  add <expression> <command>    Add a recurring cron job
-            \\  add-agent <expression> <prompt> [--model <model>]
+            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]
             \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
             \\  once-agent <delay> <prompt> [--model <model>]
@@ -395,18 +395,37 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "add-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>]\n", .{});
+            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]\n", .{});
             std.process.exit(1);
         }
         var model: ?[]const u8 = null;
+        var delivery_mode: yc.cron.DeliveryMode = .none;
+        var channel: ?[]const u8 = null;
+        var to: ?[]const u8 = null;
+
         var i: usize = 3;
         while (i < sub_args.len) : (i += 1) {
             if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
                 model = sub_args[i + 1];
                 i += 1;
+            } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
+                delivery_mode = .always;
+            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
+                channel = sub_args[i + 1];
+                i += 1;
+            } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
+                to = sub_args[i + 1];
+                i += 1;
             }
         }
-        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], model);
+        const delivery = yc.cron.DeliveryConfig{
+            .mode = delivery_mode,
+            .channel = channel,
+            .to = to,
+            .channel_owned = false,
+            .to_owned = false,
+        };
+        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], model, delivery);
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});
@@ -1874,6 +1893,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = config.agents,
+        .configured_providers = config.providers,
         .fallback_api_key = resolved_api_key,
         .tools_config = config.tools,
         .allowed_paths = config.autonomy.allowed_paths,
@@ -2195,6 +2215,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = config.agents,
+        .configured_providers = config.providers,
         .fallback_api_key = resolved_api_key,
         .tools_config = config.tools,
         .allowed_paths = config.autonomy.allowed_paths,

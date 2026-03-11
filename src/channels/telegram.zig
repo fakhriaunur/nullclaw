@@ -458,9 +458,19 @@ pub const TelegramChannel = struct {
     streaming_enabled: bool = true,
 
     pub const MAX_MESSAGE_LEN: usize = 4096;
+    const CONTINUATION_MARKER = "\n\n\u{23EC}";
     const MIN_ADAPTIVE_SPLIT_LIMIT: usize = 256;
     const TYPING_INTERVAL_NS: u64 = 4 * std.time.ns_per_s;
     const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
+
+    const OutgoingTextChunk = struct {
+        body: []const u8,
+        owned: ?[]u8 = null,
+
+        fn deinit(self: *const OutgoingTextChunk, allocator: std.mem.Allocator) void {
+            if (self.owned) |buf| allocator.free(buf);
+        }
+    };
 
     const TypingTask = struct {
         channel: *TelegramChannel,
@@ -1164,6 +1174,161 @@ pub const TelegramChannel = struct {
         _ = try self.sendWithMarkdownFallbackWithMarkup(chat_id, text, reply_to, null);
     }
 
+    fn outgoingChunkSplitLimit(text_len: usize, split_limit_override: ?usize) usize {
+        if (split_limit_override) |split_limit| {
+            const capped = @min(split_limit, MAX_MESSAGE_LEN - CONTINUATION_MARKER.len);
+            return if (capped == 0) 1 else capped;
+        }
+        return if (text_len > MAX_MESSAGE_LEN) MAX_MESSAGE_LEN - CONTINUATION_MARKER.len else MAX_MESSAGE_LEN;
+    }
+
+    fn buildOutgoingTextChunksWithLimit(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        split_limit_override: ?usize,
+    ) ![]OutgoingTextChunk {
+        if (text.len == 0) return allocator.alloc(OutgoingTextChunk, 0);
+
+        const split_limit = outgoingChunkSplitLimit(text.len, split_limit_override);
+
+        var raw_chunks: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer raw_chunks.deinit(allocator);
+
+        var it = smartSplitMessage(text, split_limit);
+        while (it.next()) |chunk| {
+            try raw_chunks.append(allocator, chunk);
+        }
+
+        const out = try allocator.alloc(OutgoingTextChunk, raw_chunks.items.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |chunk| chunk.deinit(allocator);
+            allocator.free(out);
+        }
+
+        for (raw_chunks.items, 0..) |chunk, i| {
+            const is_last = i == raw_chunks.items.len - 1;
+            if (is_last) {
+                out[i] = .{ .body = chunk };
+            } else {
+                var body: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer body.deinit(allocator);
+                try body.appendSlice(allocator, chunk);
+                try body.appendSlice(allocator, CONTINUATION_MARKER);
+                const owned = try body.toOwnedSlice(allocator);
+                out[i] = .{
+                    .body = owned,
+                    .owned = owned,
+                };
+            }
+            built += 1;
+        }
+
+        return out;
+    }
+
+    fn buildOutgoingTextChunks(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+    ) ![]OutgoingTextChunk {
+        return buildOutgoingTextChunksWithLimit(allocator, text, null);
+    }
+
+    fn sendSplitTextWithMarkdownFallbackWithMarkup(
+        self: *TelegramChannel,
+        chat_id: []const u8,
+        text: []const u8,
+        reply_to: ?i64,
+        reply_markup_json: ?[]const u8,
+    ) !SentMessageMeta {
+        return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+            chat_id,
+            text,
+            reply_to,
+            reply_markup_json,
+            outgoingChunkSplitLimit(text.len, null),
+        );
+    }
+
+    fn sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+        self: *TelegramChannel,
+        chat_id: []const u8,
+        text: []const u8,
+        reply_to: ?i64,
+        reply_markup_json: ?[]const u8,
+        split_limit_hint: usize,
+    ) !SentMessageMeta {
+        const chunks = try buildOutgoingTextChunksWithLimit(self.allocator, text, split_limit_hint);
+        defer {
+            for (chunks) |chunk| chunk.deinit(self.allocator);
+            self.allocator.free(chunks);
+        }
+
+        const current_limit = outgoingChunkSplitLimit(text.len, split_limit_hint);
+        var current_reply_to = reply_to;
+        var last_meta: SentMessageMeta = .{};
+        var sent_any = false;
+        for (chunks, 0..) |chunk, i| {
+            const is_last = i == chunks.len - 1;
+            if (is_last) {
+                last_meta = self.sendWithMarkdownFallbackWithMarkup(chat_id, chunk.body, current_reply_to, reply_markup_json) catch |err| switch (err) {
+                    error.TelegramMessageTooLong => blk: {
+                        const next_limit = nextAdaptiveSplitLimit(current_limit, chunk.body.len);
+                        if (next_limit == 0 or next_limit >= chunk.body.len) {
+                            if (sent_any) return error.PartiallySent;
+                            return err;
+                        }
+                        const meta = self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                            chat_id,
+                            chunk.body,
+                            current_reply_to,
+                            reply_markup_json,
+                            next_limit,
+                        ) catch |split_err| {
+                            if (sent_any) return error.PartiallySent;
+                            return split_err;
+                        };
+                        break :blk meta;
+                    },
+                    else => {
+                        if (sent_any) return error.PartiallySent;
+                        return err;
+                    },
+                };
+            } else {
+                self.sendWithMarkdownFallback(chat_id, chunk.body, current_reply_to) catch |err| switch (err) {
+                    error.TelegramMessageTooLong => {
+                        const next_limit = nextAdaptiveSplitLimit(current_limit, chunk.body.len);
+                        if (next_limit == 0 or next_limit >= chunk.body.len) {
+                            if (sent_any) return error.PartiallySent;
+                            return err;
+                        }
+                        _ = self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                            chat_id,
+                            chunk.body,
+                            current_reply_to,
+                            null,
+                            next_limit,
+                        ) catch |split_err| {
+                            if (sent_any) return error.PartiallySent;
+                            return split_err;
+                        };
+                    },
+                    else => {
+                        if (sent_any) return error.PartiallySent;
+                        return err;
+                    },
+                };
+            }
+
+            sent_any = true;
+            current_reply_to = null;
+            if (!is_last) std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+
+        return last_meta;
+    }
+
     fn sendChunkPlainWithMarkup(
         self: *TelegramChannel,
         chat_id: []const u8,
@@ -1287,8 +1452,8 @@ pub const TelegramChannel = struct {
             return self.sendMessageWithReply(chat_id, parsed.visible_text, reply_to);
         }
 
-        // v1 scope: if the reply needs attachment parsing or splitting, fall back to text-only send.
-        if (parsed.visible_text.len > MAX_MESSAGE_LEN or isAttachmentMarkerCandidate(parsed.visible_text)) {
+        // v1 scope: interactive choices do not support attachment-marker payloads.
+        if (isAttachmentMarkerCandidate(parsed.visible_text)) {
             return self.sendMessageWithReply(chat_id, parsed.visible_text, reply_to);
         }
 
@@ -1305,7 +1470,11 @@ pub const TelegramChannel = struct {
         };
         defer self.allocator.free(keyboard_json);
 
-        const sent = self.sendWithMarkdownFallbackWithMarkup(chat_id, parsed.visible_text, reply_to, keyboard_json) catch |err| {
+        const sent = self.sendSplitTextWithMarkdownFallbackWithMarkup(chat_id, parsed.visible_text, reply_to, keyboard_json) catch |err| {
+            if (err == error.PartiallySent) {
+                log.warn("telegram interactive send partially succeeded; skipping full fallback to avoid duplicate chunks", .{});
+                return;
+            }
             log.warn("telegram interactive send failed, falling back to plain send: {}", .{err});
             return self.sendMessageWithReply(chat_id, parsed.visible_text, reply_to);
         };
@@ -1346,39 +1515,6 @@ pub const TelegramChannel = struct {
             text_len - 1;
     }
 
-    fn sendChunkWithAdaptiveSplit(
-        self: *TelegramChannel,
-        chat_id: []const u8,
-        text: []const u8,
-        reply_to: ?i64,
-        split_limit_hint: usize,
-    ) !void {
-        self.sendWithMarkdownFallback(chat_id, text, reply_to) catch |err| switch (err) {
-            error.TelegramMessageTooLong => {
-                const next_limit = nextAdaptiveSplitLimit(split_limit_hint, text.len);
-                if (next_limit == 0 or next_limit >= text.len) return err;
-
-                var chunks: std.ArrayListUnmanaged([]const u8) = .empty;
-                defer chunks.deinit(self.allocator);
-                var it = smartSplitMessage(text, next_limit);
-                while (it.next()) |chunk| {
-                    try chunks.append(self.allocator, chunk);
-                }
-                if (chunks.items.len <= 1) return err;
-
-                var current_reply_to = reply_to;
-                for (chunks.items, 0..) |chunk, i| {
-                    try self.sendChunkWithAdaptiveSplit(chat_id, chunk, current_reply_to, next_limit);
-                    current_reply_to = null;
-                    if (i < chunks.items.len - 1) {
-                        std.Thread.sleep(100 * std.time.ns_per_ms);
-                    }
-                }
-            },
-            else => return err,
-        };
-    }
-
     /// Send a message with optional reply-to, continuation markers, and delay between chunks.
     pub fn sendMessageWithReply(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to: ?i64) !void {
         // Send typing indicator (best-effort)
@@ -1390,41 +1526,7 @@ pub const TelegramChannel = struct {
 
         // Send remaining text (if any) with smart splitting
         if (parsed.remaining_text.len > 0) {
-            // Use slightly smaller limit when text will split, to leave room for markers
-            const needs_split = parsed.remaining_text.len > MAX_MESSAGE_LEN;
-            const split_limit = if (needs_split) MAX_MESSAGE_LEN - 12 else MAX_MESSAGE_LEN;
-
-            // Collect chunks
-            var chunks: std.ArrayListUnmanaged([]const u8) = .empty;
-            defer chunks.deinit(self.allocator);
-            var it = smartSplitMessage(parsed.remaining_text, split_limit);
-            while (it.next()) |chunk| {
-                try chunks.append(self.allocator, chunk);
-            }
-
-            var current_reply_to = reply_to;
-            for (chunks.items, 0..) |chunk, i| {
-                if (chunks.items.len > 1 and i < chunks.items.len - 1) {
-                    // Not the last chunk — append ⏬ to signal continuation
-                    var annotated: std.ArrayListUnmanaged(u8) = .empty;
-                    defer annotated.deinit(self.allocator);
-
-                    try annotated.appendSlice(self.allocator, chunk);
-                    try annotated.appendSlice(self.allocator, "\n\n\u{23EC}"); // ⏬
-
-                    try self.sendChunkWithAdaptiveSplit(chat_id, annotated.items, current_reply_to, split_limit);
-                } else {
-                    try self.sendChunkWithAdaptiveSplit(chat_id, chunk, current_reply_to, split_limit);
-                }
-
-                // Only reply-to the first chunk
-                current_reply_to = null;
-
-                // 100ms delay between chunks to avoid rate-limit / ordering issues
-                if (i < chunks.items.len - 1) {
-                    std.Thread.sleep(100 * std.time.ns_per_ms);
-                }
-            }
+            _ = try self.sendSplitTextWithMarkdownFallbackWithMarkup(chat_id, parsed.remaining_text, reply_to, null);
         }
 
         // Send attachments
@@ -3259,6 +3361,42 @@ test "telegram smartSplitMessage preserves total content" {
         total += chunk.len;
     }
     try std.testing.expectEqual(msg.len, total);
+}
+
+test "telegram buildOutgoingTextChunks appends continuation only to non-last chunks" {
+    const allocator = std.testing.allocator;
+    const text = ("word " ** 900) ++ "tail";
+
+    const chunks = try TelegramChannel.buildOutgoingTextChunks(allocator, text);
+    defer {
+        for (chunks) |chunk| chunk.deinit(allocator);
+        allocator.free(chunks);
+    }
+
+    try std.testing.expect(chunks.len >= 2);
+    for (chunks[0 .. chunks.len - 1]) |chunk| {
+        try std.testing.expect(std.mem.endsWith(u8, chunk.body, TelegramChannel.CONTINUATION_MARKER));
+        try std.testing.expect(chunk.body.len <= TelegramChannel.MAX_MESSAGE_LEN);
+        try std.testing.expect(chunk.owned != null);
+    }
+    try std.testing.expect(!std.mem.endsWith(u8, chunks[chunks.len - 1].body, TelegramChannel.CONTINUATION_MARKER));
+    try std.testing.expect(chunks[chunks.len - 1].body.len <= TelegramChannel.MAX_MESSAGE_LEN);
+    try std.testing.expect(chunks[chunks.len - 1].owned == null);
+}
+
+test "telegram buildOutgoingTextChunks reuses source slice when split is unnecessary" {
+    const allocator = std.testing.allocator;
+    const text = "Short reply";
+
+    const chunks = try TelegramChannel.buildOutgoingTextChunks(allocator, text);
+    defer {
+        for (chunks) |chunk| chunk.deinit(allocator);
+        allocator.free(chunks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), chunks.len);
+    try std.testing.expectEqualStrings(text, chunks[0].body);
+    try std.testing.expect(chunks[0].owned == null);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -9,7 +9,7 @@ pub const HELP_TEXT =
     \\Available commands:
     \\  /new, /reset [model], /restart [model]
     \\  /help, /commands, /status, /whoami, /id
-    \\  /model, /models, /model <name>
+    \\  /model, /models, /model <name>, /model auto
     \\  /think, /verbose, /reasoning
     \\  /exec, /queue, /usage, /tts, /voice
     \\  /stop, /abort, /compact

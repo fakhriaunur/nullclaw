@@ -109,6 +109,56 @@ Example:
 - Sets default model route, typically `provider/vendor/model`.
 - Example: `openrouter/anthropic/claude-sonnet-4`
 
+### `model_routes`
+
+- Optional top-level routing table for automatic per-turn model selection in `nullclaw agent`.
+- Each entry maps a route `hint` to a concrete `provider` and `model`.
+- Recognized routing hints in the current daemon are `fast`, `balanced`, `deep`, `reasoning`, and `vision`.
+- `balanced` is the normal fallback when configured. `fast` is preferred for short status/list/check prompts and other short structured tasks such as extraction, counting, classification, or narrow return-only transforms. `deep` and `reasoning` are preferred for investigation, planning, tradeoff analysis, and longer contexts. `vision` is used for image turns.
+- `api_key` is optional. If omitted, NullClaw uses the normal credential from `models.providers.<provider>`.
+- `cost_class` is optional metadata with values `free`, `cheap`, `standard`, or `premium`.
+- `quota_class` is optional metadata with values `unlimited`, `normal`, or `constrained`.
+
+Example:
+
+```json
+{
+  "model_routes": [
+    { "hint": "fast", "provider": "groq", "model": "llama-3.3-70b", "cost_class": "free", "quota_class": "unlimited" },
+    { "hint": "balanced", "provider": "openrouter", "model": "anthropic/claude-sonnet-4", "cost_class": "standard", "quota_class": "normal" },
+    { "hint": "deep", "provider": "openrouter", "model": "anthropic/claude-opus-4", "cost_class": "premium", "quota_class": "constrained" },
+    { "hint": "vision", "provider": "openrouter", "model": "openai/gpt-4.1", "cost_class": "standard", "quota_class": "normal" }
+  ]
+}
+```
+
+Notes:
+
+- `model_routes` are used only when the session is not pinned to an explicit model.
+- If both `deep` and `reasoning` are configured, deep-analysis prompts prefer `deep`.
+- `/model` shows the last auto-route decision so operators can see which route was picked and why.
+- Auto-routed sessions temporarily degrade a route after quota or rate-limit failures and skip it until the cooldown expires.
+- Route metadata only nudges scoring. Ambiguous prompts still stay on `balanced`; `fast` is reserved for high-confidence cheap tasks, and strong deep-analysis signals still win over cheaper routes.
+
+### `agents.list`
+
+- Defines named agent profiles used by tools such as `/delegate`.
+- Each entry may set `provider` + `model`, or a full `provider/model` ref in `model.primary`.
+- Example:
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "coder",
+        "model": { "primary": "ollama/qwen3.5:cloud" },
+        "system_prompt": "You're an experienced coder"
+      }
+    ]
+  }
+}
+```
 ### `channels`
 
 - Channel config lives under `channels.<name>`.
@@ -186,7 +236,7 @@ Use only in controlled environments:
 
 Notes:
 
-- `search_base_url` must be a valid URL, otherwise startup validation fails.
+- `search_base_url` must be `https://host[/search]` or a local/private `http://host[:port][/search]` URL, otherwise startup validation fails.
 - `allowed_commands: ["*"]` and `allowed_paths: ["*"]` significantly widen execution scope.
 
 ## Validate After Config Changes

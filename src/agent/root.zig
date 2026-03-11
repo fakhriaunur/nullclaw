@@ -244,6 +244,10 @@ pub const Agent = struct {
     default_provider: []const u8 = "openrouter",
     default_provider_owned: bool = false,
     default_model: []const u8 = "anthropic/claude-sonnet-4",
+    model_routes: []const config_types.ModelRouteConfig = &.{},
+    model_pinned_by_user: bool = false,
+    last_route_trace: ?[]u8 = null,
+    degraded_routes: std.ArrayListUnmanaged(DegradedRoute) = .empty,
     configured_providers: []const config_types.ProviderEntry = &.{},
     fallback_providers: []const []const u8 = &.{},
     model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
@@ -272,7 +276,9 @@ pub const Agent = struct {
     reasoning_mode: ReasoningMode = .off,
     usage_mode: UsageMode = .off,
     exec_host: ExecHost = .gateway,
+    default_exec_security: ExecSecurity = .allowlist,
     exec_security: ExecSecurity = .allowlist,
+    default_exec_ask: ExecAsk = .on_miss,
     exec_ask: ExecAsk = .on_miss,
     exec_node_id: ?[]const u8 = null,
     exec_node_id_owned: bool = false,
@@ -341,6 +347,8 @@ pub const Agent = struct {
     system_prompt_has_conversation_context: bool = false,
     /// Fingerprint of workspace prompt files for the currently injected system prompt.
     workspace_prompt_fingerprint: ?u64 = null,
+    /// Model name used when building the currently cached system prompt.
+    system_prompt_model_name: ?[]u8 = null,
 
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
@@ -377,6 +385,15 @@ pub const Agent = struct {
         const resolved_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(cfg.max_tokens, default_model);
         const token_limit_cap: u32 = @intCast(@min(resolved_token_limit, @as(u64, std.math.maxInt(u32))));
         const resolved_max_tokens = @min(resolved_max_tokens_raw, token_limit_cap);
+        const resolved_exec_security: ExecSecurity = switch (cfg.autonomy.level) {
+            .full, .yolo => .full,
+            .read_only => .deny,
+            .supervised => .allowlist,
+        };
+        const resolved_exec_ask: ExecAsk = switch (cfg.autonomy.level) {
+            .full, .read_only, .yolo => .off,
+            .supervised => .on_miss,
+        };
 
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
@@ -406,6 +423,7 @@ pub const Agent = struct {
             .model_name = default_model,
             .default_provider = cfg.default_provider,
             .default_model = default_model,
+            .model_routes = cfg.model_routes,
             .configured_providers = cfg.providers,
             .fallback_providers = cfg.reliability.fallback_providers,
             .model_fallbacks = cfg.reliability.model_fallbacks,
@@ -431,15 +449,10 @@ pub const Agent = struct {
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
-            .exec_security = switch (cfg.autonomy.level) {
-                .full, .yolo => .full,
-                .read_only => .deny,
-                .supervised => .allowlist,
-            },
-            .exec_ask = switch (cfg.autonomy.level) {
-                .full, .read_only, .yolo => .off,
-                .supervised => .on_miss,
-            },
+            .default_exec_security = resolved_exec_security,
+            .exec_security = resolved_exec_security,
+            .default_exec_ask = resolved_exec_ask,
+            .exec_ask = resolved_exec_ask,
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -451,6 +464,8 @@ pub const Agent = struct {
         if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        if (self.system_prompt_model_name) |model| self.allocator.free(model);
+        if (self.last_route_trace) |trace| self.allocator.free(trace);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
@@ -470,6 +485,10 @@ pub const Agent = struct {
             self.allocator.free(model);
         }
         self.detected_vision_disabled.deinit(self.allocator);
+        for (self.degraded_routes.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.degraded_routes.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
     }
 
@@ -616,23 +635,34 @@ pub const Agent = struct {
         messages: []const ChatMessage,
         tool_specs_for_estimate: ?[]const ToolSpec,
     ) u32 {
-        if (self.token_limit == 0) return self.max_tokens;
+        return self.effectiveMaxTokensForTurn(messages, tool_specs_for_estimate, self.token_limit, self.max_tokens);
+    }
+
+    fn effectiveMaxTokensForTurn(
+        self: *const Agent,
+        messages: []const ChatMessage,
+        tool_specs_for_estimate: ?[]const ToolSpec,
+        token_limit: u64,
+        max_tokens: u32,
+    ) u32 {
+        _ = self;
+        if (token_limit == 0) return max_tokens;
 
         var prompt_estimate = estimatePromptTokens(messages);
         if (tool_specs_for_estimate) |tool_specs| {
             prompt_estimate +|= estimateToolSpecsTokens(tool_specs);
         }
 
-        if (prompt_estimate >= self.token_limit) return 1;
+        if (prompt_estimate >= token_limit) return 1;
 
-        const available = self.token_limit - prompt_estimate;
+        const available = token_limit - prompt_estimate;
         const reserve = @min(@as(u64, 256), available / 4);
         if (available <= reserve) return 1;
 
         const completion_budget = available - reserve;
         const completion_budget_u32: u32 = @intCast(@min(completion_budget, @as(u64, std.math.maxInt(u32))));
         if (completion_budget_u32 == 0) return 1;
-        return @max(@as(u32, 1), @min(self.max_tokens, completion_budget_u32));
+        return @max(@as(u32, 1), @min(max_tokens, completion_budget_u32));
     }
 
     /// Auto-compact history when it exceeds thresholds.
@@ -775,6 +805,433 @@ pub const Agent = struct {
         return false;
     }
 
+    fn hasModelRouteHint(self: *const Agent, hint: []const u8) bool {
+        for (self.model_routes) |route| {
+            if (std.mem.eql(u8, route.hint, hint)) return true;
+        }
+        return false;
+    }
+
+    fn findModelRouteByHint(self: *const Agent, hint: []const u8) ?config_types.ModelRouteConfig {
+        for (self.model_routes) |route| {
+            if (std.mem.eql(u8, route.hint, hint)) return route;
+        }
+        return null;
+    }
+
+    fn degradedRouteMatches(entry: *const DegradedRoute, route: config_types.ModelRouteConfig) bool {
+        return std.mem.eql(u8, entry.hint, route.hint) and
+            std.mem.eql(u8, entry.provider, route.provider) and
+            std.mem.eql(u8, entry.model, route.model);
+    }
+
+    fn pruneExpiredDegradedRoutes(self: *Agent, now_ms: i64) void {
+        var i: usize = 0;
+        while (i < self.degraded_routes.items.len) {
+            if (self.degraded_routes.items[i].until_ms <= now_ms) {
+                var expired = self.degraded_routes.orderedRemove(i);
+                expired.deinit(self.allocator);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn findActiveDegradedRoute(self: *Agent, route: config_types.ModelRouteConfig, now_ms: i64) ?*DegradedRoute {
+        self.pruneExpiredDegradedRoutes(now_ms);
+        for (self.degraded_routes.items) |*entry| {
+            if (entry.until_ms > now_ms and degradedRouteMatches(entry, route)) return entry;
+        }
+        return null;
+    }
+
+    fn hasDegradedRouteHint(self: *const Agent, hint: []const u8, now_ms: i64) bool {
+        for (self.model_routes) |route| {
+            if (!std.mem.eql(u8, route.hint, hint)) continue;
+            for (self.degraded_routes.items) |entry| {
+                if (entry.until_ms > now_ms and degradedRouteMatches(&entry, route)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn findUsableModelRouteByHint(self: *Agent, hint: []const u8, now_ms: i64) ?config_types.ModelRouteConfig {
+        self.pruneExpiredDegradedRoutes(now_ms);
+        for (self.model_routes) |route| {
+            if (!std.mem.eql(u8, route.hint, hint)) continue;
+            if (self.findActiveDegradedRoute(route, now_ms) == null) return route;
+        }
+        return null;
+    }
+
+    fn hasUsableModelRouteHint(self: *Agent, hint: []const u8, now_ms: i64) bool {
+        return self.findUsableModelRouteByHint(hint, now_ms) != null;
+    }
+
+    fn routeCostClassLabel(route: config_types.ModelRouteConfig) []const u8 {
+        return @tagName(route.cost_class);
+    }
+
+    fn routeQuotaClassLabel(route: config_types.ModelRouteConfig) []const u8 {
+        return @tagName(route.quota_class);
+    }
+
+    fn routeMetadataScoreNudge(route: config_types.ModelRouteConfig) i32 {
+        const cost_nudge: i32 = switch (route.cost_class) {
+            .free => 8,
+            .cheap => 4,
+            .standard => 0,
+            .premium => -4,
+        };
+        const quota_nudge: i32 = switch (route.quota_class) {
+            .unlimited => 6,
+            .normal => 0,
+            .constrained => -6,
+        };
+        return cost_nudge + quota_nudge;
+    }
+
+    fn routeTiePriority(hint: []const u8) u8 {
+        if (std.mem.eql(u8, hint, "balanced")) return 0;
+        if (std.mem.eql(u8, hint, "fast")) return 1;
+        if (std.mem.eql(u8, hint, "deep")) return 2;
+        if (std.mem.eql(u8, hint, "reasoning")) return 3;
+        if (std.mem.eql(u8, hint, "vision")) return 4;
+        return 255;
+    }
+
+    fn maybePromoteRoute(best: *?RouteSelection, candidate: RouteSelection) void {
+        if (best.*) |current| {
+            if (candidate.score < current.score) return;
+            if (candidate.score == current.score and routeTiePriority(candidate.hint) >= routeTiePriority(current.hint)) {
+                return;
+            }
+        }
+        best.* = candidate;
+    }
+
+    fn firstMatchingKeyword(haystack: []const u8, keywords: []const []const u8) ?[]const u8 {
+        for (keywords) |keyword| {
+            if (containsAsciiIgnoreCase(haystack, keyword)) return keyword;
+        }
+        return null;
+    }
+
+    fn isAmbiguousPrompt(user_message: []const u8) bool {
+        const ambiguous_keywords = [_][]const u8{
+            "what should",
+            "should we",
+            "should i",
+            "what do you think",
+            "thoughts",
+            "advice",
+            "not sure",
+            "unclear",
+        };
+        inline for (ambiguous_keywords) |keyword| {
+            if (containsAsciiIgnoreCase(user_message, keyword)) return true;
+        }
+        return user_message.len <= 220 and std.mem.indexOfScalar(u8, user_message, '?') != null;
+    }
+
+    fn activeDegradedRouteForStatus(
+        self: *const Agent,
+        route: config_types.ModelRouteConfig,
+        now_ms: i64,
+    ) ?*const DegradedRoute {
+        for (self.degraded_routes.items) |*entry| {
+            if (entry.until_ms > now_ms and degradedRouteMatches(entry, route)) return entry;
+        }
+        return null;
+    }
+
+    const RouteSelection = struct {
+        hint: []const u8,
+        route: config_types.ModelRouteConfig,
+        reason: []const u8,
+        matched_keyword: ?[]const u8 = null,
+        score: i32 = 0,
+    };
+
+    const DegradedRoute = struct {
+        hint: []const u8,
+        provider: []const u8,
+        model: []const u8,
+        reason: []u8,
+        until_ms: i64,
+
+        fn deinit(self: *DegradedRoute, allocator: std.mem.Allocator) void {
+            allocator.free(self.reason);
+        }
+    };
+
+    const auto_route_degrade_cooldown_ms: i64 = 5 * 60 * 1000;
+
+    fn routeSelectionForHint(
+        self: *Agent,
+        hint: []const u8,
+        reason: []const u8,
+        matched_keyword: ?[]const u8,
+        score: i32,
+        now_ms: i64,
+    ) ?RouteSelection {
+        const route = self.findUsableModelRouteByHint(hint, now_ms) orelse return null;
+        return .{
+            .hint = hint,
+            .route = route,
+            .reason = reason,
+            .matched_keyword = matched_keyword,
+            .score = score,
+        };
+    }
+
+    fn apiErrorSuggestsQuotaExhaustion(self: *Agent) bool {
+        const detail = providers.snapshotLastApiErrorDetail(self.allocator) catch return false;
+        defer if (detail) |owned| self.allocator.free(owned);
+        const snapshot = detail orelse return false;
+        return providers.reliable.isRateLimited(snapshot) or
+            containsAsciiIgnoreCase(snapshot, "quota") or
+            containsAsciiIgnoreCase(snapshot, "credit") or
+            containsAsciiIgnoreCase(snapshot, "billing") or
+            containsAsciiIgnoreCase(snapshot, "insufficient_quota") or
+            containsAsciiIgnoreCase(snapshot, "out of credits");
+    }
+
+    fn routeShouldBeDegraded(self: *Agent, err: anyerror) bool {
+        if (err == error.RateLimited) return true;
+        const err_name = @errorName(err);
+        if (providers.reliable.isRateLimited(err_name)) return true;
+        return self.apiErrorSuggestsQuotaExhaustion();
+    }
+
+    fn routeDegradeReason(self: *Agent, err: anyerror) ![]u8 {
+        if (try providers.snapshotLastApiErrorDetail(self.allocator)) |detail| {
+            return detail;
+        }
+        return try self.allocator.dupe(u8, @errorName(err));
+    }
+
+    fn markRouteDegraded(self: *Agent, selection: RouteSelection, err: anyerror) !void {
+        if (!self.routeShouldBeDegraded(err)) return;
+        const now_ms = std.time.milliTimestamp();
+        const reason = try self.routeDegradeReason(err);
+        errdefer self.allocator.free(reason);
+
+        if (self.findActiveDegradedRoute(selection.route, now_ms)) |entry| {
+            entry.deinit(self.allocator);
+            entry.reason = reason;
+            entry.until_ms = now_ms + auto_route_degrade_cooldown_ms;
+            return;
+        }
+
+        try self.degraded_routes.append(self.allocator, .{
+            .hint = selection.route.hint,
+            .provider = selection.route.provider,
+            .model = selection.route.model,
+            .reason = reason,
+            .until_ms = now_ms + auto_route_degrade_cooldown_ms,
+        });
+    }
+
+    pub fn clearLastRouteTrace(self: *Agent) void {
+        if (self.last_route_trace) |trace| self.allocator.free(trace);
+        self.last_route_trace = null;
+    }
+
+    fn setLastRouteTrace(self: *Agent, selection: RouteSelection) !void {
+        self.clearLastRouteTrace();
+        const route_ref = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ selection.route.provider, selection.route.model },
+        );
+        defer self.allocator.free(route_ref);
+
+        if (selection.matched_keyword) |keyword| {
+            self.last_route_trace = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} -> {s} ({s}: \"{s}\"; score {d})",
+                .{ selection.hint, route_ref, selection.reason, keyword, selection.score },
+            );
+            return;
+        }
+
+        self.last_route_trace = try std.fmt.allocPrint(
+            self.allocator,
+            "{s} -> {s} ({s}; score {d})",
+            .{ selection.hint, route_ref, selection.reason, selection.score },
+        );
+    }
+
+    fn selectRouteHintForTurn(self: *Agent, user_message: []const u8) ?[]const u8 {
+        const selection = self.routeSelectionForTurn(user_message) orelse return null;
+        return selection.hint;
+    }
+
+    fn routeSelectionForTurn(self: *Agent, user_message: []const u8) ?RouteSelection {
+        if (self.model_pinned_by_user or self.model_routes.len == 0) return null;
+        const now_ms = std.time.milliTimestamp();
+
+        if (std.mem.indexOf(u8, user_message, "[IMAGE:") != null and self.hasUsableModelRouteHint("vision", now_ms)) {
+            return self.routeSelectionForHint(
+                "vision",
+                "image input with configured vision route",
+                null,
+                100,
+                now_ms,
+            );
+        }
+
+        const deep_keywords = [_][]const u8{
+            "root cause",
+            "investigate",
+            "compare",
+            "tradeoff",
+            "architecture",
+            "architectural",
+            "refactor",
+            "migration",
+            "migrate",
+            "design",
+            "plan",
+            "debug deeply",
+            "why does",
+            "why is",
+        };
+        const fast_keywords = [_][]const u8{
+            "status",
+            "list",
+            "show",
+            "current",
+            "version",
+            "pwd",
+            "ls",
+            "whoami",
+            "doctor",
+            "health",
+            "check",
+        };
+        const structured_fast_keywords = [_][]const u8{
+            "extract",
+            "count",
+            "classify",
+            "label",
+            "normalize",
+            "convert",
+            "format",
+            "return only",
+            "respond with",
+            "yes or no",
+            "true or false",
+        };
+
+        const deep_keyword = firstMatchingKeyword(user_message, &deep_keywords);
+        const fast_keyword = if (user_message.len <= 120) firstMatchingKeyword(user_message, &fast_keywords) else null;
+        const structured_fast_keyword = if (user_message.len <= 220)
+            firstMatchingKeyword(user_message, &structured_fast_keywords)
+        else
+            null;
+        const long_context = user_message.len > 600 or self.history.items.len >= 24;
+        const ambiguous_prompt = isAmbiguousPrompt(user_message);
+
+        var best: ?RouteSelection = null;
+
+        if (self.findUsableModelRouteByHint("fast", now_ms)) |route| {
+            var fast_score: i32 = 12 + routeMetadataScoreNudge(route);
+            var fast_reason: []const u8 = "fallback fast route";
+            var fast_matched_keyword: ?[]const u8 = null;
+            if (fast_keyword) |keyword| {
+                fast_score += 45;
+                fast_reason = "high-confidence short operational prompt";
+                fast_matched_keyword = keyword;
+            }
+            if (structured_fast_keyword) |keyword| {
+                fast_score += 55;
+                fast_reason = "high-confidence structured prompt";
+                fast_matched_keyword = keyword;
+            }
+            if (long_context) fast_score -= 15;
+            maybePromoteRoute(&best, .{
+                .hint = "fast",
+                .route = route,
+                .reason = fast_reason,
+                .matched_keyword = fast_matched_keyword,
+                .score = fast_score,
+            });
+        }
+
+        if (self.findUsableModelRouteByHint("balanced", now_ms)) |route| {
+            var balanced_score: i32 = 30 + routeMetadataScoreNudge(route);
+            var balanced_reason: []const u8 = "default balanced route";
+            if (ambiguous_prompt) {
+                balanced_score += 12;
+                balanced_reason = "ambiguous prompt kept on balanced route";
+            }
+            if (deep_keyword != null) balanced_score -= 10;
+            if (structured_fast_keyword != null or fast_keyword != null) balanced_score -= 8;
+            maybePromoteRoute(&best, .{
+                .hint = "balanced",
+                .route = route,
+                .reason = balanced_reason,
+                .score = balanced_score,
+            });
+        }
+
+        if (self.findUsableModelRouteByHint("deep", now_ms)) |route| {
+            var deep_score: i32 = 10 + routeMetadataScoreNudge(route);
+            var deep_reason: []const u8 = "fallback deep route";
+            var deep_matched_keyword: ?[]const u8 = null;
+            if (deep_keyword) |keyword| {
+                deep_score += 50;
+                deep_reason = "matched deep-task keyword";
+                deep_matched_keyword = keyword;
+            }
+            if (long_context) {
+                deep_score += 35;
+                if (deep_matched_keyword == null) deep_reason = "long prompt or deep conversation context";
+            }
+            if (user_message.len <= 120 and deep_keyword == null) deep_score -= 4;
+            maybePromoteRoute(&best, .{
+                .hint = "deep",
+                .route = route,
+                .reason = deep_reason,
+                .matched_keyword = deep_matched_keyword,
+                .score = deep_score,
+            });
+        }
+
+        if (self.findUsableModelRouteByHint("reasoning", now_ms)) |route| {
+            var reasoning_score: i32 = 8 + routeMetadataScoreNudge(route);
+            var reasoning_reason: []const u8 = "fallback reasoning route";
+            var reasoning_matched_keyword: ?[]const u8 = null;
+            if (deep_keyword) |keyword| {
+                reasoning_score += 45;
+                reasoning_reason = "matched deep-task keyword";
+                reasoning_matched_keyword = keyword;
+            }
+            if (long_context) {
+                reasoning_score += 30;
+                if (reasoning_matched_keyword == null) reasoning_reason = "long prompt or deep conversation context";
+            }
+            if (user_message.len <= 120 and deep_keyword == null) reasoning_score -= 4;
+            maybePromoteRoute(&best, .{
+                .hint = "reasoning",
+                .route = route,
+                .reason = reasoning_reason,
+                .matched_keyword = reasoning_matched_keyword,
+                .score = reasoning_score,
+            });
+        }
+
+        return best;
+    }
+
+    fn routeModelNameForTurn(self: *Agent, allocator: std.mem.Allocator, user_message: []const u8) !?[]u8 {
+        const selection = self.routeSelectionForTurn(user_message) orelse return null;
+        try self.setLastRouteTrace(selection);
+        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ selection.route.provider, selection.route.model });
+    }
+
     fn isExecToolName(tool_name: []const u8) bool {
         return commands.isExecToolName(tool_name);
     }
@@ -869,6 +1326,60 @@ pub const Agent = struct {
             }
         } else {
             try w.writeAll(" (no configured fallbacks)");
+        }
+
+        try w.writeAll("\nAuto-routing: ");
+        if (self.model_routes.len == 0) {
+            try w.writeAll("not configured");
+        } else {
+            try w.writeAll("configured");
+            if (self.model_pinned_by_user) {
+                try w.writeAll(" (currently pinned off for this session)");
+            }
+            if (self.last_route_trace) |trace| {
+                try w.print("\nLast auto-route: {s}", .{trace});
+            } else if (self.model_pinned_by_user) {
+                try w.writeAll("\nLast auto-route: inactive while the model is pinned");
+            } else {
+                try w.writeAll("\nLast auto-route: no decision recorded yet");
+            }
+        }
+
+        const now_ms = std.time.milliTimestamp();
+        if (self.model_routes.len > 0) {
+            try w.writeAll("\nAuto routes:");
+            for (self.model_routes) |route| {
+                try w.print(
+                    "\n  - {s} -> {s}/{s} (cost={s}, quota={s})",
+                    .{
+                        route.hint,
+                        route.provider,
+                        route.model,
+                        routeCostClassLabel(route),
+                        routeQuotaClassLabel(route),
+                    },
+                );
+                if (self.activeDegradedRouteForStatus(route, now_ms)) |entry| {
+                    const remaining_ms = @max(@as(i64, 0), entry.until_ms - now_ms);
+                    const remaining_secs: u64 = @intCast(@divFloor(remaining_ms + 999, 1000));
+                    try w.print(" [degraded: {s}; {d}s remaining]", .{ entry.reason, remaining_secs });
+                }
+            }
+        }
+
+        var wrote_degraded_routes = false;
+        for (self.degraded_routes.items) |entry| {
+            if (entry.until_ms <= now_ms) continue;
+            if (!wrote_degraded_routes) {
+                try w.writeAll("\nDegraded routes:");
+                wrote_degraded_routes = true;
+            }
+            const remaining_ms = @max(@as(i64, 0), entry.until_ms - now_ms);
+            const remaining_secs: u64 = @intCast(@divFloor(remaining_ms + 999, 1000));
+            try w.print(
+                "\n  - {s} -> {s}/{s} ({s}; {d}s cooldown remaining)",
+                .{ entry.hint, entry.provider, entry.model, entry.reason, remaining_secs },
+            );
         }
 
         try w.writeAll("\nSwitch: /model <name>");
@@ -983,10 +1494,28 @@ pub const Agent = struct {
             break :blk turn_input.llm_user_message orelse user_message;
         };
 
+        const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
+        if (turn_route_selection) |selection| {
+            try self.setLastRouteTrace(selection);
+        }
+        const turn_model_name = if (turn_route_selection) |selection|
+            try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ selection.route.provider, selection.route.model })
+        else
+            self.model_name;
+        const turn_model_name_owned = !std.mem.eql(u8, turn_model_name, self.model_name);
+        defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
+
         // Inject system prompt on first turn (or when tracked workspace files changed).
         const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
+        }
+        if (self.has_system_prompt) {
+            if (self.system_prompt_model_name) |cached_model| {
+                if (!std.mem.eql(u8, cached_model, turn_model_name)) {
+                    self.has_system_prompt = false;
+                }
+            }
         }
 
         const turn_has_conversation_context = self.conversation_context != null;
@@ -1005,23 +1534,14 @@ pub const Agent = struct {
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
-            const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
+            const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
-                .model_name = self.model_name,
+                .model_name = turn_model_name,
                 .tools = self.tools,
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
             });
-            defer self.allocator.free(system_prompt);
-
-            // Append tool instructions
-            const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
-            defer self.allocator.free(tool_instructions);
-
-            const full_system = try self.allocator.alloc(u8, system_prompt.len + tool_instructions.len);
-            @memcpy(full_system[0..system_prompt.len], system_prompt);
-            @memcpy(full_system[system_prompt.len..], tool_instructions);
 
             // Keep exactly one canonical system prompt at history[0].
             // This allows /model to invalidate and refresh the prompt in place.
@@ -1045,6 +1565,8 @@ pub const Agent = struct {
             self.has_system_prompt = true;
             self.system_prompt_has_conversation_context = turn_has_conversation_context;
             self.workspace_prompt_fingerprint = workspace_fp;
+            if (self.system_prompt_model_name) |cached_model| self.allocator.free(cached_model);
+            self.system_prompt_model_name = try self.allocator.dupe(u8, turn_model_name);
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
@@ -1084,7 +1606,7 @@ pub const Agent = struct {
                 self.history.items[0].content
             else
                 null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, effective_user_message);
+            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, turn_model_name, system_prompt, effective_user_message);
             if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
                 errdefer self.allocator.free(cached_response);
                 const history_copy = try self.allocator.dupe(u8, cached_response);
@@ -1101,10 +1623,15 @@ pub const Agent = struct {
         // Record agent event
         const start_event = ObserverEvent{ .llm_request = .{
             .provider = self.provider.getName(),
-            .model = self.model_name,
+            .model = turn_model_name,
             .messages_count = self.history.items.len,
         } };
         self.observer.recordEvent(&start_event);
+
+        const turn_token_limit = context_tokens.resolveContextTokens(self.token_limit_override, turn_model_name);
+        const turn_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(self.max_tokens_override, turn_model_name);
+        const turn_token_limit_cap: u32 = @intCast(@min(turn_token_limit, @as(u64, std.math.maxInt(u32))));
+        const turn_max_tokens = @min(turn_max_tokens_raw, turn_token_limit_cap);
 
         // Tool call loop — reuse a single arena across iterations (retains pages)
         var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1121,7 +1648,7 @@ pub const Agent = struct {
             const arena = iter_arena.allocator();
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
-            const messages = try self.buildProviderMessages(arena);
+            const messages = try self.buildProviderMessages(arena, turn_model_name);
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
@@ -1129,28 +1656,30 @@ pub const Agent = struct {
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
             const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
-            const request_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+            const request_max_tokens = self.effectiveMaxTokensForTurn(
                 messages,
                 if (native_tools_enabled) turn_tool_specs else null,
+                turn_token_limit,
+                turn_max_tokens,
             );
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
             if (is_streaming) {
-                self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, true);
+                self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
                     self.allocator,
                     .{
                         .messages = messages,
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
                         .tools = null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
-                    self.model_name,
+                    turn_model_name,
                     self.temperature,
                     self.stream_callback.?,
                     self.stream_ctx.?,
@@ -1158,7 +1687,7 @@ pub const Agent = struct {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .duration_ms = fail_duration,
                         .success = false,
                         .error_message = @errorName(err),
@@ -1168,38 +1697,42 @@ pub const Agent = struct {
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
                         if (self.verbose_level == .on or self.verbose_level == .full) {
-                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
+                            log.info("Auto-disabling vision for model {s}", .{turn_model_name});
                         }
-                        try self.markVisionDisabled();
-                        const retry_msgs = try self.buildProviderMessages(arena);
-                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                        try self.markVisionDisabled(turn_model_name);
+                        const retry_msgs = try self.buildProviderMessages(arena, turn_model_name);
+                        const retry_max_tokens = self.effectiveMaxTokensForTurn(
                             retry_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
+                            turn_token_limit,
+                            turn_max_tokens,
                         );
                         response_attempt = 2;
-                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, true);
+                        self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, true);
                         break :retry_stream self.provider.streamChat(
                             self.allocator,
                             .{
                                 .messages = retry_msgs,
-                                .model = self.model_name,
+                                .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
                                 .tools = null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
-                            self.model_name,
+                            turn_model_name,
                             self.temperature,
                             self.stream_callback.?,
                             self.stream_ctx.?,
                         ) catch |retry_err| {
-                            self.emitUsageFailure();
+                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                            self.emitUsageFailure(turn_model_name);
                             return retry_err;
                         };
                     }
 
-                    self.emitUsageFailure();
+                    if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
+                    self.emitUsageFailure(turn_model_name);
                     return err;
                 };
                 response = ChatResponse{
@@ -1209,26 +1742,26 @@ pub const Agent = struct {
                     .model = stream_result.model,
                 };
             } else {
-                self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, false);
+                self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, false);
                 response = self.provider.chat(
                     self.allocator,
                     .{
                         .messages = messages,
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
                         .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
-                    self.model_name,
+                    turn_model_name,
                     self.temperature,
                 ) catch |err| retry_blk: {
                     // Record the failed attempt
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .duration_ms = fail_duration,
                         .success = false,
                         .error_message = @errorName(err),
@@ -1238,30 +1771,34 @@ pub const Agent = struct {
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
                         if (self.verbose_level == .on or self.verbose_level == .full) {
-                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
+                            log.info("Auto-disabling vision for model {s}", .{turn_model_name});
                         }
-                        try self.markVisionDisabled();
-                        const retry_msgs = try self.buildProviderMessages(arena);
-                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                        try self.markVisionDisabled(turn_model_name);
+                        const retry_msgs = try self.buildProviderMessages(arena, turn_model_name);
+                        const retry_max_tokens = self.effectiveMaxTokensForTurn(
                             retry_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
+                            turn_token_limit,
+                            turn_max_tokens,
                         );
-                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, false);
+                        response_attempt = 2;
+                        self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
                                 .messages = retry_msgs,
-                                .model = self.model_name,
+                                .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
-                            self.model_name,
+                            turn_model_name,
                             self.temperature,
                         ) catch |retry_err| {
-                            self.emitUsageFailure();
+                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                            self.emitUsageFailure(turn_model_name);
                             return retry_err;
                         };
                     }
@@ -1273,28 +1810,31 @@ pub const Agent = struct {
                         self.forceCompressHistory())
                     {
                         self.context_was_compacted = true;
-                        const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
-                        const recovery_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                        const recovery_msgs = self.buildProviderMessages(arena, turn_model_name) catch |prep_err| return prep_err;
+                        const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                             recovery_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
+                            turn_token_limit,
+                            turn_max_tokens,
                         );
                         response_attempt = 2;
-                        self.logLlmRequest(iteration + 1, 2, recovery_msgs, native_tools_enabled, false);
+                        self.logLlmRequest(iteration + 1, 2, turn_model_name, recovery_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
                                 .messages = recovery_msgs,
-                                .model = self.model_name,
+                                .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = recovery_max_tokens,
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
-                            self.model_name,
+                            turn_model_name,
                             self.temperature,
                         ) catch |retry_after_compact_err| {
-                            self.emitUsageFailure();
+                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
+                            self.emitUsageFailure(turn_model_name);
                             return retry_after_compact_err;
                         };
                     }
@@ -1302,51 +1842,55 @@ pub const Agent = struct {
                     // Retry once
                     std.Thread.sleep(500 * std.time.ns_per_ms);
                     response_attempt = 2;
-                    self.logLlmRequest(iteration + 1, 2, messages, native_tools_enabled, false);
+                    self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, false);
                     break :retry_blk self.provider.chat(
                         self.allocator,
                         .{
                             .messages = messages,
-                            .model = self.model_name,
+                            .model = turn_model_name,
                             .temperature = self.temperature,
                             .max_tokens = request_max_tokens,
                             .tools = if (native_tools_enabled) turn_tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
                         },
-                        self.model_name,
+                        turn_model_name,
                         self.temperature,
                     ) catch |retry_err| {
                         // Context exhaustion recovery: if we have enough history,
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
-                            const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
-                            const recovery_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                            const recovery_msgs = self.buildProviderMessages(arena, turn_model_name) catch |prep_err| return prep_err;
+                            const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                                 recovery_msgs,
                                 if (native_tools_enabled) turn_tool_specs else null,
+                                turn_token_limit,
+                                turn_max_tokens,
                             );
                             response_attempt = 3;
-                            self.logLlmRequest(iteration + 1, 3, recovery_msgs, native_tools_enabled, false);
+                            self.logLlmRequest(iteration + 1, 3, turn_model_name, recovery_msgs, native_tools_enabled, false);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
                                 .{
                                     .messages = recovery_msgs,
-                                    .model = self.model_name,
+                                    .model = turn_model_name,
                                     .temperature = self.temperature,
                                     .max_tokens = recovery_max_tokens,
                                     .tools = if (native_tools_enabled) turn_tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
                                 },
-                                self.model_name,
+                                turn_model_name,
                                 self.temperature,
                             ) catch |retry_after_compact_err| {
-                                self.emitUsageFailure();
+                                if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
+                                self.emitUsageFailure(turn_model_name);
                                 return retry_after_compact_err;
                             };
                         }
-                        self.emitUsageFailure();
+                        if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                        self.emitUsageFailure(turn_model_name);
                         return retry_err;
                     };
                 };
@@ -1356,7 +1900,7 @@ pub const Agent = struct {
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
             const resp_event = ObserverEvent{ .llm_response = .{
                 .provider = self.provider.getName(),
-                .model = self.model_name,
+                .model = turn_model_name,
                 .duration_ms = duration_ms,
                 .success = true,
                 .error_message = null,
@@ -1439,8 +1983,9 @@ pub const Agent = struct {
                 free_parsed_calls = true;
                 parsed_text = xml_parsed.text;
                 free_parsed_text = true;
-                // For XML path, store the raw response text as history
-                assistant_history_content = response_text;
+                // For XML path, never preserve model-fabricated <tool_result> markup in history.
+                assistant_history_content = try dispatcher.stripToolResultMarkup(self.allocator, response_text);
+                free_assistant_history = true;
             }
 
             // Determine display text.
@@ -1537,9 +2082,9 @@ pub const Agent = struct {
                         self.history.items[0].content
                     else
                         null;
-                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, effective_user_message);
+                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, effective_user_message);
                     const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
-                    rc.put(self.allocator, store_key_hex, self.model_name, final_text, token_count) catch {};
+                    rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
                 }
 
                 return final_text;
@@ -1674,7 +2219,7 @@ pub const Agent = struct {
         defer self.allocator.free(summary_messages);
         const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
 
-        self.logLlmRequest(self.max_tool_iterations + 1, 1, summary_messages, false, false);
+        self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, summary_messages, false, false);
         var summary_response = self.provider.chat(
             self.allocator,
             .{
@@ -1927,7 +2472,15 @@ pub const Agent = struct {
         return .{ .slice = text[0..LLM_LOG_MAX_BYTES], .truncated = true };
     }
 
-    fn logLlmRequest(self: *Agent, iteration: u32, attempt: u32, messages: []const ChatMessage, native_tools_enabled: bool, is_streaming: bool) void {
+    fn logLlmRequest(
+        self: *Agent,
+        iteration: u32,
+        attempt: u32,
+        model_name: []const u8,
+        messages: []const ChatMessage,
+        native_tools_enabled: bool,
+        is_streaming: bool,
+    ) void {
         if (!self.log_llm_io) return;
         const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
         log.info(
@@ -1937,7 +2490,7 @@ pub const Agent = struct {
                 iteration,
                 attempt,
                 self.provider.getName(),
-                self.model_name,
+                model_name,
                 messages.len,
                 native_tools_enabled,
                 is_streaming,
@@ -2039,38 +2592,38 @@ pub const Agent = struct {
         });
     }
 
-    fn emitUsageFailure(self: *Agent) void {
+    fn emitUsageFailure(self: *Agent, model_name: []const u8) void {
         const failed = ChatResponse{
-            .model = self.model_name,
+            .model = model_name,
             .usage = .{},
         };
         self.emitUsageRecord(&failed, false);
     }
 
     /// Check if vision is disabled for current model (either configured or auto-detected).
-    fn isVisionDisabled(self: *const Agent) bool {
+    fn isVisionDisabled(self: *const Agent, model_name: []const u8) bool {
         for (self.vision_disabled_models) |model| {
-            if (std.mem.eql(u8, model, self.model_name)) return true;
+            if (std.mem.eql(u8, model, model_name)) return true;
         }
         for (self.detected_vision_disabled.items) |model| {
-            if (std.mem.eql(u8, model, self.model_name)) return true;
+            if (std.mem.eql(u8, model, model_name)) return true;
         }
         return false;
     }
 
     /// Add model to detected vision disabled list if not already present.
-    fn markVisionDisabled(self: *Agent) !void {
+    fn markVisionDisabled(self: *Agent, model_name: []const u8) !void {
         const already_disabled = for (self.detected_vision_disabled.items) |model| {
-            if (std.mem.eql(u8, model, self.model_name)) break true;
+            if (std.mem.eql(u8, model, model_name)) break true;
         } else false;
         if (!already_disabled) {
-            try self.detected_vision_disabled.append(self.allocator, try self.allocator.dupe(u8, self.model_name));
+            try self.detected_vision_disabled.append(self.allocator, try self.allocator.dupe(u8, model_name));
         }
     }
 
     /// Build provider-ready ChatMessage slice from owned history.
     /// Applies multimodal preprocessing and vision capability checks.
-    fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
+    fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator, model_name: []const u8) ![]ChatMessage {
         const m = try arena.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
             m[i] = msg.toChatMessage();
@@ -2082,21 +2635,21 @@ pub const Agent = struct {
         }
 
         // Check if vision is disabled (configured or auto-detected)
-        if (self.isVisionDisabled()) {
+        if (self.isVisionDisabled(model_name)) {
             if (self.verbose_level == .on or self.verbose_level == .full) {
-                log.info("Vision disabled for model {s}, stripping image markers", .{self.model_name});
+                log.info("Vision disabled for model {s}, stripping image markers", .{model_name});
             }
             return multimodal.stripImageMarkers(arena, m);
         }
 
         // Check if provider supports vision for this model
-        if (!self.provider.supportsVisionForModel(self.model_name)) {
+        if (!self.provider.supportsVisionForModel(model_name)) {
             if (self.verbose_level == .on or self.verbose_level == .full) {
-                log.info("Model {s} does not support vision, stripping image markers", .{self.model_name});
+                log.info("Model {s} does not support vision, stripping image markers", .{model_name});
             }
             // Auto-disable vision if configured
             if (self.auto_disable_vision_on_error) {
-                try self.markVisionDisabled();
+                try self.markVisionDisabled(model_name);
             }
             return multimodal.stripImageMarkers(arena, m);
         }
@@ -2382,7 +2935,6 @@ test "dispatcher module reexport" {
     _ = dispatcher.ToolExecutionResult;
     _ = dispatcher.parseToolCalls;
     _ = dispatcher.formatToolResults;
-    _ = dispatcher.buildToolInstructions;
     _ = dispatcher.buildAssistantHistoryWithToolCalls;
 }
 
@@ -2713,14 +3265,14 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    const text_model_messages = try agent.buildProviderMessages(arena);
+    const text_model_messages = try agent.buildProviderMessages(arena, agent.model_name);
     try std.testing.expectEqual(@as(usize, 1), text_model_messages.len);
     try std.testing.expect(text_model_messages[0].content_parts == null);
     try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "[IMAGE:") == null);
     try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "omitted because the current model does not support vision") != null);
 
     agent.model_name = "vision-model";
-    const messages = try agent.buildProviderMessages(arena);
+    const messages = try agent.buildProviderMessages(arena, agent.model_name);
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
 }
@@ -2801,7 +3353,7 @@ test "Agent buildProviderMessages allows workspace image paths" {
     var arena_impl = std.heap.ArenaAllocator.init(allocator);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
-    const messages = try agent.buildProviderMessages(arena);
+    const messages = try agent.buildProviderMessages(arena, agent.model_name);
 
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
@@ -3691,6 +4243,307 @@ test "slash /model keeps explicit token_limit override" {
     try std.testing.expect(std.mem.indexOf(u8, response, "claude-opus-4-6") != null);
     try std.testing.expectEqual(@as(u64, 64_000), agent.token_limit);
     try std.testing.expectEqual(@as(u32, 1024), agent.max_tokens);
+}
+
+test "auto route selects provider-prefixed model ref for fast prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "show current status")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-70b", routed);
+}
+
+test "auto route selects fast model for short structured prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b", .cost_class = .free, .quota_class = .unlimited },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4", .cost_class = .standard, .quota_class = .normal },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4", .cost_class = .premium, .quota_class = .constrained },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(
+        allocator,
+        "Extract the version from 'release-1.2.3' and return only the semver.",
+    )).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-8b", routed);
+}
+
+test "auto route keeps ambiguous short prompt on balanced model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b", .cost_class = .free, .quota_class = .unlimited },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4", .cost_class = .premium, .quota_class = .constrained },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4", .cost_class = .premium, .quota_class = .constrained },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "What should we do here?")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", routed);
+}
+
+test "auto route selects deep model for investigation prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b", .cost_class = .free, .quota_class = .unlimited },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4", .cost_class = .standard, .quota_class = .normal },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4", .cost_class = .premium, .quota_class = .constrained },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(
+        allocator,
+        "Investigate the root cause of this regression and compare the tradeoffs of the possible fixes.",
+    )).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-opus-4", routed);
+}
+
+test "auto route records last route trace for short structured prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{
+            .hint = "fast",
+            .provider = "groq",
+            .model = "llama-3.3-8b",
+            .cost_class = .free,
+            .quota_class = .unlimited,
+        },
+        .{
+            .hint = "balanced",
+            .provider = "openrouter",
+            .model = "anthropic/claude-sonnet-4",
+            .cost_class = .standard,
+            .quota_class = .normal,
+        },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(
+        allocator,
+        "Extract the version from 'release-1.2.3' and return only the semver.",
+    )).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-8b", routed);
+    try std.testing.expect(agent.last_route_trace != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.last_route_trace.?, "fast -> groq/llama-3.3-8b") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, agent.last_route_trace.?, "high-confidence") != null or
+            std.mem.indexOf(u8, agent.last_route_trace.?, "structured prompt") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, agent.last_route_trace.?, "score ") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, agent.last_route_trace.?, "\"version\"") != null or
+            std.mem.indexOf(u8, agent.last_route_trace.?, "\"extract\"") != null or
+            std.mem.indexOf(u8, agent.last_route_trace.?, "\"return only\"") != null,
+    );
+}
+
+test "model status reports last auto-route trace" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{
+            .hint = "fast",
+            .provider = "groq",
+            .model = "llama-3.3-8b",
+            .cost_class = .free,
+            .quota_class = .unlimited,
+        },
+        .{
+            .hint = "balanced",
+            .provider = "openrouter",
+            .model = "anthropic/claude-sonnet-4",
+            .cost_class = .standard,
+            .quota_class = .normal,
+        },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(
+        allocator,
+        "Extract the version from 'release-1.2.3' and return only the semver.",
+    )).?;
+    defer allocator.free(routed);
+
+    const status = try agent.formatModelStatus();
+    defer allocator.free(status);
+
+    try std.testing.expect(std.mem.indexOf(u8, status, "Auto-routing: configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Last auto-route: fast -> groq/llama-3.3-8b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Auto routes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "cost=free, quota=unlimited") != null);
+}
+
+test "auto route skips degraded fast route after rate limit" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    const selection = agent.routeSelectionForTurn("show current status").?;
+    try agent.markRouteDegraded(selection, error.RateLimited);
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "show current status")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", routed);
+
+    const status = try agent.formatModelStatus();
+    defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Degraded routes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "fast -> groq/llama-3.3-8b") != null);
+}
+
+test "auto route degrades route on out-of-credits provider detail" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+    providers.setLastApiErrorDetail("groq", "out of credits");
+
+    const selection = agent.routeSelectionForTurn("show current status").?;
+    try agent.markRouteDegraded(selection, error.AllProvidersFailed);
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "show current status")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", routed);
+}
+
+test "auto route is disabled when model is pinned" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+    agent.model_pinned_by_user = true;
+
+    try std.testing.expect((try agent.routeModelNameForTurn(allocator, "show current status")) == null);
+}
+
+test "auto route selection benchmark stays below visible overhead" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4" },
+        .{ .hint = "vision", .provider = "openrouter", .model = "openai/gpt-4.1" },
+    };
+
+    const iterations: usize = 50_000;
+    var timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const hint = agent.selectRouteHintForTurn("show current status");
+        try std.testing.expect(hint != null);
+        try std.testing.expectEqualStrings("fast", hint.?);
+    }
+    const elapsed_ns = timer.read();
+    const avg_ns = elapsed_ns / iterations;
+
+    // Heuristic routing should stay far below human-visible latency.
+    try std.testing.expect(avg_ns < 200_000);
+}
+
+test "slash /model auto clears pin and invalidates cached prompt model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+    agent.model_name = "gpt-4o";
+    agent.model_name_owned = false;
+    agent.model_pinned_by_user = true;
+    agent.has_system_prompt = true;
+    agent.system_prompt_has_conversation_context = true;
+    agent.system_prompt_model_name = try allocator.dupe(u8, "groq/llama-3.3-70b");
+
+    const response = (try agent.handleSlashCommand("/model auto")).?;
+    defer allocator.free(response);
+
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "Automatic model routing enabled. Reverted to the configured default model: {s}",
+        .{agent.default_model},
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, response);
+    try std.testing.expect(!agent.model_pinned_by_user);
+    try std.testing.expectEqualStrings(agent.default_model, agent.model_name);
+    try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expect(!agent.system_prompt_has_conversation_context);
+    try std.testing.expect(agent.system_prompt_model_name == null);
+}
+
+test "slash /model auto without routes restores default model and explains routing is not configured" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_name = "gpt-4o";
+    agent.model_name_owned = false;
+    agent.model_pinned_by_user = true;
+
+    const response = (try agent.handleSlashCommand("/model auto")).?;
+    defer allocator.free(response);
+
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "Automatic model routing is not configured. Reverted to the configured default model: {s}",
+        .{agent.default_model},
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, response);
+    try std.testing.expect(!agent.model_pinned_by_user);
+    try std.testing.expectEqualStrings(agent.default_model, agent.model_name);
+}
+
+test "slash /model pins explicit selection" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    const response = (try agent.handleSlashCommand("/model gpt-4o")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "gpt-4o") != null);
+    try std.testing.expect(agent.model_pinned_by_user);
 }
 
 test "slash /model without name shows current" {
@@ -5045,6 +5898,75 @@ test "slash /model dupe prevents use-after-free" {
     try std.testing.expectEqualStrings("new-model-xyz", agent.model_name);
 }
 
+test "turn passes auto-routed model to provider" {
+    const CaptureProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, model),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "capture-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = CaptureProvider.chatWithSystem,
+        .chat = CaptureProvider.chat,
+        .supportsNativeTools = CaptureProvider.supportsNativeTools,
+        .getName = CaptureProvider.getName,
+        .deinit = CaptureProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrFromInt(1),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .model_routes = &.{
+            .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+            .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+        },
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("show current status");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-70b", response);
+}
+
 // Bug 2: @intCast on negative i64 duration should not panic.
 // Simulate by verifying the @max(0, ...) clamping logic.
 test "milliTimestamp negative difference clamps to zero" {
@@ -5599,6 +6521,112 @@ test "Agent shell failure with normalized output does not poison next turn" {
     }
 }
 
+test "Agent strips fabricated tool_result blocks from XML assistant history" {
+    const XmlFabricationProvider = struct {
+        saw_fake_tool_result_in_history: bool = false,
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                return .{
+                    .content = try allocator.dupe(
+                        u8,
+                        "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"printf hi\"}}</tool_call><tool_result name=\"shell\" status=\"ok\">fabricated</tool_result>",
+                    ),
+                    .tool_calls = &.{},
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            for (request.messages) |msg| {
+                if (msg.role != .assistant) continue;
+                if (std.mem.indexOf(u8, msg.content, "fabricated") != null) {
+                    self.saw_fake_tool_result_in_history = true;
+                }
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "xml-fabrication-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = XmlFabricationProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = XmlFabricationProvider.chatWithSystem,
+        .chat = XmlFabricationProvider.chat,
+        .supportsNativeTools = XmlFabricationProvider.supportsNativeTools,
+        .getName = XmlFabricationProvider.getName,
+        .deinit = XmlFabricationProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var shell_tool_impl = tools_mod.shell.ShellTool{ .workspace_dir = "." };
+    const tool_list = [_]Tool{shell_tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run shell");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(!provider_state.saw_fake_tool_result_in_history);
+}
+
 test "Agent streaming fields can be set" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};
@@ -5835,6 +6863,35 @@ test "Agent.fromConfig sets multimodal_unrestricted for yolo" {
     defer agent.deinit();
 
     try std.testing.expect(agent.multimodal_unrestricted == true);
+    try std.testing.expect(agent.exec_security == .full);
+    try std.testing.expect(agent.exec_ask == .off);
+    try std.testing.expect(agent.default_exec_security == .full);
+    try std.testing.expect(agent.default_exec_ask == .off);
+}
+
+test "slash /restart restores config-derived exec policy for yolo" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .yolo;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    agent.exec_security = .allowlist;
+    agent.exec_ask = .on_miss;
+
+    const response = (try agent.handleSlashCommand("/restart")).?;
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("Session restarted.", response);
+    try std.testing.expect(agent.exec_security == .full);
+    try std.testing.expect(agent.exec_ask == .off);
 }
 
 test "Agent.fromConfig does not set multimodal_unrestricted for full" {

@@ -538,7 +538,9 @@ pub const SessionManager = struct {
         const now = std.time.timestamp();
         var evicted: usize = 0;
 
-        // Collect keys to remove (can't modify map while iterating)
+        // Collect keys to remove (can't modify map while iterating).
+        // Active turns keep stale last_active until the turn finishes, so skip
+        // any session that is currently executing.
         var to_remove: std.ArrayListUnmanaged([]const u8) = .{};
         defer to_remove.deinit(self.allocator);
 
@@ -546,7 +548,7 @@ pub const SessionManager = struct {
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
             const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
-            if (idle_secs > max_idle_secs) {
+            if (idle_secs > max_idle_secs and !session.turn_running.load(.acquire)) {
                 to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
@@ -1900,6 +1902,22 @@ test "evictIdle with no sessions returns 0" {
     defer sm.deinit();
 
     try testing.expectEqual(@as(usize, 0), sm.evictIdle(60));
+}
+
+test "evictIdle preserves sessions with active turns" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("busy:1");
+    session.last_active = std.time.timestamp() - 1000;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    const evicted = sm.evictIdle(5);
+    try testing.expectEqual(@as(usize, 0), evicted);
+    try testing.expect(sm.sessions.contains("busy:1"));
 }
 
 // ---------------------------------------------------------------------------
