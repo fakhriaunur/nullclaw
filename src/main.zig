@@ -28,6 +28,7 @@ const Command = enum {
     hardware,
     migrate,
     memory,
+    history,
     workspace,
     capabilities,
     models,
@@ -42,6 +43,7 @@ const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
 const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|forget";
+const HISTORY_SUBCOMMANDS = "list|show";
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
 const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
 const AUTH_SUBCOMMANDS = "login|status|logout";
@@ -66,6 +68,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  hardware     Discover and manage hardware
     \\  migrate      Migrate data from other agent runtimes
     \\  memory       Inspect and maintain memory subsystem
+    \\  history      View session conversation history
     \\  workspace    Maintain workspace markdown/bootstrap files
     \\  capabilities Show runtime capabilities manifest
     \\  models       Manage provider model catalogs
@@ -85,6 +88,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  hardware <{s}> [ARGS]
     \\  migrate openclaw [--dry-run] [--source PATH]
     \\  memory <{s}> [ARGS]
+    \\  history <{s}> [ARGS]
     \\  workspace <{s}> [ARGS]
     \\  capabilities [--json]
     \\  models <{s}> [ARGS]
@@ -99,6 +103,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
         SKILLS_SUBCOMMANDS,
         HARDWARE_SUBCOMMANDS,
         MEMORY_SUBCOMMANDS,
+        HISTORY_SUBCOMMANDS,
         WORKSPACE_SUBCOMMANDS,
         MODELS_SUBCOMMANDS,
         AUTH_SUBCOMMANDS,
@@ -122,6 +127,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "hardware", .hardware },
         .{ "migrate", .migrate },
         .{ "memory", .memory },
+        .{ "history", .history },
         .{ "workspace", .workspace },
         .{ "capabilities", .capabilities },
         .{ "models", .models },
@@ -203,6 +209,7 @@ pub fn main() !void {
         .hardware => try runHardware(allocator, sub_args),
         .migrate => try runMigrate(allocator, sub_args),
         .memory => try runMemory(allocator, sub_args),
+        .history => try runHistory(allocator, sub_args),
         .workspace => try runWorkspace(allocator, sub_args),
         .capabilities => try runCapabilities(allocator, sub_args),
         .models => try runModels(allocator, sub_args),
@@ -591,10 +598,10 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Usage: nullclaw skills <{s}> [args]
             \\
             \\Commands:
-            \\  list                          List installed skills
+            \\  list [--json]                 List installed skills
             \\  install <source>              Install from GitHub URL or path
             \\  remove <name>                 Remove a skill
-            \\  info <name>                   Show skill details
+            \\  info <name> [--json]          Show skill details
             \\
         , .{SKILLS_SUBCOMMANDS}), .{});
         std.process.exit(1);
@@ -609,22 +616,42 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     const subcmd = sub_args[0];
 
     if (std.mem.eql(u8, subcmd, "list")) {
+        const json_mode = hasJsonFlag(sub_args[1..]);
         const skills_list = yc.skills.listSkills(allocator, cfg.workspace_dir) catch |err| {
             std.debug.print("Failed to list skills: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         defer yc.skills.freeSkills(allocator, skills_list);
 
-        if (skills_list.len == 0) {
-            std.debug.print("No skills installed.\n", .{});
+        if (json_mode) {
+            var buf: [65536]u8 = undefined;
+            var bw = std.fs.File.stdout().writer(&buf);
+            const out = &bw.interface;
+            out.writeAll("[") catch return;
+            for (skills_list, 0..) |skill, idx| {
+                if (idx > 0) out.writeAll(",") catch return;
+                out.writeAll("{\"name\":\"") catch return;
+                writeJsonEscaped(out, skill.name);
+                out.writeAll("\",\"version\":\"") catch return;
+                writeJsonEscaped(out, skill.version);
+                out.writeAll("\",\"description\":\"") catch return;
+                writeJsonEscaped(out, skill.description);
+                out.print("\",\"enabled\":{}}}", .{skill.enabled}) catch return;
+            }
+            out.writeAll("]\n") catch return;
+            out.flush() catch return;
         } else {
-            std.debug.print("Installed skills ({d}):\n", .{skills_list.len});
-            for (skills_list) |skill| {
-                std.debug.print("  {s} v{s}", .{ skill.name, skill.version });
-                if (skill.description.len > 0) {
-                    std.debug.print(" -- {s}", .{skill.description});
+            if (skills_list.len == 0) {
+                std.debug.print("No skills installed.\n", .{});
+            } else {
+                std.debug.print("Installed skills ({d}):\n", .{skills_list.len});
+                for (skills_list) |skill| {
+                    std.debug.print("  {s} v{s}", .{ skill.name, skill.version });
+                    if (skill.description.len > 0) {
+                        std.debug.print(" -- {s}", .{skill.description});
+                    }
+                    std.debug.print("\n", .{});
                 }
-                std.debug.print("\n", .{});
             }
         }
     } else if (std.mem.eql(u8, subcmd, "install")) {
@@ -654,9 +681,10 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         std.debug.print("Removed skill: {s}\n", .{sub_args[1]});
     } else if (std.mem.eql(u8, subcmd, "info")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw skills info <name>\n", .{});
+            std.debug.print("Usage: nullclaw skills info <name> [--json]\n", .{});
             std.process.exit(1);
         }
+        const json_mode = hasJsonFlag(sub_args[2..]);
         const skill_path = std.fmt.allocPrint(allocator, "{s}/skills/{s}", .{ cfg.workspace_dir, sub_args[1] }) catch {
             std.debug.print("Out of memory\n", .{});
             std.process.exit(1);
@@ -669,17 +697,33 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         };
         defer yc.skills.freeSkill(allocator, &skill);
 
-        std.debug.print("Skill: {s}\n", .{skill.name});
-        std.debug.print("  Version:     {s}\n", .{skill.version});
-        if (skill.description.len > 0) {
-            std.debug.print("  Description: {s}\n", .{skill.description});
-        }
-        if (skill.author.len > 0) {
-            std.debug.print("  Author:      {s}\n", .{skill.author});
-        }
-        std.debug.print("  Enabled:     {}\n", .{skill.enabled});
-        if (skill.instructions.len > 0) {
-            std.debug.print("  Instructions: {d} bytes\n", .{skill.instructions.len});
+        if (json_mode) {
+            var buf: [65536]u8 = undefined;
+            var bw = std.fs.File.stdout().writer(&buf);
+            const out = &bw.interface;
+            out.writeAll("{\"name\":\"") catch return;
+            writeJsonEscaped(out, skill.name);
+            out.writeAll("\",\"version\":\"") catch return;
+            writeJsonEscaped(out, skill.version);
+            out.writeAll("\",\"description\":\"") catch return;
+            writeJsonEscaped(out, skill.description);
+            out.writeAll("\",\"author\":\"") catch return;
+            writeJsonEscaped(out, skill.author);
+            out.print("\",\"enabled\":{},\"instructions_bytes\":{d}}}\n", .{ skill.enabled, skill.instructions.len }) catch return;
+            out.flush() catch return;
+        } else {
+            std.debug.print("Skill: {s}\n", .{skill.name});
+            std.debug.print("  Version:     {s}\n", .{skill.version});
+            if (skill.description.len > 0) {
+                std.debug.print("  Description: {s}\n", .{skill.description});
+            }
+            if (skill.author.len > 0) {
+                std.debug.print("  Author:      {s}\n", .{skill.author});
+            }
+            std.debug.print("  Enabled:     {}\n", .{skill.enabled});
+            if (skill.instructions.len > 0) {
+                std.debug.print("  Instructions: {d} bytes\n", .{skill.instructions.len});
+            }
         }
     } else {
         std.debug.print("Unknown skills command: {s}\n", .{subcmd});
@@ -811,12 +855,13 @@ fn printMemoryUsage() void {
         \\Usage: nullclaw memory <{s}> [args]
         \\
         \\Commands:
-        \\  stats                         Show resolved memory config and key counters
+        \\  stats [--json]                Show resolved memory config and key counters
         \\  count                         Show total number of memory entries
         \\  reindex                       Rebuild vector index from primary memory
-        \\  search <query> [--limit N]    Run runtime retrieval (keyword/hybrid)
-        \\  get <key>                     Show a single memory entry by key
-        \\  list [--category C] [--limit N]
+        \\  search <query> [--limit N] [--json]
+        \\                                Run runtime retrieval (keyword/hybrid)
+        \\  get <key> [--json]            Show a single memory entry by key
+        \\  list [--category C] [--limit N] [--json]
         \\                                List memory entries (default limit: 20)
         \\  drain-outbox                  Drain durable vector outbox queue
         \\  forget <key>                  Delete entry from primary memory (if backend supports)
@@ -848,6 +893,13 @@ fn parsePositiveUsize(arg: []const u8) ?usize {
     const n = std.fmt.parseInt(usize, arg, 10) catch return null;
     if (n == 0) return null;
     return n;
+}
+
+fn hasJsonFlag(args: []const []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--json")) return true;
+    }
+    return false;
 }
 
 fn printMemoryRuntimeInitFailure(allocator: std.mem.Allocator, backend: []const u8) void {
@@ -910,27 +962,48 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     const subcmd = sub_args[0];
 
     if (std.mem.eql(u8, subcmd, "stats")) {
+        const json_mode = hasJsonFlag(sub_args[1..]);
         const r = mem_rt.resolved;
         const report = mem_rt.diagnose();
-        std.debug.print("Memory stats:\n", .{});
-        std.debug.print("  backend: {s}\n", .{r.primary_backend});
-        std.debug.print("  retrieval: {s}\n", .{r.retrieval_mode});
-        std.debug.print("  vector: {s}\n", .{r.vector_mode});
-        std.debug.print("  embedding: {s}\n", .{r.embedding_provider});
-        std.debug.print("  rollout: {s}\n", .{r.rollout_mode});
-        std.debug.print("  sync: {s}\n", .{r.vector_sync_mode});
-        std.debug.print("  sources: {d}\n", .{r.source_count});
-        std.debug.print("  fallback: {s}\n", .{r.fallback_policy});
-        std.debug.print("  entries: {d}\n", .{report.entry_count});
-        if (report.vector_entry_count) |n| {
-            std.debug.print("  vector_entries: {d}\n", .{n});
+        if (json_mode) {
+            var buf: [8192]u8 = undefined;
+            var bw = std.fs.File.stdout().writer(&buf);
+            const out = &bw.interface;
+            out.print(
+                \\{{"backend":"{s}","retrieval":"{s}","vector":"{s}","embedding":"{s}","rollout":"{s}","sync":"{s}","sources":{d},"fallback":"{s}","entries":{d},
+            , .{ r.primary_backend, r.retrieval_mode, r.vector_mode, r.embedding_provider, r.rollout_mode, r.vector_sync_mode, r.source_count, r.fallback_policy, report.entry_count }) catch return;
+            if (report.vector_entry_count) |n| {
+                out.print("\"vector_entries\":{d},", .{n}) catch return;
+            } else {
+                out.writeAll("\"vector_entries\":null,") catch return;
+            }
+            if (report.outbox_pending) |n| {
+                out.print("\"outbox_pending\":{d}}}\n", .{n}) catch return;
+            } else {
+                out.writeAll("\"outbox_pending\":null}\n") catch return;
+            }
+            out.flush() catch return;
         } else {
-            std.debug.print("  vector_entries: n/a\n", .{});
-        }
-        if (report.outbox_pending) |n| {
-            std.debug.print("  outbox_pending: {d}\n", .{n});
-        } else {
-            std.debug.print("  outbox_pending: n/a\n", .{});
+            std.debug.print("Memory stats:\n", .{});
+            std.debug.print("  backend: {s}\n", .{r.primary_backend});
+            std.debug.print("  retrieval: {s}\n", .{r.retrieval_mode});
+            std.debug.print("  vector: {s}\n", .{r.vector_mode});
+            std.debug.print("  embedding: {s}\n", .{r.embedding_provider});
+            std.debug.print("  rollout: {s}\n", .{r.rollout_mode});
+            std.debug.print("  sync: {s}\n", .{r.vector_sync_mode});
+            std.debug.print("  sources: {d}\n", .{r.source_count});
+            std.debug.print("  fallback: {s}\n", .{r.fallback_policy});
+            std.debug.print("  entries: {d}\n", .{report.entry_count});
+            if (report.vector_entry_count) |n| {
+                std.debug.print("  vector_entries: {d}\n", .{n});
+            } else {
+                std.debug.print("  vector_entries: n/a\n", .{});
+            }
+            if (report.outbox_pending) |n| {
+                std.debug.print("  outbox_pending: {d}\n", .{n});
+            } else {
+                std.debug.print("  outbox_pending: n/a\n", .{});
+            }
         }
         return;
     }
@@ -981,24 +1054,45 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
     if (std.mem.eql(u8, subcmd, "get")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw memory get <key>\n", .{});
+            std.debug.print("Usage: nullclaw memory get <key> [--json]\n", .{});
             std.process.exit(1);
         }
         const key = sub_args[1];
+        const json_mode = hasJsonFlag(sub_args[2..]);
         const entry = mem_rt.memory.get(allocator, key) catch |err| {
             std.debug.print("memory get failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         if (entry) |e| {
             defer e.deinit(allocator);
-            std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}\n", .{
-                e.key,
-                e.category.toString(),
-                e.timestamp,
-                e.content,
-            });
+            if (json_mode) {
+                var buf: [65536]u8 = undefined;
+                var bw = std.fs.File.stdout().writer(&buf);
+                const out = &bw.interface;
+                out.writeAll("{\"key\":\"") catch return;
+                writeJsonEscaped(out, e.key);
+                out.print("\",\"category\":\"{s}\",\"timestamp\":\"{s}\",\"content\":\"", .{ e.category.toString(), e.timestamp }) catch return;
+                writeJsonEscaped(out, e.content);
+                out.writeAll("\"}\n") catch return;
+                out.flush() catch return;
+            } else {
+                std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}\n", .{
+                    e.key,
+                    e.category.toString(),
+                    e.timestamp,
+                    e.content,
+                });
+            }
         } else {
-            std.debug.print("Not found: {s}\n", .{key});
+            if (json_mode) {
+                var buf: [64]u8 = undefined;
+                var bw = std.fs.File.stdout().writer(&buf);
+                const out = &bw.interface;
+                out.writeAll("null\n") catch return;
+                out.flush() catch return;
+            } else {
+                std.debug.print("Not found: {s}\n", .{key});
+            }
         }
         return;
     }
@@ -1006,12 +1100,13 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (std.mem.eql(u8, subcmd, "list")) {
         var limit: usize = 20;
         var category_opt: ?yc.memory.MemoryCategory = null;
+        var json_mode = false;
 
         var i: usize = 1;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--limit")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N]\n", .{});
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--json]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
@@ -1021,11 +1116,13 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 };
             } else if (std.mem.eql(u8, sub_args[i], "--category")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N]\n", .{});
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--json]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
                 category_opt = yc.memory.MemoryCategory.fromString(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
             } else {
                 std.debug.print("Unknown option for memory list: {s}\n", .{sub_args[i]});
                 std.process.exit(1);
@@ -1039,35 +1136,54 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         defer yc.memory.freeEntries(allocator, entries);
 
         const shown = @min(limit, entries.len);
-        std.debug.print("Memory entries: showing {d}/{d}\n", .{ shown, entries.len });
-        for (entries[0..shown], 0..) |e, idx| {
-            const preview_len = @min(@as(usize, 120), e.content.len);
-            const preview = e.content[0..preview_len];
-            std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
-                idx + 1,
-                e.key,
-                e.category.toString(),
-                e.timestamp,
-                preview,
-                if (e.content.len > preview_len) "..." else "",
-            });
+
+        if (json_mode) {
+            var buf: [65536]u8 = undefined;
+            var bw = std.fs.File.stdout().writer(&buf);
+            const out = &bw.interface;
+            out.writeAll("[") catch return;
+            for (entries[0..shown], 0..) |e, idx| {
+                if (idx > 0) out.writeAll(",") catch return;
+                out.writeAll("{\"key\":\"") catch return;
+                writeJsonEscaped(out, e.key);
+                out.print("\",\"category\":\"{s}\",\"timestamp\":\"{s}\",\"content\":\"", .{ e.category.toString(), e.timestamp }) catch return;
+                writeJsonEscaped(out, e.content);
+                out.writeAll("\"}") catch return;
+            }
+            out.writeAll("]\n") catch return;
+            out.flush() catch return;
+        } else {
+            std.debug.print("Memory entries: showing {d}/{d}\n", .{ shown, entries.len });
+            for (entries[0..shown], 0..) |e, idx| {
+                const preview_len = @min(@as(usize, 120), e.content.len);
+                const preview = e.content[0..preview_len];
+                std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
+                    idx + 1,
+                    e.key,
+                    e.category.toString(),
+                    e.timestamp,
+                    preview,
+                    if (e.content.len > preview_len) "..." else "",
+                });
+            }
         }
         return;
     }
 
     if (std.mem.eql(u8, subcmd, "search")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw memory search <query> [--limit N]\n", .{});
+            std.debug.print("Usage: nullclaw memory search <query> [--limit N] [--json]\n", .{});
             std.process.exit(1);
         }
         const query = sub_args[1];
         var limit: usize = 6;
+        var json_mode = false;
 
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--limit")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory search <query> [--limit N]\n", .{});
+                    std.debug.print("Usage: nullclaw memory search <query> [--limit N] [--json]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
@@ -1075,6 +1191,8 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                     std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
                     std.process.exit(1);
                 };
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
             } else {
                 std.debug.print("Unknown option for memory search: {s}\n", .{sub_args[i]});
                 std.process.exit(1);
@@ -1087,13 +1205,30 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         };
         defer yc.memory.retrieval.freeCandidates(allocator, results);
 
-        std.debug.print("Search results: {d}\n", .{results.len});
-        for (results, 0..) |c, idx| {
-            std.debug.print("  {d}. {s} [{s}]\n", .{ idx + 1, c.key, c.category.toString() });
-            printRetrievalScoreLine(c);
-            const preview_len = @min(@as(usize, 140), c.snippet.len);
-            const preview = c.snippet[0..preview_len];
-            std.debug.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+        if (json_mode) {
+            var buf: [65536]u8 = undefined;
+            var bw = std.fs.File.stdout().writer(&buf);
+            const out = &bw.interface;
+            out.writeAll("[") catch return;
+            for (results, 0..) |rc, idx| {
+                if (idx > 0) out.writeAll(",") catch return;
+                out.writeAll("{\"key\":\"") catch return;
+                writeJsonEscaped(out, rc.key);
+                out.print("\",\"category\":\"{s}\",\"snippet\":\"", .{rc.category.toString()}) catch return;
+                writeJsonEscaped(out, rc.snippet);
+                out.writeAll("\"}") catch return;
+            }
+            out.writeAll("]\n") catch return;
+            out.flush() catch return;
+        } else {
+            std.debug.print("Search results: {d}\n", .{results.len});
+            for (results, 0..) |rc, idx| {
+                std.debug.print("  {d}. {s} [{s}]\n", .{ idx + 1, rc.key, rc.category.toString() });
+                printRetrievalScoreLine(rc);
+                const preview_len = @min(@as(usize, 140), rc.snippet.len);
+                const preview = rc.snippet[0..preview_len];
+                std.debug.print("     {s}{s}\n", .{ preview, if (rc.snippet.len > preview_len) "..." else "" });
+            }
         }
         return;
     }
@@ -1101,6 +1236,191 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     std.debug.print("Unknown memory command: {s}\n\n", .{subcmd});
     printMemoryUsage();
     std.process.exit(1);
+}
+
+// ── History ──────────────────────────────────────────────────────
+
+fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw history <{s}> [args]
+            \\
+            \\Commands:
+            \\  list [--limit N] [--json]     List conversation sessions
+            \\  show <session_id> [--json]     Show messages for a session
+            \\
+        , .{HISTORY_SUBCOMMANDS}), .{});
+        std.process.exit(1);
+    }
+
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    var mem_rt = yc.memory.initRuntime(allocator, &cfg.memory, cfg.workspace_dir) orelse {
+        std.debug.print("Failed to initialize memory runtime (backend: {s})\n", .{cfg.memory.backend});
+        std.process.exit(1);
+    };
+    defer mem_rt.deinit();
+
+    const session_store = mem_rt.session_store orelse {
+        std.debug.print("Session store not available for backend: {s}\n", .{cfg.memory.backend});
+        std.process.exit(1);
+    };
+
+    const subcmd = sub_args[0];
+
+    if (std.mem.eql(u8, subcmd, "list")) {
+        var limit: usize = 50;
+        var json_mode = false;
+
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw history list [--limit N] [--json]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else {
+                std.debug.print("Unknown option: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        const sessions = session_store.listSessions(allocator, limit) catch |err| {
+            if (err == error.NotSupported) {
+                std.debug.print("History listing not supported for backend: {s}\n", .{cfg.memory.backend});
+                std.process.exit(1);
+            }
+            std.debug.print("Failed to list sessions: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer yc.memory.freeSessionInfos(allocator, sessions);
+
+        if (json_mode) {
+            writeHistoryListJson(sessions);
+        } else {
+            if (sessions.len == 0) {
+                std.debug.print("No sessions found.\n", .{});
+            } else {
+                std.debug.print("Sessions ({d}):\n", .{sessions.len});
+                for (sessions, 0..) |s, idx| {
+                    std.debug.print("  {d}. {s}  msgs={d}  first={s}  last={s}\n", .{
+                        idx + 1, s.session_id, s.message_count, s.first_message_at, s.last_message_at,
+                    });
+                }
+            }
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "show")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw history show <session_id> [--json]\n", .{});
+            std.process.exit(1);
+        }
+        const session_id = sub_args[1];
+        var json_mode = false;
+
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else {
+                std.debug.print("Unknown option: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        const messages = session_store.loadMessagesDetailed(allocator, session_id) catch |err| {
+            if (err == error.NotSupported) {
+                std.debug.print("Detailed history not supported for backend: {s}\n", .{cfg.memory.backend});
+                std.process.exit(1);
+            }
+            std.debug.print("Failed to load messages: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer yc.memory.freeDetailedMessages(allocator, messages);
+
+        if (json_mode) {
+            writeHistoryShowJson(session_id, messages);
+        } else {
+            if (messages.len == 0) {
+                std.debug.print("No messages for session: {s}\n", .{session_id});
+            } else {
+                std.debug.print("Session: {s} ({d} messages)\n\n", .{ session_id, messages.len });
+                for (messages) |m| {
+                    std.debug.print("[{s}] {s}:\n{s}\n\n", .{ m.created_at, m.role, m.content });
+                }
+            }
+        }
+        return;
+    }
+
+    std.debug.print("Unknown history command: {s}\n", .{subcmd});
+    std.process.exit(1);
+}
+
+fn writeHistoryListJson(sessions: []const yc.memory.SessionInfo) void {
+    var buf: [65536]u8 = undefined;
+    var bw = std.fs.File.stdout().writer(&buf);
+    const out = &bw.interface;
+
+    out.writeAll("[") catch return;
+    for (sessions, 0..) |s, idx| {
+        if (idx > 0) out.writeAll(",") catch return;
+        out.print(
+            \\{{"session_id":"{s}","message_count":{d},"first_message_at":"{s}","last_message_at":"{s}"}}
+        , .{ s.session_id, s.message_count, s.first_message_at, s.last_message_at }) catch return;
+    }
+    out.writeAll("]\n") catch return;
+    out.flush() catch return;
+}
+
+fn writeHistoryShowJson(session_id: []const u8, messages: []const yc.memory.DetailedMessageEntry) void {
+    var buf: [65536]u8 = undefined;
+    var bw = std.fs.File.stdout().writer(&buf);
+    const out = &bw.interface;
+
+    out.print("{{{s}\"session_id\":\"{s}\",\"messages\":[", .{ "", session_id }) catch return;
+    for (messages, 0..) |m, idx| {
+        if (idx > 0) out.writeAll(",") catch return;
+        out.writeAll("{\"role\":\"") catch return;
+        writeJsonEscaped(out, m.role);
+        out.writeAll("\",\"content\":\"") catch return;
+        writeJsonEscaped(out, m.content);
+        out.print("\",\"created_at\":\"{s}\"}}", .{m.created_at}) catch return;
+    }
+    out.writeAll("]}\n") catch return;
+    out.flush() catch return;
+}
+
+fn writeJsonEscaped(out: anytype, s: []const u8) void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => out.writeAll("\\\"") catch return,
+            '\\' => out.writeAll("\\\\") catch return,
+            '\n' => out.writeAll("\\n") catch return,
+            '\r' => out.writeAll("\\r") catch return,
+            '\t' => out.writeAll("\\t") catch return,
+            else => {
+                if (ch < 0x20) {
+                    out.print("\\u{x:0>4}", .{ch}) catch return;
+                } else {
+                    out.writeByte(ch) catch return;
+                }
+            },
+        }
+    }
 }
 
 fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {

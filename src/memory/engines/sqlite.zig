@@ -736,6 +736,88 @@ pub const SqliteMemory = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
     }
 
+    // ── History queries ──────────────────────────────────────────────
+
+    /// List sessions with message counts and time bounds.
+    pub fn listSessions(self: *Self, allocator: std.mem.Allocator, limit: usize) ![]root.SessionInfo {
+        const sql =
+            "SELECT session_id, COUNT(*) as msg_count, MIN(created_at) as first_at, MAX(created_at) as last_at " ++
+            "FROM messages GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(limit));
+
+        var list: std.ArrayListUnmanaged(root.SessionInfo) = .empty;
+        errdefer {
+            for (list.items) |info| info.deinit(allocator);
+            list.deinit(allocator);
+        }
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const sid_ptr = c.sqlite3_column_text(stmt, 0);
+            const sid_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+            const count = c.sqlite3_column_int64(stmt, 1);
+            const first_ptr = c.sqlite3_column_text(stmt, 2);
+            const first_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+            const last_ptr = c.sqlite3_column_text(stmt, 3);
+            const last_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+
+            if (sid_ptr == null) continue;
+
+            try list.append(allocator, .{
+                .session_id = try allocator.dupe(u8, sid_ptr[0..sid_len]),
+                .message_count = if (count < 0) 0 else @intCast(count),
+                .first_message_at = if (first_ptr) |p| try allocator.dupe(u8, p[0..first_len]) else try allocator.dupe(u8, ""),
+                .last_message_at = if (last_ptr) |p| try allocator.dupe(u8, p[0..last_len]) else try allocator.dupe(u8, ""),
+            });
+        }
+
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Load messages with timestamps for a session.
+    pub fn loadMessagesDetailed(self: *Self, allocator: std.mem.Allocator, session_id: []const u8) ![]root.DetailedMessageEntry {
+        const sql = "SELECT role, content, created_at FROM messages WHERE session_id = ? ORDER BY id ASC";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+
+        var list: std.ArrayListUnmanaged(root.DetailedMessageEntry) = .empty;
+        errdefer {
+            for (list.items) |entry| {
+                allocator.free(entry.role);
+                allocator.free(entry.content);
+                allocator.free(entry.created_at);
+            }
+            list.deinit(allocator);
+        }
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const role_ptr = c.sqlite3_column_text(stmt, 0);
+            const role_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+            const content_ptr = c.sqlite3_column_text(stmt, 1);
+            const content_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const ts_ptr = c.sqlite3_column_text(stmt, 2);
+            const ts_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+
+            if (role_ptr == null or content_ptr == null) continue;
+
+            try list.append(allocator, .{
+                .role = try allocator.dupe(u8, role_ptr[0..role_len]),
+                .content = try allocator.dupe(u8, content_ptr[0..content_len]),
+                .created_at = if (ts_ptr) |p| try allocator.dupe(u8, p[0..ts_len]) else try allocator.dupe(u8, ""),
+            });
+        }
+
+        return list.toOwnedSlice(allocator);
+    }
+
     // ── SessionStore vtable ────────────────────────────────────────
 
     fn implSessionSaveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
@@ -768,6 +850,16 @@ pub const SqliteMemory = struct {
         return self_.loadUsage(session_id);
     }
 
+    fn implSessionListSessions(ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize) anyerror![]root.SessionInfo {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.listSessions(allocator, limit);
+    }
+
+    fn implSessionLoadMessagesDetailed(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]root.DetailedMessageEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.loadMessagesDetailed(allocator, session_id);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
@@ -775,6 +867,8 @@ pub const SqliteMemory = struct {
         .clearAutoSaved = &implSessionClearAutoSaved,
         .saveUsage = &implSessionSaveUsage,
         .loadUsage = &implSessionLoadUsage,
+        .listSessions = &implSessionListSessions,
+        .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {
