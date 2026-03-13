@@ -2190,6 +2190,13 @@ fn dispatchChannelStart(
             std.debug.print("Matrix channel is not configured.\n", .{});
             std.process.exit(1);
         },
+        .max => {
+            if (config.channels.maxPrimary()) |max_config| {
+                return runMaxChannel(allocator, args, config, max_config);
+            }
+            std.debug.print("Max channel is not configured.\n", .{});
+            std.process.exit(1);
+        },
         else => return runGatewayChannel(allocator, config, meta.key),
     }
 }
@@ -2715,6 +2722,56 @@ fn runMatrixChannel(
 
     var loop_state = yc.channel_loop.MatrixLoopState.init();
     yc.channel_loop.runMatrixLoop(allocator, config, runtime, &loop_state, &mx);
+}
+
+// ── Max Channel ───────────────────────────────────────────────────
+
+fn runMaxChannel(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    config: *const yc.config.Config,
+    max_config: yc.config.MaxConfig,
+) !void {
+    _ = args;
+    if (!build_options.enable_channel_max) {
+        std.debug.print("Max channel is disabled in this build.\n", .{});
+        std.process.exit(1);
+    }
+
+    var mx = yc.channels.max.MaxChannel.initFromConfig(allocator, max_config);
+
+    std.debug.print("nullclaw Max bot starting...\n", .{});
+    std.debug.print("  Provider: {s}\n", .{config.default_provider});
+    std.debug.print("  Account ID: {s}\n", .{mx.account_id});
+    std.debug.print("  Mode: {s}\n", .{@tagName(mx.mode)});
+    std.debug.print("  Group policy: {s}\n", .{mx.group_policy});
+    if (mx.allow_from.len == 0) {
+        std.debug.print("  Allowed users: (none — all messages will be denied)\n", .{});
+    } else if (mx.allow_from.len == 1 and std.mem.eql(u8, mx.allow_from[0], "*")) {
+        std.debug.print("  Allowed users: *\n", .{});
+    } else {
+        std.debug.print("  Allowed users:", .{});
+        for (mx.allow_from) |u| {
+            std.debug.print(" {s}", .{u});
+        }
+        std.debug.print("\n", .{});
+    }
+
+    if (!mx.healthCheck()) {
+        std.debug.print("Max health check failed. Verify bot_token.\n", .{});
+        std.process.exit(1);
+    }
+
+    std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
+
+    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
+        std.debug.print("Runtime init failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer runtime.deinit();
+
+    var loop_state = yc.channel_loop.MaxLoopState.init();
+    yc.channel_loop.runMaxLoop(allocator, config, runtime, &loop_state, &mx);
 }
 
 // ── Telegram Channel ───────────────────────────────────────────────-
