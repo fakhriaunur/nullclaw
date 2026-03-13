@@ -668,17 +668,17 @@ Implement a vtable interface, submit a PR:
 - New `Peripheral` -> `src/peripherals.zig`
 - New `Skill` -> `~/.nullclaw/workspace/skills/<name>/`
 
-## 中文文档
+## Chinese Docs (中文文档)
 
-- [中文文档总览](docs/zh/README.md)
-- [安装指南](docs/zh/installation.md)
-- [配置指南](docs/zh/configuration.md)
-- [使用与运维](docs/zh/usage.md)
-- [架构总览](docs/zh/architecture.md)
-- [安全机制](docs/zh/security.md)
-- [Gateway API](docs/zh/gateway-api.md)
-- [命令参考](docs/zh/commands.md)
-- [开发指南](docs/zh/development.md)
+- [Chinese docs overview (中文文档总览)](docs/zh/README.md)
+- [Installation guide (安装指南)](docs/zh/installation.md)
+- [Configuration guide (配置指南)](docs/zh/configuration.md)
+- [Usage and operations (使用与运维)](docs/zh/usage.md)
+- [Architecture overview (架构总览)](docs/zh/architecture.md)
+- [Security model (安全机制)](docs/zh/security.md)
+- [Gateway API (中文)](docs/zh/gateway-api.md)
+- [Commands reference (命令参考)](docs/zh/commands.md)
+- [Development guide (开发指南)](docs/zh/development.md)
 
 ## English Docs
 
