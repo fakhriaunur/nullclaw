@@ -478,7 +478,8 @@ fn redactHeadersForDisplay(allocator: std.mem.Allocator, headers: []const [2][]c
 fn isSensitiveHeader(name: []const u8) bool {
     // Convert to lowercase for comparison
     var lower_buf: [256]u8 = undefined;
-    if (name.len > lower_buf.len) return false;
+    // Fail closed: oversized header names are treated as sensitive.
+    if (name.len > lower_buf.len) return true;
     const lower = lower_buf[0..name.len];
     for (name, 0..) |c, i| {
         lower[i] = std.ascii.toLower(c);
@@ -580,6 +581,12 @@ test "isSensitiveHeader checks" {
     try std.testing.expect(isSensitiveHeader("password-header"));
     try std.testing.expect(!isSensitiveHeader("Content-Type"));
     try std.testing.expect(!isSensitiveHeader("Accept"));
+}
+
+test "isSensitiveHeader treats oversized names as sensitive" {
+    var long_name: [300]u8 = undefined;
+    @memset(long_name[0..], 'a');
+    try std.testing.expect(isSensitiveHeader(long_name[0..]));
 }
 
 test "http_request disables automatic redirects" {
