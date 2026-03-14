@@ -204,7 +204,7 @@ pub fn main() !void {
     switch (cmd) {
         .version => printVersion(),
         .status => try yc.status.run(allocator),
-        .agent => if (hasHelpFlag(sub_args)) {
+        .agent => if (agentHelpRequested(sub_args)) {
             printAgentUsage();
         } else {
             try yc.agent.run(allocator, sub_args);
@@ -258,10 +258,39 @@ fn hasVerboseFlag(args: []const []const u8) bool {
     return false;
 }
 
-fn hasHelpFlag(args: []const []const u8) bool {
-    for (args) |arg| {
+fn agentHelpRequested(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return true;
+        }
+        if (std.mem.eql(u8, arg, "-m") or
+            std.mem.eql(u8, arg, "--message") or
+            std.mem.eql(u8, arg, "-s") or
+            std.mem.eql(u8, arg, "--session") or
+            std.mem.eql(u8, arg, "--provider") or
+            std.mem.eql(u8, arg, "--model") or
+            std.mem.eql(u8, arg, "--temperature"))
+        {
+            if (i + 1 < args.len) i += 1;
+        }
+    }
+    return false;
+}
+
+fn gatewayHelpRequested(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--port") or
+            std.mem.eql(u8, arg, "-p") or
+            std.mem.eql(u8, arg, "--host"))
+        {
+            if (i + 1 < args.len) i += 1;
         }
     }
     return false;
@@ -322,7 +351,7 @@ fn printAgentUsage() void {
 }
 
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    if (hasHelpFlag(sub_args)) {
+    if (gatewayHelpRequested(sub_args)) {
         printGatewayUsage();
         return;
     }
@@ -3722,6 +3751,31 @@ test "hasJsonFlag detects --json" {
 
     const without_json = [_][]const u8{ "--limit", "10" };
     try std.testing.expect(!hasJsonFlag(&without_json));
+}
+
+test "agentHelpRequested detects standalone help flag" {
+    const args = [_][]const u8{ "--provider", "openrouter", "--help" };
+    try std.testing.expect(agentHelpRequested(&args));
+}
+
+test "agentHelpRequested ignores message value that matches help flag" {
+    const args = [_][]const u8{ "--message", "--help" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
+test "agentHelpRequested ignores session value that matches short help flag" {
+    const args = [_][]const u8{ "--session", "-h" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
+test "gatewayHelpRequested detects standalone help flag" {
+    const args = [_][]const u8{ "--port", "8080", "--help" };
+    try std.testing.expect(gatewayHelpRequested(&args));
+}
+
+test "gatewayHelpRequested ignores host value that matches help flag" {
+    const args = [_][]const u8{ "--host", "--help" };
+    try std.testing.expect(!gatewayHelpRequested(&args));
 }
 
 test "writeJsonString wraps and escapes special characters" {
