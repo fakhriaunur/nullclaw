@@ -58,6 +58,11 @@ pub fn estimate_text_tokens(text: []const u8) u32 {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Agent = struct {
+    const TextPreview = struct {
+        slice: []const u8,
+        truncated: bool,
+    };
+
     const VerboseLevel = enum {
         off,
         on,
@@ -1692,14 +1697,6 @@ pub const Agent = struct {
             }
         }
 
-        // Record agent event
-        const start_event = ObserverEvent{ .llm_request = .{
-            .provider = self.provider.getName(),
-            .model = turn_model_name,
-            .messages_count = self.history.items.len,
-        } };
-        self.observer.recordEvent(&start_event);
-
         const turn_token_limit = context_tokens.resolveContextTokens(self.token_limit_override, turn_model_name);
         const turn_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(self.max_tokens_override, turn_model_name);
         const turn_token_limit_cap: u32 = @intCast(@min(turn_token_limit, @as(u64, std.math.maxInt(u32))));
@@ -1743,6 +1740,7 @@ pub const Agent = struct {
             var response_attempt: u32 = 1;
             providers.clearLastApiErrorDetail();
             if (is_streaming) {
+                self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
                     self.allocator,
@@ -1762,14 +1760,7 @@ pub const Agent = struct {
                     self.stream_ctx.?,
                 ) catch |err| retry_stream: {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
-                    const fail_event = ObserverEvent{ .llm_response = .{
-                        .provider = self.provider.getName(),
-                        .model = turn_model_name,
-                        .duration_ms = fail_duration,
-                        .success = false,
-                        .error_message = @errorName(err),
-                    } };
-                    self.observer.recordEvent(&fail_event);
+                    self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
@@ -1785,6 +1776,7 @@ pub const Agent = struct {
                             turn_max_tokens,
                         );
                         response_attempt = 2;
+                        self.recordLlmRequestEvent(turn_model_name, retry_msgs);
                         self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, true);
                         break :retry_stream self.provider.streamChat(
                             self.allocator,
@@ -1820,6 +1812,7 @@ pub const Agent = struct {
                     .model = stream_result.model,
                 };
             } else {
+                self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, false);
                 response = self.provider.chat(
                     self.allocator,
@@ -1838,14 +1831,7 @@ pub const Agent = struct {
                 ) catch |err| retry_blk: {
                     // Record the failed attempt
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
-                    const fail_event = ObserverEvent{ .llm_response = .{
-                        .provider = self.provider.getName(),
-                        .model = turn_model_name,
-                        .duration_ms = fail_duration,
-                        .success = false,
-                        .error_message = @errorName(err),
-                    } };
-                    self.observer.recordEvent(&fail_event);
+                    self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
                     if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
@@ -1861,6 +1847,7 @@ pub const Agent = struct {
                             turn_max_tokens,
                         );
                         response_attempt = 2;
+                        self.recordLlmRequestEvent(turn_model_name, retry_msgs);
                         self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
@@ -1929,6 +1916,7 @@ pub const Agent = struct {
                     // Retry once
                     std.Thread.sleep(500 * std.time.ns_per_ms);
                     response_attempt = 2;
+                    self.recordLlmRequestEvent(turn_model_name, messages);
                     self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, false);
                     break :retry_blk self.provider.chat(
                         self.allocator,
@@ -1957,6 +1945,7 @@ pub const Agent = struct {
                                 turn_max_tokens,
                             );
                             response_attempt = 3;
+                            self.recordLlmRequestEvent(turn_model_name, recovery_msgs);
                             self.logLlmRequest(iteration + 1, 3, turn_model_name, recovery_msgs, native_tools_enabled, false);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
@@ -1987,14 +1976,6 @@ pub const Agent = struct {
             self.logLlmResponse(iteration + 1, response_attempt, &response);
 
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
-            const resp_event = ObserverEvent{ .llm_response = .{
-                .provider = self.provider.getName(),
-                .model = turn_model_name,
-                .duration_ms = duration_ms,
-                .success = true,
-                .error_message = null,
-            } };
-            self.observer.recordEvent(&resp_event);
 
             const response_text = response.contentOrEmpty();
 
@@ -2014,6 +1995,11 @@ pub const Agent = struct {
 
             self.total_tokens += normalized_usage.total_tokens;
             self.last_turn_usage = normalized_usage;
+            if (normalized_usage.total_tokens > 0) {
+                const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_usage.total_tokens };
+                self.observer.recordMetric(&usage_metric);
+            }
+            self.recordLlmResponseEvent(turn_model_name, duration_ms, &response);
             self.emitUsageRecord(&response, true);
             const use_native = response.hasToolCalls();
 
@@ -2270,11 +2256,25 @@ pub const Agent = struct {
                     );
                 }
 
+                var tool_args_buf: [1024]u8 = undefined;
+                var tool_detail_buf: [1024]u8 = undefined;
+                const tool_args = if (self.log_llm_io)
+                    toolArgsObserverDetail(&tool_args_buf, call.arguments_json)
+                else
+                    null;
+                const tool_detail = if (self.log_llm_io) blk: {
+                    const scrubbed_output = providers.scrubToolOutput(arena, result.output) catch result.output;
+                    break :blk toolResultObserverDetail(&tool_detail_buf, scrubbed_output);
+                } else if (!result.success)
+                    result.output
+                else
+                    null;
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
                     .duration_ms = tool_duration,
                     .success = result.success,
-                    .detail = if (result.success) null else result.output,
+                    .args = tool_args,
+                    .detail = tool_detail,
                 } };
                 self.observer.recordEvent(&tool_event);
 
@@ -2646,11 +2646,155 @@ pub const Agent = struct {
 
     const LLM_LOG_MAX_BYTES: usize = 8192;
 
-    fn llmLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
-        if (text.len <= LLM_LOG_MAX_BYTES) {
+    fn previewText(text: []const u8, max_bytes: usize) TextPreview {
+        if (text.len <= max_bytes) {
             return .{ .slice = text, .truncated = false };
         }
-        return .{ .slice = text[0..LLM_LOG_MAX_BYTES], .truncated = true };
+        return .{ .slice = text[0..max_bytes], .truncated = true };
+    }
+
+    fn llmLogPreview(text: []const u8) TextPreview {
+        return previewText(text, LLM_LOG_MAX_BYTES);
+    }
+
+    fn llmRequestObserverDetail(buf: []u8, messages: []const ChatMessage) ?[]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        const max_messages = @min(messages.len, 6);
+        for (messages[0..max_messages], 0..) |msg, idx| {
+            const preview = previewText(msg.content, 240);
+            const parts_count: usize = if (msg.content_parts) |parts| parts.len else 0;
+            w.print(
+                "#{d} role={s} bytes={d} parts={d} content={f}{s}",
+                .{
+                    idx + 1,
+                    msg.role.toSlice(),
+                    msg.content.len,
+                    parts_count,
+                    std.json.fmt(preview.slice, .{}),
+                    if (preview.truncated) " [truncated]" else "",
+                },
+            ) catch break;
+            if (idx + 1 < max_messages) {
+                w.writeByte('\n') catch break;
+            }
+        }
+        if (messages.len > max_messages) {
+            w.print("\n... {d} more messages", .{messages.len - max_messages}) catch {};
+        }
+        const written = fbs.getWritten();
+        if (written.len == 0) return null;
+        return written;
+    }
+
+    fn llmResponseObserverDetail(buf: []u8, response: *const ChatResponse) ?[]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+
+        const content = response.contentOrEmpty();
+        const content_preview = previewText(content, 400);
+        w.print(
+            "content_bytes={d} content={f}{s}",
+            .{
+                content.len,
+                std.json.fmt(content_preview.slice, .{}),
+                if (content_preview.truncated) " [truncated]" else "",
+            },
+        ) catch return null;
+
+        if (response.reasoning_content) |reasoning| {
+            const reasoning_preview = previewText(reasoning, 240);
+            w.print(
+                "\nreasoning_bytes={d} reasoning={f}{s}",
+                .{
+                    reasoning.len,
+                    std.json.fmt(reasoning_preview.slice, .{}),
+                    if (reasoning_preview.truncated) " [truncated]" else "",
+                },
+            ) catch {};
+        }
+
+        const max_tool_calls = @min(response.tool_calls.len, 4);
+        for (response.tool_calls[0..max_tool_calls], 0..) |tc, idx| {
+            const args_preview = previewText(tc.arguments, 200);
+            w.print(
+                "\ntool#{d} id={s} name={s} args={f}{s}",
+                .{
+                    idx + 1,
+                    if (tc.id.len > 0) tc.id else "-",
+                    tc.name,
+                    std.json.fmt(args_preview.slice, .{}),
+                    if (args_preview.truncated) " [truncated]" else "",
+                },
+            ) catch {};
+        }
+        if (response.tool_calls.len > max_tool_calls) {
+            w.print("\n... {d} more tool calls", .{response.tool_calls.len - max_tool_calls}) catch {};
+        }
+
+        const written = fbs.getWritten();
+        if (written.len == 0) return null;
+        return written;
+    }
+
+    fn toolArgsObserverDetail(buf: []u8, arguments_json: []const u8) ?[]const u8 {
+        const preview = previewText(arguments_json, @min(buf.len, 512));
+        if (preview.slice.len == 0) return null;
+        var fbs = std.io.fixedBufferStream(buf);
+        fbs.writer().print("{f}{s}", .{
+            std.json.fmt(preview.slice, .{}),
+            if (preview.truncated) " [truncated]" else "",
+        }) catch return null;
+        return fbs.getWritten();
+    }
+
+    fn toolResultObserverDetail(buf: []u8, output: []const u8) ?[]const u8 {
+        const preview = previewText(output, @min(buf.len, 512));
+        if (preview.slice.len == 0) return null;
+        var fbs = std.io.fixedBufferStream(buf);
+        fbs.writer().print("{f}{s}", .{
+            std.json.fmt(preview.slice, .{}),
+            if (preview.truncated) " [truncated]" else "",
+        }) catch return null;
+        return fbs.getWritten();
+    }
+
+    fn recordLlmRequestEvent(self: *Agent, model_name: []const u8, messages: []const ChatMessage) void {
+        var detail_buf: [2048]u8 = undefined;
+        const event = ObserverEvent{ .llm_request = .{
+            .provider = self.provider.getName(),
+            .model = model_name,
+            .messages_count = messages.len,
+            .detail = if (self.log_llm_io) llmRequestObserverDetail(&detail_buf, messages) else null,
+        } };
+        self.observer.recordEvent(&event);
+    }
+
+    fn recordLlmResponseEvent(self: *Agent, model_name: []const u8, duration_ms: u64, response: *const ChatResponse) void {
+        var detail_buf: [2048]u8 = undefined;
+        const event = ObserverEvent{ .llm_response = .{
+            .provider = self.provider.getName(),
+            .model = model_name,
+            .duration_ms = duration_ms,
+            .success = true,
+            .error_message = null,
+            .prompt_tokens = response.usage.prompt_tokens,
+            .completion_tokens = response.usage.completion_tokens,
+            .total_tokens = response.usage.total_tokens,
+            .detail = if (self.log_llm_io) llmResponseObserverDetail(&detail_buf, response) else null,
+        } };
+        self.observer.recordEvent(&event);
+    }
+
+    fn recordLlmFailureEvent(self: *Agent, model_name: []const u8, duration_ms: u64, err_name: []const u8) void {
+        const event = ObserverEvent{ .llm_response = .{
+            .provider = self.provider.getName(),
+            .model = model_name,
+            .duration_ms = duration_ms,
+            .success = false,
+            .error_message = err_name,
+        } };
+        self.observer.recordEvent(&event);
     }
 
     fn logLlmRequest(
