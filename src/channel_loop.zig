@@ -60,6 +60,52 @@ fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
     return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
 }
 
+fn detailedProviderErrorForDisplay(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+) !?[]u8 {
+    switch (err) {
+        error.ApiError, error.ProviderError, error.AllProvidersFailed => {},
+        else => return null,
+    }
+
+    const detail = try providers.snapshotLastApiErrorDetail(allocator);
+    if (detail) |owned| {
+        defer allocator.free(owned);
+        if (owned.len == 0) return null;
+        const formatted = try std.fmt.allocPrint(allocator, "Provider API error: {s}", .{owned});
+        return formatted;
+    }
+    return null;
+}
+
+fn logAgentProcessingError(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    err: anyerror,
+) void {
+    const detail = providers.snapshotLastApiErrorDetail(allocator) catch null;
+    if (detail) |owned| {
+        defer allocator.free(owned);
+        if (owned.len > 0) {
+            log.err("{s}: {} ({s})", .{ prefix, err, owned });
+            return;
+        }
+    }
+    log.err("{s}: {}", .{ prefix, err });
+}
+
+fn defaultAgentErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+        error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+        error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+        error.OutOfMemory => "Out of memory.",
+        else => "An error occurred. Try again or /new for a fresh session.",
+    };
+}
+
 const TelegramSessionTarget = struct {
     base_chat_id: []const u8,
     thread_id: ?i64,
@@ -767,16 +813,11 @@ fn processTelegramMessage(
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
-        log.err("Agent error: {}", .{err});
+        logAgentProcessingError(allocator, "Agent error", err);
         tg_ptr.setTaskReaction(sender, message_id, .failed);
-        const err_msg: []const u8 = switch (err) {
-            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-            error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-            error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-            error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-            error.OutOfMemory => "Out of memory.",
-            else => "An error occurred. Try again or /new for a fresh session.",
-        };
+        const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+        defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+        const err_msg = owned_err_msg orelse defaultAgentErrorMessage(err);
         tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
         return;
     };
@@ -1973,14 +2014,13 @@ pub fn runMaxLoop(
             const sink = mx_ptr.makeSink(&stream_ctx);
 
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
-                log.err("Max agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+                logAgentProcessingError(allocator, "Max agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse switch (err) {
                     error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
                     error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
+                    else => defaultAgentErrorMessage(err),
                 };
                 mx_ptr.sendMessage(reply_target, err_msg) catch |send_err| log.err("failed to send max error reply: {}", .{send_err});
                 continue;
@@ -2391,6 +2431,27 @@ test "telegram update offset store roundtrip" {
     try saveTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token", 777);
     const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
     try std.testing.expectEqual(@as(?i64, 777), restored);
+}
+
+test "detailedProviderErrorForDisplay surfaces sanitized provider detail" {
+    const allocator = std.testing.allocator;
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
+    const msg = (try detailedProviderErrorForDisplay(allocator, error.ApiError)).?;
+    defer allocator.free(msg);
+
+    try std.testing.expectEqualStrings("Provider API error: compatible: status=429 message=Rate limit exceeded", msg);
+}
+
+test "detailedProviderErrorForDisplay ignores non-provider errors" {
+    const allocator = std.testing.allocator;
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+
+    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
+    try std.testing.expect((try detailedProviderErrorForDisplay(allocator, error.OutOfMemory)) == null);
 }
 
 test "telegram update offset store returns null for mismatched bot id" {
