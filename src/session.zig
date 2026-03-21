@@ -834,7 +834,7 @@ pub const SessionManager = struct {
             std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
-                    std.fs.cwd().makePath(parent) catch return;
+                    fs_compat.makePath(parent) catch return;
                 },
             };
         }
@@ -1327,6 +1327,7 @@ pub const SessionManager = struct {
             self.config.getProviderBaseUrl(profile.provider),
             self.config.getProviderNativeTools(profile.provider),
             self.config.getProviderUserAgent(profile.provider),
+            self.config.getProviderMaxStreamingPromptBytes(profile.provider),
         );
         return .{
             .provider = holder.provider(),

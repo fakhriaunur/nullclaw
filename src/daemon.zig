@@ -41,7 +41,8 @@ const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE
 
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
-var outbound_draft_id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+var outbound_draft_id_counter: u64 = 1;
+var outbound_draft_id_mutex: std.Thread.Mutex = .{};
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -789,7 +790,11 @@ const StreamingOutboundCtx = struct {
 };
 
 fn nextOutboundDraftId() u64 {
-    return outbound_draft_id_counter.fetchAdd(1, .monotonic);
+    outbound_draft_id_mutex.lock();
+    defer outbound_draft_id_mutex.unlock();
+    const id = outbound_draft_id_counter;
+    outbound_draft_id_counter += 1;
+    return id;
 }
 
 fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
