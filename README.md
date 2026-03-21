@@ -525,6 +525,7 @@ Named agent profiles are configured separately from bindings. Bindings only choo
 
 If a named agent should run from its own workspace, set `agents.list[].workspace_path`.
 Relative paths are resolved from the directory that contains `config.json`, the workspace is scaffolded on first use, and the agent gets a durable memory namespace `agent:<agent-id>`.
+Setting `workspace_path` does not disable `system_prompt`: when both are configured, the named profile prompt is still applied and the workspace bootstrap files are loaded from that dedicated workspace.
 This applies to `nullclaw agent --agent <id>`, `/subagents spawn --agent <id>`, and routed sessions resolved through `bindings`.
 
 Minimal end-to-end example:
