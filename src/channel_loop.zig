@@ -942,7 +942,10 @@ fn telegramUpdateOffsetPath(allocator: std.mem.Allocator, config: *const Config,
     const file_name = try std.fmt.allocPrint(allocator, "update-offset-{s}.json", .{normalized_account_id});
     defer allocator.free(file_name);
 
-    return std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    const relative_path = try std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    defer allocator.free(relative_path);
+
+    return std.fs.path.resolve(allocator, &.{relative_path});
 }
 
 /// Load persisted Telegram update offset. Returns null when missing/invalid/stale.

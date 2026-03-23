@@ -2691,6 +2691,7 @@ pub const TelegramChannel = struct {
                     .channel = "telegram",
                     .timestamp = root.nowEpochSecs(),
                     .message_id = chat.message_id,
+                    .is_interaction = true,
                     .first_name = fn_dup,
                     .is_group = chat.is_group,
                 }) catch {
