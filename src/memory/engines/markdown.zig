@@ -710,6 +710,10 @@ pub const MarkdownMemory = struct {
             .vtable = &vtable,
         };
     }
+
+    pub fn exportAllEntries(self: *Self, allocator: std.mem.Allocator) ![]MemoryEntry {
+        return self.readAllEntries(allocator);
+    }
 };
 
 // ── Tests ──────────────────────────────────────────────────────────

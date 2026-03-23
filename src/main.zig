@@ -1054,6 +1054,13 @@ fn hasJsonFlag(args: []const []const u8) bool {
     return false;
 }
 
+fn memorySupportsEventFeed(memory: yc.memory.Memory) bool {
+    return memory.vtable.listEvents != null and
+        memory.vtable.applyEvent != null and
+        memory.vtable.lastEventSequence != null and
+        memory.vtable.eventFeedInfo != null;
+}
+
 const VisibleSkills = struct {
     skills: []yc.skills.Skill,
     community_base: ?[]u8 = null,
@@ -1256,25 +1263,61 @@ fn collectMemoryKeyScopes(allocator: std.mem.Allocator, memory: yc.memory.Memory
     return scopes.toOwnedSlice(allocator);
 }
 
+fn scopeListsContain(scopes: []const ?[]u8, session_id: ?[]const u8) bool {
+    for (scopes) |existing| {
+        if (existing == null and session_id == null) return true;
+        if (existing != null and session_id != null and std.mem.eql(u8, existing.?, session_id.?)) return true;
+    }
+    return false;
+}
+
 fn freeMemoryKeyScopes(allocator: std.mem.Allocator, scopes: []?[]u8) void {
     for (scopes) |sid_opt| if (sid_opt) |sid| allocator.free(sid);
     allocator.free(scopes);
 }
 
 fn applyMemoryEventWithVectorSync(mem_rt: *yc.memory.MemoryRuntime, allocator: std.mem.Allocator, input: yc.memory.MemoryEventInput) !void {
-    var delete_scopes: []?[]u8 = &.{};
-    defer if (delete_scopes.len > 0) freeMemoryKeyScopes(allocator, delete_scopes);
+    var before_entry: ?yc.memory.MemoryEntry = null;
+    defer if (before_entry) |*entry| entry.deinit(allocator);
+    var after_entry: ?yc.memory.MemoryEntry = null;
+    defer if (after_entry) |*entry| entry.deinit(allocator);
+    var before_scopes: []?[]u8 = &.{};
+    defer if (before_scopes.len > 0) freeMemoryKeyScopes(allocator, before_scopes);
+    var after_scopes: []?[]u8 = &.{};
+    defer if (after_scopes.len > 0) freeMemoryKeyScopes(allocator, after_scopes);
 
-    if (input.operation == .delete_all) {
-        delete_scopes = try collectMemoryKeyScopes(allocator, mem_rt.memory, input.key);
+    switch (input.operation) {
+        .put, .delete_scoped => before_entry = try mem_rt.memory.getScoped(allocator, input.key, input.session_id),
+        .delete_all => before_scopes = try collectMemoryKeyScopes(allocator, mem_rt.memory, input.key),
     }
 
     try mem_rt.memory.applyEvent(input);
 
     switch (input.operation) {
-        .put => if (input.content) |content| mem_rt.syncVectorAfterStore(allocator, input.key, content, input.session_id),
-        .delete_scoped => mem_rt.deleteFromVectorStore(input.key, input.session_id),
-        .delete_all => for (delete_scopes) |sid_opt| mem_rt.deleteFromVectorStore(input.key, sid_opt),
+        .put => {
+            after_entry = try mem_rt.memory.getScoped(allocator, input.key, input.session_id);
+            if (after_entry) |after| {
+                const changed = if (before_entry) |before|
+                    !std.mem.eql(u8, before.content, after.content) or !before.category.eql(after.category)
+                else
+                    true;
+                if (changed) mem_rt.syncVectorAfterStore(allocator, input.key, after.content, after.session_id);
+            }
+        },
+        .delete_scoped => {
+            after_entry = try mem_rt.memory.getScoped(allocator, input.key, input.session_id);
+            if (before_entry != null and after_entry == null) {
+                mem_rt.deleteFromVectorStore(input.key, input.session_id);
+            }
+        },
+        .delete_all => {
+            after_scopes = try collectMemoryKeyScopes(allocator, mem_rt.memory, input.key);
+            for (before_scopes) |sid_opt| {
+                if (!scopeListsContain(after_scopes, sid_opt)) {
+                    mem_rt.deleteFromVectorStore(input.key, sid_opt);
+                }
+            }
+        },
     }
 }
 
@@ -1406,6 +1449,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const json_mode = hasJsonFlag(sub_args[1..]);
         const r = mem_rt.resolved;
         const report = mem_rt.diagnose();
+        const event_feed_supported = memorySupportsEventFeed(mem_rt.memory);
         if (json_mode) {
             var buf: [8192]u8 = undefined;
             var bw = std.fs.File.stdout().writer(&buf);
@@ -1424,6 +1468,8 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             writeJsonString(out, r.vector_sync_mode) catch return;
             out.print(",\"sources\":{d},\"fallback\":", .{r.source_count}) catch return;
             writeJsonString(out, r.fallback_policy) catch return;
+            out.writeAll(",\"event_feed_supported\":") catch return;
+            writeJsonBool(out, event_feed_supported) catch return;
             out.print(",\"entries\":{d},", .{report.entry_count}) catch return;
             if (report.vector_entry_count) |n| {
                 out.print("\"vector_entries\":{d},", .{n}) catch return;
@@ -1446,6 +1492,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("  sync: {s}\n", .{r.vector_sync_mode});
             std.debug.print("  sources: {d}\n", .{r.source_count});
             std.debug.print("  fallback: {s}\n", .{r.fallback_policy});
+            std.debug.print("  event_feed_supported: {s}\n", .{if (event_feed_supported) "true" else "false"});
             std.debug.print("  entries: {d}\n", .{report.entry_count});
             if (report.vector_entry_count) |n| {
                 std.debug.print("  vector_entries: {d}\n", .{n});
@@ -1554,6 +1601,10 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
         if (status_mode) {
             const info = mem_rt.memory.eventFeedInfo(allocator) catch |err| {
+                if (err == error.NotSupported) {
+                    std.debug.print("memory events are not supported for backend: {s}\n", .{cfg.memory.backend});
+                    std.process.exit(1);
+                }
                 std.debug.print("memory events status failed: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
@@ -1580,6 +1631,10 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         }
 
         const events = mem_rt.memory.listEvents(allocator, after_sequence, limit) catch |err| {
+            if (err == error.NotSupported) {
+                std.debug.print("memory events are not supported for backend: {s}\n", .{cfg.memory.backend});
+                std.process.exit(1);
+            }
             std.debug.print("memory events failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -1655,6 +1710,10 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                     std.process.exit(1);
                 };
                 applyMemoryEventWithVectorSync(&mem_rt, allocator, input) catch |err| {
+                    if (err == error.NotSupported) {
+                        std.debug.print("memory apply is not supported for backend: {s}\n", .{cfg.memory.backend});
+                        std.process.exit(1);
+                    }
                     std.debug.print("memory apply failed: {s}\n", .{@errorName(err)});
                     std.process.exit(1);
                 };
@@ -1675,6 +1734,10 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                     std.process.exit(1);
                 };
                 applyMemoryEventWithVectorSync(&mem_rt, allocator, input) catch |err| {
+                    if (err == error.NotSupported) {
+                        std.debug.print("memory apply is not supported for backend: {s}\n", .{cfg.memory.backend});
+                        std.process.exit(1);
+                    }
                     std.debug.print("memory apply failed: {s}\n", .{@errorName(err)});
                     std.process.exit(1);
                 };
@@ -4624,4 +4687,55 @@ test "parseCronAddAgentOptions preserves delivery account flag" {
     try std.testing.expect(!options.delivery.channel_owned);
     try std.testing.expect(!options.delivery.account_id_owned);
     try std.testing.expect(!options.delivery.to_owned);
+}
+
+test "applyMemoryEventWithVectorSync ignores stale put for vector sync" {
+    if (!build_options.enable_memory_sqlite) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ws_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var rt = yc.memory.initRuntime(std.testing.allocator, &.{
+        .backend = "sqlite",
+        .search = .{
+            .provider = "openai",
+            .query = .{ .hybrid = .{ .enabled = true } },
+            .sync = .{
+                .mode = "durable_outbox",
+            },
+        },
+    }, ws_path) orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try rt.memory.applyEvent(.{
+        .origin_instance_id = "agent-a",
+        .origin_sequence = 2,
+        .timestamp_ms = 2000,
+        .operation = .put,
+        .key = "preferences.theme",
+        .category = .core,
+        .content = "new",
+    });
+
+    const ob = rt._outbox orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), try ob.pendingCount());
+
+    try applyMemoryEventWithVectorSync(&rt, std.testing.allocator, .{
+        .origin_instance_id = "agent-a",
+        .origin_sequence = 1,
+        .timestamp_ms = 1000,
+        .operation = .put,
+        .key = "preferences.theme",
+        .category = .core,
+        .content = "old",
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), try ob.pendingCount());
+
+    const entry = (try rt.memory.getScoped(std.testing.allocator, "preferences.theme", null)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("new", entry.content);
 }

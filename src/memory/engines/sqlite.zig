@@ -608,6 +608,7 @@ pub const SqliteMemory = struct {
             \\);
         );
         try self.execSql("event stream migration", "CREATE INDEX IF NOT EXISTS idx_memory_tombstones_key ON memory_tombstones(key);");
+        try self.bootstrapEventFeedFromExistingMemories();
     }
 
     fn localInstanceId(self: *Self) []const u8 {
@@ -703,6 +704,97 @@ pub const SqliteMemory = struct {
         _ = c.sqlite3_bind_int64(stmt, 2, @intCast(origin_sequence));
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn queryCount(self: *Self, sql: [:0]const u8) !u64 {
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            const value = c.sqlite3_column_int64(stmt, 0);
+            return if (value < 0) 0 else @intCast(value);
+        }
+        return 0;
+    }
+
+    fn bootstrapEventFeedFromExistingMemories(self: *Self) !void {
+        const event_count = try self.queryCount("SELECT COUNT(*) FROM memory_events");
+        if (event_count > 0) return;
+
+        const memory_count = try self.queryCount("SELECT COUNT(*) FROM memories");
+        if (memory_count == 0) return;
+
+        var owns_tx = c.sqlite3_get_autocommit(self.db) != 0;
+        if (owns_tx) owns_tx = try self.beginImmediate();
+        var committed = false;
+        errdefer if (owns_tx and !committed) self.rollbackTxn();
+
+        const select_sql =
+            "SELECT rowid, key, content, category, session_id, " ++
+            "COALESCE(CAST(strftime('%s', updated_at) AS INTEGER), 0) " ++
+            "FROM memories ORDER BY updated_at ASC, rowid ASC";
+        var select_stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, select_sql, -1, &select_stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(select_stmt);
+
+        const update_sql =
+            "UPDATE memories SET event_timestamp_ms = ?1, event_origin_instance_id = ?2, event_origin_sequence = ?3 WHERE rowid = ?4";
+        var update_stmt: ?*c.sqlite3_stmt = null;
+        rc = c.sqlite3_prepare_v2(self.db, update_sql, -1, &update_stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(update_stmt);
+
+        var next_origin_sequence: u64 = 1;
+        while (true) {
+            rc = c.sqlite3_step(select_stmt);
+            if (rc != c.SQLITE_ROW) break;
+
+            const rowid = c.sqlite3_column_int64(select_stmt, 0);
+            const key = try dupeColumnText(select_stmt.?, 1, self.allocator);
+            defer self.allocator.free(key);
+            const content = try dupeColumnText(select_stmt.?, 2, self.allocator);
+            defer self.allocator.free(content);
+            const category_text = try dupeColumnText(select_stmt.?, 3, self.allocator);
+            defer self.allocator.free(category_text);
+            const session_id = try dupeColumnTextNullable(select_stmt.?, 4, self.allocator);
+            defer if (session_id) |sid| self.allocator.free(sid);
+            const updated_at_secs = c.sqlite3_column_int64(select_stmt, 5);
+            const timestamp_ms: i64 = if (updated_at_secs > 0) updated_at_secs * 1000 else @intCast(next_origin_sequence);
+            const input = MemoryEventInput{
+                .origin_instance_id = self.localInstanceId(),
+                .origin_sequence = next_origin_sequence,
+                .timestamp_ms = timestamp_ms,
+                .operation = .put,
+                .key = key,
+                .session_id = session_id,
+                .category = MemoryCategory.fromString(category_text),
+                .content = content,
+            };
+            const inserted = try self.insertEventTx(input);
+            if (!inserted) return error.StepFailed;
+
+            _ = c.sqlite3_reset(update_stmt);
+            _ = c.sqlite3_clear_bindings(update_stmt);
+            _ = c.sqlite3_bind_int64(update_stmt, 1, timestamp_ms);
+            _ = c.sqlite3_bind_text(update_stmt, 2, self.localInstanceId().ptr, @intCast(self.localInstanceId().len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_int64(update_stmt, 3, @intCast(next_origin_sequence));
+            _ = c.sqlite3_bind_int64(update_stmt, 4, rowid);
+            rc = c.sqlite3_step(update_stmt);
+            if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+            next_origin_sequence += 1;
+        }
+
+        if (next_origin_sequence > 1) {
+            try self.setFrontierTx(self.localInstanceId(), next_origin_sequence - 1);
+        }
+
+        if (owns_tx) try self.commitTxn();
+        committed = true;
     }
 
     fn nextLocalOriginSequenceTx(self: *Self) !u64 {
@@ -3180,6 +3272,48 @@ test "sqlite event feed converges across replicas and is idempotent" {
     }
     try std.testing.expectEqual(@as(usize, 1), try replica_mem.count());
     try std.testing.expectEqual(@as(u64, 3), try replica_mem.lastEventSequence());
+}
+
+test "sqlite migration backfills existing memories into event feed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ws_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ ws_path, "memory.db" });
+    defer std.testing.allocator.free(db_path);
+
+    {
+        var mem = try SqliteMemory.initWithInstanceId(std.testing.allocator, db_path, "agent-a");
+        defer mem.deinit();
+        const memory = mem.memory();
+
+        try memory.store("preferences.theme", "dark", .core, null);
+        try memory.store("preferences.locale", "en", .core, "sess-1");
+
+        try mem.execSql("test reset events", "DELETE FROM memory_events;");
+        try mem.execSql("test reset frontiers", "DELETE FROM memory_event_frontiers;");
+    }
+
+    var reopened = try SqliteMemory.initWithInstanceId(std.testing.allocator, db_path, "agent-a");
+    defer reopened.deinit();
+    const reopened_mem = reopened.memory();
+
+    const events = try reopened_mem.listEvents(std.testing.allocator, 0, 32);
+    defer root.freeEvents(std.testing.allocator, events);
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+
+    try std.testing.expectEqualStrings("preferences.theme", events[0].key);
+    try std.testing.expectEqual(@as(u64, 1), events[0].origin_sequence);
+    try std.testing.expect(events[0].session_id == null);
+    try std.testing.expectEqualStrings("dark", events[0].content.?);
+    try std.testing.expectEqualStrings("preferences.locale", events[1].key);
+    try std.testing.expectEqual(@as(u64, 2), events[1].origin_sequence);
+    try std.testing.expectEqualStrings("sess-1", events[1].session_id.?);
+    try std.testing.expectEqualStrings("en", events[1].content.?);
+    try std.testing.expect(events[0].sequence < events[1].sequence);
+    try std.testing.expectEqual(events[1].sequence, try reopened_mem.lastEventSequence());
 }
 
 test "sqlite tombstones block older cross-origin put replay" {
