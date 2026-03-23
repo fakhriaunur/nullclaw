@@ -336,12 +336,16 @@ pub fn freeEntries(allocator: std.mem.Allocator, entries: []MemoryEntry) void {
 
 pub const MemoryEventOp = enum {
     put,
+    merge_object,
+    merge_string_set,
     delete_scoped,
     delete_all,
 
     pub fn toString(self: MemoryEventOp) []const u8 {
         return switch (self) {
             .put => "put",
+            .merge_object => "merge_object",
+            .merge_string_set => "merge_string_set",
             .delete_scoped => "delete_scoped",
             .delete_all => "delete_all",
         };
@@ -349,8 +353,28 @@ pub const MemoryEventOp = enum {
 
     pub fn fromString(value: []const u8) ?MemoryEventOp {
         if (std.mem.eql(u8, value, "put")) return .put;
+        if (std.mem.eql(u8, value, "merge_object")) return .merge_object;
+        if (std.mem.eql(u8, value, "merge_string_set")) return .merge_string_set;
         if (std.mem.eql(u8, value, "delete_scoped")) return .delete_scoped;
         if (std.mem.eql(u8, value, "delete_all")) return .delete_all;
+        return null;
+    }
+};
+
+pub const MemoryValueKind = enum {
+    json_object,
+    string_set,
+
+    pub fn toString(self: MemoryValueKind) []const u8 {
+        return switch (self) {
+            .json_object => "json_object",
+            .string_set => "string_set",
+        };
+    }
+
+    pub fn fromString(value: []const u8) ?MemoryValueKind {
+        if (std.mem.eql(u8, value, "json_object")) return .json_object;
+        if (std.mem.eql(u8, value, "string_set")) return .string_set;
         return null;
     }
 };
@@ -365,6 +389,7 @@ pub const MemoryEvent = struct {
     key: []const u8,
     session_id: ?[]const u8 = null,
     category: ?MemoryCategory = null,
+    value_kind: ?MemoryValueKind = null,
     content: ?[]const u8 = null,
 
     pub fn deinit(self: *const MemoryEvent, allocator: std.mem.Allocator) void {
@@ -392,6 +417,7 @@ pub const MemoryEventInput = struct {
     key: []const u8,
     session_id: ?[]const u8 = null,
     category: ?MemoryCategory = null,
+    value_kind: ?MemoryValueKind = null,
     content: ?[]const u8 = null,
 };
 
@@ -404,6 +430,365 @@ pub const MemoryEventFeedInfo = struct {
         allocator.free(self.instance_id);
     }
 };
+
+pub const ResolvedMemoryState = struct {
+    content: []u8,
+    category: MemoryCategory,
+    value_kind: ?MemoryValueKind = null,
+
+    pub fn deinit(self: *const ResolvedMemoryState, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+        switch (self.category) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        }
+    }
+};
+
+pub fn cloneMemoryCategory(allocator: std.mem.Allocator, cat: MemoryCategory) !MemoryCategory {
+    return switch (cat) {
+        .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+        else => cat,
+    };
+}
+
+pub fn eventProducesState(operation: MemoryEventOp) bool {
+    return switch (operation) {
+        .put, .merge_object, .merge_string_set => true,
+        .delete_scoped, .delete_all => false,
+    };
+}
+
+pub fn resolveMemoryEventState(
+    allocator: std.mem.Allocator,
+    existing_content: ?[]const u8,
+    existing_category: ?MemoryCategory,
+    existing_value_kind: ?MemoryValueKind,
+    input: MemoryEventInput,
+) !?ResolvedMemoryState {
+    return switch (input.operation) {
+        .put => blk: {
+            const category = input.category orelse return error.InvalidEvent;
+            const content = input.content orelse return error.InvalidEvent;
+            const resolved_content = try canonicalizeMemoryContent(allocator, content, input.value_kind);
+            errdefer allocator.free(resolved_content);
+            break :blk .{
+                .content = resolved_content,
+                .category = try cloneMemoryCategory(allocator, category),
+                .value_kind = input.value_kind,
+            };
+        },
+        .merge_object => blk: {
+            if (input.value_kind) |kind| {
+                if (kind != .json_object) return error.InvalidEvent;
+            }
+            const patch_content = input.content orelse return error.InvalidEvent;
+            if (existing_value_kind) |kind| {
+                if (kind != .json_object) return error.InvalidEvent;
+            }
+            const category = if (input.category) |category|
+                category
+            else
+                existing_category orelse return error.InvalidEvent;
+            const resolved_content = try canonicalizeMergedObjectContent(allocator, existing_content, patch_content);
+            errdefer allocator.free(resolved_content);
+            break :blk .{
+                .content = resolved_content,
+                .category = try cloneMemoryCategory(allocator, category),
+                .value_kind = .json_object,
+            };
+        },
+        .merge_string_set => blk: {
+            if (input.value_kind) |kind| {
+                if (kind != .string_set) return error.InvalidEvent;
+            }
+            const incoming_content = input.content orelse return error.InvalidEvent;
+            if (existing_value_kind) |kind| {
+                if (kind != .string_set) return error.InvalidEvent;
+            }
+            const category = if (input.category) |category|
+                category
+            else
+                existing_category orelse return error.InvalidEvent;
+            const resolved_content = try canonicalizeMergedStringSetContent(allocator, existing_content, incoming_content);
+            errdefer allocator.free(resolved_content);
+            break :blk .{
+                .content = resolved_content,
+                .category = try cloneMemoryCategory(allocator, category),
+                .value_kind = .string_set,
+            };
+        },
+        .delete_scoped, .delete_all => null,
+    };
+}
+
+pub fn canonicalizeMemoryContent(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    value_kind: ?MemoryValueKind,
+) ![]u8 {
+    return switch (value_kind orelse return allocator.dupe(u8, content)) {
+        .json_object => canonicalizeJsonObjectContent(allocator, content),
+        .string_set => canonicalizeMergedStringSetContent(allocator, null, content),
+    };
+}
+
+fn canonicalizeJsonObjectContent(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidEvent;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendCanonicalJsonValue(&out, allocator, parsed.value);
+    return out.toOwnedSlice(allocator);
+}
+
+fn canonicalizeMergedObjectContent(
+    allocator: std.mem.Allocator,
+    existing_content: ?[]const u8,
+    patch_content: []const u8,
+) ![]u8 {
+    var patch = try std.json.parseFromSlice(std.json.Value, allocator, patch_content, .{});
+    defer patch.deinit();
+    if (patch.value != .object) return error.InvalidEvent;
+
+    var existing: ?std.json.Parsed(std.json.Value) = null;
+    defer if (existing) |*parsed| parsed.deinit();
+    if (existing_content) |content| {
+        existing = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+        if (existing.?.value != .object) return error.InvalidEvent;
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try appendMergedObjectCanonical(
+        &out,
+        allocator,
+        if (existing) |parsed| parsed.value.object else null,
+        patch.value.object,
+    );
+    return out.toOwnedSlice(allocator);
+}
+
+fn canonicalizeMergedStringSetContent(
+    allocator: std.mem.Allocator,
+    existing_content: ?[]const u8,
+    incoming_content: []const u8,
+) ![]u8 {
+    var items: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
+
+    if (existing_content) |content| {
+        try appendStringSetItems(&items, allocator, content, true);
+    }
+    try appendStringSetItems(&items, allocator, incoming_content, true);
+
+    std.mem.sort([]const u8, items.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (items.items, 0..) |item, idx| {
+        if (idx > 0) try out.append(allocator, ',');
+        try appendCanonicalJsonString(&out, allocator, item);
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendStringSetItems(
+    items: *std.ArrayListUnmanaged([]const u8),
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    allow_plain_string: bool,
+) !void {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    if (trimmed[0] != '[' and trimmed[0] != '"') {
+        if (!allow_plain_string) return error.InvalidEvent;
+        try appendUniqueStringSetItem(items, allocator, trimmed);
+        return;
+    }
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .string => |value| try appendUniqueStringSetItem(items, allocator, value),
+        .array => |array| {
+            for (array.items) |item| {
+                if (item != .string) return error.InvalidEvent;
+                try appendUniqueStringSetItem(items, allocator, item.string);
+            }
+        },
+        else => return error.InvalidEvent,
+    }
+}
+
+fn appendUniqueStringSetItem(
+    items: *std.ArrayListUnmanaged([]const u8),
+    allocator: std.mem.Allocator,
+    item: []const u8,
+) !void {
+    for (items.items) |existing| {
+        if (std.mem.eql(u8, existing, item)) return;
+    }
+    try items.append(allocator, try allocator.dupe(u8, item));
+}
+
+fn appendCanonicalJsonString(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: []const u8,
+) !void {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(encoded);
+    try out.appendSlice(allocator, encoded);
+}
+
+fn appendCanonicalJsonValue(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) anyerror!void {
+    switch (value) {
+        .null => try out.appendSlice(allocator, "null"),
+        .bool => |inner| try out.appendSlice(allocator, if (inner) "true" else "false"),
+        .integer => |inner| try out.writer(allocator).print("{d}", .{inner}),
+        .float => |inner| try out.writer(allocator).print("{d}", .{inner}),
+        .number_string => |inner| try out.appendSlice(allocator, inner),
+        .string => |inner| try appendCanonicalJsonString(out, allocator, inner),
+        .array => |inner| {
+            try out.append(allocator, '[');
+            for (inner.items, 0..) |item, idx| {
+                if (idx > 0) try out.append(allocator, ',');
+                try appendCanonicalJsonValue(out, allocator, item);
+            }
+            try out.append(allocator, ']');
+        },
+        .object => |inner| try appendCanonicalJsonObject(out, allocator, inner),
+    }
+}
+
+fn appendCanonicalJsonObject(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) anyerror!void {
+    const keys = try collectSortedObjectKeys(allocator, object);
+    defer allocator.free(keys);
+
+    try out.append(allocator, '{');
+    for (keys, 0..) |key, idx| {
+        if (idx > 0) try out.append(allocator, ',');
+        try appendCanonicalJsonString(out, allocator, key);
+        try out.append(allocator, ':');
+        try appendCanonicalJsonValue(out, allocator, object.get(key).?);
+    }
+    try out.append(allocator, '}');
+}
+
+fn appendMergedObjectCanonical(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    existing_object: ?std.json.ObjectMap,
+    patch_object: std.json.ObjectMap,
+) anyerror!void {
+    const keys = try collectMergedObjectKeys(allocator, existing_object, patch_object);
+    defer allocator.free(keys);
+
+    try out.append(allocator, '{');
+    for (keys, 0..) |key, idx| {
+        if (idx > 0) try out.append(allocator, ',');
+        try appendCanonicalJsonString(out, allocator, key);
+        try out.append(allocator, ':');
+
+        const patch_value = patch_object.get(key);
+        const existing_value = if (existing_object) |object| object.get(key) else null;
+        if (patch_value) |value| {
+            if (existing_value) |existing| {
+                if (existing == .object and value == .object) {
+                    try appendMergedObjectCanonical(out, allocator, existing.object, value.object);
+                    continue;
+                }
+            }
+            try appendCanonicalJsonValue(out, allocator, value);
+        } else if (existing_value) |value| {
+            try appendCanonicalJsonValue(out, allocator, value);
+        } else {
+            return error.InvalidEvent;
+        }
+    }
+    try out.append(allocator, '}');
+}
+
+fn collectSortedObjectKeys(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) anyerror![][]const u8 {
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer keys.deinit(allocator);
+
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        try keys.append(allocator, entry.key_ptr.*);
+    }
+
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return keys.toOwnedSlice(allocator);
+}
+
+fn collectMergedObjectKeys(
+    allocator: std.mem.Allocator,
+    existing_object: ?std.json.ObjectMap,
+    patch_object: std.json.ObjectMap,
+) anyerror![][]const u8 {
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer keys.deinit(allocator);
+
+    if (existing_object) |object| {
+        var existing_it = object.iterator();
+        while (existing_it.next()) |entry| {
+            try appendUniqueObjectKey(&keys, allocator, entry.key_ptr.*);
+        }
+    }
+
+    var patch_it = patch_object.iterator();
+    while (patch_it.next()) |entry| {
+        try appendUniqueObjectKey(&keys, allocator, entry.key_ptr.*);
+    }
+
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return keys.toOwnedSlice(allocator);
+}
+
+fn appendUniqueObjectKey(
+    keys: *std.ArrayListUnmanaged([]const u8),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+) anyerror!void {
+    for (keys.items) |existing| {
+        if (std.mem.eql(u8, existing, key)) return;
+    }
+    try keys.append(allocator, key);
+}
 
 pub const PromptBootstrapKeyPrefix = "__bootstrap.prompt.";
 
@@ -991,6 +1376,7 @@ fn buildOverlayJournalIdentity(
     const writer = out.writer(allocator);
     const effective_instance_id = if (cfg.instance_id.len > 0) cfg.instance_id else "default";
 
+    try writer.writeAll("overlay_protocol=v2\n");
     try writer.print("backend={s}\n", .{backend_name});
     try writer.print("instance_id={s}\n", .{effective_instance_id});
 
@@ -1079,7 +1465,7 @@ pub fn initRuntime(
         return null;
     };
 
-    if (instance.memory.vtable.listEvents == null and !std.mem.eql(u8, config.backend, "none")) {
+    if ((instance.memory.vtable.listEvents == null or std.mem.eql(u8, config.backend, "memory")) and !std.mem.eql(u8, config.backend, "none")) {
         const overlay_root = buildOverlayJournalRootDir(allocator, config.backend, workspace_dir) catch |err| {
             log.warn("memory backend '{s}' event feed root init failed: {}", .{ config.backend, err });
             instance.memory.deinit();
@@ -2476,6 +2862,103 @@ test "MemoryRuntime.deinit cleans up P3 resources" {
     // P3 fields are null for "none" backend with hybrid disabled, but deinit should handle that.
     rt.deinit();
     // testing allocator detects leaks
+}
+
+test "initRuntime memory backend persists deterministic feed across restart" {
+    try requireBackendEnabledForTests("memory");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const cfg = config_types.MemoryConfig{ .backend = "memory" };
+
+    var first = initRuntime(std.testing.allocator, &cfg, workspace) orelse return error.TestUnexpectedResult;
+
+    try first.memory.store("preferences.theme", "dark", .core, null);
+    try std.testing.expect(first.memory.vtable.listEvents != null);
+
+    const first_info = try first.memory.eventFeedInfo(std.testing.allocator);
+    defer first_info.deinit(std.testing.allocator);
+    try std.testing.expect(first_info.last_sequence > 0);
+
+    first.deinit();
+
+    var second = initRuntime(std.testing.allocator, &cfg, workspace) orelse return error.TestUnexpectedResult;
+    defer second.deinit();
+
+    const entry = (try second.memory.getScoped(std.testing.allocator, "preferences.theme", null)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("dark", entry.content);
+
+    const second_info = try second.memory.eventFeedInfo(std.testing.allocator);
+    defer second_info.deinit(std.testing.allocator);
+    try std.testing.expect(second_info.last_sequence > 0);
+}
+
+test "initRuntime memory backend supports deterministic behavioral merge events" {
+    try requireBackendEnabledForTests("memory");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const cfg = config_types.MemoryConfig{ .backend = "memory" };
+    var rt = initRuntime(std.testing.allocator, &cfg, workspace) orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try rt.memory.applyEvent(.{
+        .origin_instance_id = "agent-a",
+        .origin_sequence = 1,
+        .timestamp_ms = 10,
+        .operation = .merge_string_set,
+        .key = "traits.tags",
+        .category = .core,
+        .value_kind = .string_set,
+        .content = "friendly",
+    });
+    try rt.memory.applyEvent(.{
+        .origin_instance_id = "agent-b",
+        .origin_sequence = 1,
+        .timestamp_ms = 11,
+        .operation = .merge_string_set,
+        .key = "traits.tags",
+        .value_kind = .string_set,
+        .content = "[\"concise\",\"friendly\"]",
+    });
+
+    const tags = (try rt.memory.getScoped(std.testing.allocator, "traits.tags", null)).?;
+    defer tags.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("[\"concise\",\"friendly\"]", tags.content);
+
+    try rt.memory.applyEvent(.{
+        .origin_instance_id = "agent-a",
+        .origin_sequence = 2,
+        .timestamp_ms = 20,
+        .operation = .merge_object,
+        .key = "profile.behavior",
+        .category = .core,
+        .value_kind = .json_object,
+        .content = "{\"tone\":\"formal\",\"persona\":{\"warm\":true}}",
+    });
+    try rt.memory.applyEvent(.{
+        .origin_instance_id = "agent-b",
+        .origin_sequence = 2,
+        .timestamp_ms = 21,
+        .operation = .merge_object,
+        .key = "profile.behavior",
+        .value_kind = .json_object,
+        .content = "{\"persona\":{\"direct\":true},\"verbosity\":\"low\"}",
+    });
+
+    const behavior = (try rt.memory.getScoped(std.testing.allocator, "profile.behavior", null)).?;
+    defer behavior.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "{\"persona\":{\"direct\":true,\"warm\":true},\"tone\":\"formal\",\"verbosity\":\"low\"}",
+        behavior.content,
+    );
 }
 
 test {

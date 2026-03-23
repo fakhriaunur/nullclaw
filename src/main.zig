@@ -43,7 +43,7 @@ const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
-const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|put|delete|events|apply|drain-outbox|forget";
+const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|put|merge-object|merge-set|delete|events|apply|drain-outbox|forget";
 const HISTORY_SUBCOMMANDS = "list|show";
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
 const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
@@ -1003,8 +1003,12 @@ fn printMemoryUsage() void {
         \\                                Show a single memory entry by key
         \\  list [--category C] [--session-id ID] [--limit N] [--json]
         \\                                List memory entries (default limit: 20)
-        \\  put <key> <content> [--category C] [--session-id ID]
+        \\  put <key> <content> [--category C] [--session-id ID] [--value-kind KIND]
         \\                                Store or update a memory entry
+        \\  merge-object <key> <json-object> [--category C] [--session-id ID]
+        \\                                Deterministically merge a JSON object into memory state
+        \\  merge-set <key> <value|json-array> [--category C] [--session-id ID]
+        \\                                Deterministically union values into a string-set memory
         \\  delete <key> [--session-id ID]
         \\                                Delete a memory entry (scoped if session id is given)
         \\  events [--after N] [--limit N] [--json|--ndjson|--status]
@@ -1177,6 +1181,12 @@ fn writeMemoryEventJson(out: anytype, event: yc.memory.MemoryEvent) !void {
     } else {
         try out.writeAll("null");
     }
+    try out.writeAll(",\"value_kind\":");
+    if (event.value_kind) |value_kind| {
+        try writeJsonString(out, value_kind.toString());
+    } else {
+        try out.writeAll("null");
+    }
     try out.writeAll(",\"content\":");
     try writeJsonNullableString(out, event.content);
     try out.writeAll("}");
@@ -1215,6 +1225,7 @@ fn parseMemoryEventValue(val: std.json.Value) !yc.memory.MemoryEventInput {
     if (origin_sequence_raw < 0) return error.InvalidEvent;
     const operation = yc.memory.MemoryEventOp.fromString(operation_str) orelse return error.InvalidEvent;
     const category_str = jsonNullableStringField(val, "category");
+    const value_kind_str = jsonNullableStringField(val, "value_kind");
     const content = jsonNullableStringField(val, "content");
     const session_id = jsonNullableStringField(val, "session_id");
 
@@ -1226,6 +1237,10 @@ fn parseMemoryEventValue(val: std.json.Value) !yc.memory.MemoryEventInput {
         .key = key,
         .session_id = session_id,
         .category = if (category_str) |cat| yc.memory.MemoryCategory.fromString(cat) else null,
+        .value_kind = if (value_kind_str) |kind|
+            yc.memory.MemoryValueKind.fromString(kind) orelse return error.InvalidEvent
+        else
+            null,
         .content = content,
     };
 }
@@ -1287,14 +1302,14 @@ fn applyMemoryEventWithVectorSync(mem_rt: *yc.memory.MemoryRuntime, allocator: s
     defer if (after_scopes.len > 0) freeMemoryKeyScopes(allocator, after_scopes);
 
     switch (input.operation) {
-        .put, .delete_scoped => before_entry = try mem_rt.memory.getScoped(allocator, input.key, input.session_id),
+        .put, .merge_object, .merge_string_set, .delete_scoped => before_entry = try mem_rt.memory.getScoped(allocator, input.key, input.session_id),
         .delete_all => before_scopes = try collectMemoryKeyScopes(allocator, mem_rt.memory, input.key),
     }
 
     try mem_rt.memory.applyEvent(input);
 
     switch (input.operation) {
-        .put => {
+        .put, .merge_object, .merge_string_set => {
             after_entry = try mem_rt.memory.getScoped(allocator, input.key, input.session_id);
             if (after_entry) |after| {
                 const changed = if (before_entry) |before|
@@ -1319,6 +1334,41 @@ fn applyMemoryEventWithVectorSync(mem_rt: *yc.memory.MemoryRuntime, allocator: s
             }
         },
     }
+}
+
+const LocalMemoryEventOrigin = struct {
+    instance_id: []u8,
+    next_origin_sequence: u64,
+
+    fn deinit(self: *const LocalMemoryEventOrigin, allocator: std.mem.Allocator) void {
+        allocator.free(self.instance_id);
+    }
+};
+
+fn nextLocalMemoryEventOrigin(allocator: std.mem.Allocator, memory: yc.memory.Memory) !LocalMemoryEventOrigin {
+    var info = try memory.eventFeedInfo(allocator);
+    errdefer info.deinit(allocator);
+
+    var after_sequence: u64 = 0;
+    var max_origin_sequence: u64 = 0;
+    while (true) {
+        const events = try memory.listEvents(allocator, after_sequence, 256);
+        defer yc.memory.freeEvents(allocator, events);
+        if (events.len == 0) break;
+
+        for (events) |event| {
+            if (std.mem.eql(u8, event.origin_instance_id, info.instance_id)) {
+                max_origin_sequence = @max(max_origin_sequence, event.origin_sequence);
+            }
+        }
+        after_sequence = events[events.len - 1].sequence;
+        if (events.len < 256) break;
+    }
+
+    return .{
+        .instance_id = info.instance_id,
+        .next_origin_sequence = max_origin_sequence + 1,
+    };
 }
 
 fn readAllFromPathOrStdin(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -1519,42 +1569,132 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
     if (std.mem.eql(u8, subcmd, "put")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID]\n", .{});
+            std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID] [--value-kind KIND]\n", .{});
             std.process.exit(1);
         }
         const key = sub_args[1];
         const content = sub_args[2];
         var category: yc.memory.MemoryCategory = .core;
         var session_id: ?[]const u8 = null;
+        var value_kind: ?yc.memory.MemoryValueKind = null;
 
         var i: usize = 3;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--category")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID]\n", .{});
+                    std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID] [--value-kind KIND]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
                 category = yc.memory.MemoryCategory.fromString(sub_args[i]);
             } else if (std.mem.eql(u8, sub_args[i], "--session-id")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID]\n", .{});
+                    std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID] [--value-kind KIND]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
                 session_id = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--value-kind")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID] [--value-kind KIND]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                value_kind = yc.memory.MemoryValueKind.fromString(sub_args[i]) orelse {
+                    std.debug.print("Unknown memory value kind: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
             } else {
                 std.debug.print("Unknown option for memory put: {s}\n", .{sub_args[i]});
                 std.process.exit(1);
             }
         }
 
-        mem_rt.memory.store(key, content, category, session_id) catch |err| {
-            std.debug.print("memory put failed: {s}\n", .{@errorName(err)});
+        if (value_kind) |kind| {
+            var origin = nextLocalMemoryEventOrigin(allocator, mem_rt.memory) catch |err| {
+                std.debug.print("memory put failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer origin.deinit(allocator);
+
+            applyMemoryEventWithVectorSync(&mem_rt, allocator, .{
+                .origin_instance_id = origin.instance_id,
+                .origin_sequence = origin.next_origin_sequence,
+                .timestamp_ms = std.time.milliTimestamp(),
+                .operation = .put,
+                .key = key,
+                .session_id = session_id,
+                .category = category,
+                .value_kind = kind,
+                .content = content,
+            }) catch |err| {
+                std.debug.print("memory put failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+        } else {
+            mem_rt.memory.store(key, content, category, session_id) catch |err| {
+                std.debug.print("memory put failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            mem_rt.syncVectorAfterStore(allocator, key, content, session_id);
+        }
+        std.debug.print("Stored memory entry: {s}\n", .{key});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "merge-object") or std.mem.eql(u8, subcmd, "merge-set")) {
+        if (sub_args.len < 3) {
+            std.debug.print("Usage: nullclaw memory {s} <key> <content> [--category C] [--session-id ID]\n", .{subcmd});
+            std.process.exit(1);
+        }
+        const key = sub_args[1];
+        const content = sub_args[2];
+        var category: ?yc.memory.MemoryCategory = null;
+        var session_id: ?[]const u8 = null;
+
+        var i: usize = 3;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--category")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory {s} <key> <content> [--category C] [--session-id ID]\n", .{subcmd});
+                    std.process.exit(1);
+                }
+                i += 1;
+                category = yc.memory.MemoryCategory.fromString(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--session-id")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory {s} <key> <content> [--category C] [--session-id ID]\n", .{subcmd});
+                    std.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
+            } else {
+                std.debug.print("Unknown option for memory {s}: {s}\n", .{ subcmd, sub_args[i] });
+                std.process.exit(1);
+            }
+        }
+
+        var origin = nextLocalMemoryEventOrigin(allocator, mem_rt.memory) catch |err| {
+            std.debug.print("memory {s} failed: {s}\n", .{ subcmd, @errorName(err) });
             std.process.exit(1);
         };
-        mem_rt.syncVectorAfterStore(allocator, key, content, session_id);
-        std.debug.print("Stored memory entry: {s}\n", .{key});
+        defer origin.deinit(allocator);
+
+        applyMemoryEventWithVectorSync(&mem_rt, allocator, .{
+            .origin_instance_id = origin.instance_id,
+            .origin_sequence = origin.next_origin_sequence,
+            .timestamp_ms = std.time.milliTimestamp(),
+            .operation = if (std.mem.eql(u8, subcmd, "merge-object")) .merge_object else .merge_string_set,
+            .key = key,
+            .session_id = session_id,
+            .category = category,
+            .value_kind = if (std.mem.eql(u8, subcmd, "merge-object")) .json_object else .string_set,
+            .content = content,
+        }) catch |err| {
+            std.debug.print("memory {s} failed: {s}\n", .{ subcmd, @errorName(err) });
+            std.process.exit(1);
+        };
+        std.debug.print("Merged memory entry: {s}\n", .{key});
         return;
     }
 
@@ -1671,6 +1811,9 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                     event.origin_instance_id,
                     event.origin_sequence,
                 });
+                if (event.value_kind) |value_kind| {
+                    std.debug.print("     value_kind={s}\n", .{value_kind.toString()});
+                }
             }
         }
         return;

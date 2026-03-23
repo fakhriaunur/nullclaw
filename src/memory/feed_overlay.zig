@@ -10,6 +10,8 @@ const MemoryEntry = root.MemoryEntry;
 const MemoryEvent = root.MemoryEvent;
 const MemoryEventFeedInfo = root.MemoryEventFeedInfo;
 const MemoryEventInput = root.MemoryEventInput;
+const MemoryValueKind = root.MemoryValueKind;
+const ResolvedMemoryState = root.ResolvedMemoryState;
 
 const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
 
@@ -23,7 +25,7 @@ pub const EventFeedOverlay = struct {
     loaded_size_bytes: u64 = 0,
     projection_offset_bytes: u64 = 0,
     origin_frontiers: std.StringHashMapUnmanaged(u64) = .{},
-    state_meta: std.StringHashMapUnmanaged(EventMeta) = .{},
+    state_entries: std.StringHashMapUnmanaged(StoredState) = .{},
     scoped_tombstones: std.StringHashMapUnmanaged(EventMeta) = .{},
     key_tombstones: std.StringHashMapUnmanaged(EventMeta) = .{},
     owns_self: bool = false,
@@ -31,6 +33,17 @@ pub const EventFeedOverlay = struct {
     const Self = @This();
 
     const EventMeta = struct {
+        timestamp_ms: i64,
+        origin_instance_id: []const u8,
+        origin_sequence: u64,
+    };
+
+    const StoredState = struct {
+        key: []const u8,
+        content: []const u8,
+        category: MemoryCategory,
+        value_kind: ?MemoryValueKind,
+        session_id: ?[]const u8,
         timestamp_ms: i64,
         origin_instance_id: []const u8,
         origin_sequence: u64,
@@ -60,19 +73,23 @@ pub const EventFeedOverlay = struct {
         }
     };
 
-    const BootstrapEntry = struct {
-        key: []const u8,
-        content: []const u8,
-        category: MemoryCategory,
-        session_id: ?[]const u8,
+    const EventDecision = struct {
+        effect: Effect,
+        resolved_state: ?ResolvedMemoryState = null,
+
+        fn deinit(self: *EventDecision, allocator: std.mem.Allocator) void {
+            if (self.resolved_state) |*state| state.deinit(allocator);
+        }
     };
 
     const RecordedEvent = struct {
         event: MemoryEvent,
         effect: ?Effect = null,
+        resolved_state: ?ResolvedMemoryState = null,
 
         fn deinit(self: *RecordedEvent, allocator: std.mem.Allocator) void {
             self.event.deinit(allocator);
+            if (self.resolved_state) |*state| state.deinit(allocator);
         }
     };
 
@@ -85,13 +102,16 @@ pub const EventFeedOverlay = struct {
     ) !Self {
         const effective_instance_id = if (instance_id.len > 0) instance_id else "default";
         const journal_path = try buildJournalPath(allocator, journal_root_dir, journal_identity);
-        errdefer allocator.free(journal_path);
+        const owned_instance_id = allocator.dupe(u8, effective_instance_id) catch |err| {
+            allocator.free(journal_path);
+            return err;
+        };
 
         var self = Self{
             .allocator = allocator,
             .backend = backend,
             .journal_path = journal_path,
-            .instance_id = try allocator.dupe(u8, effective_instance_id),
+            .instance_id = owned_instance_id,
         };
         errdefer self.deinitMembers();
 
@@ -101,9 +121,6 @@ pub const EventFeedOverlay = struct {
         defer file.close();
 
         try self.refreshJournalLocked(&file);
-        if (self.last_sequence == 0) {
-            try self.bootstrapFromBackendLocked(&file);
-        }
         try self.replayProjectionLocked(&file);
 
         return self;
@@ -132,13 +149,13 @@ pub const EventFeedOverlay = struct {
         self.origin_frontiers.deinit(self.allocator);
         self.origin_frontiers = .{};
 
-        var state_it = self.state_meta.iterator();
+        var state_it = self.state_entries.iterator();
         while (state_it.next()) |kv| {
             self.allocator.free(kv.key_ptr.*);
-            self.freeEventMeta(kv.value_ptr.*);
+            self.freeStoredState(kv.value_ptr.*);
         }
-        self.state_meta.deinit(self.allocator);
-        self.state_meta = .{};
+        self.state_entries.deinit(self.allocator);
+        self.state_entries = .{};
 
         var scoped_it = self.scoped_tombstones.iterator();
         while (scoped_it.next()) |kv| {
@@ -177,25 +194,30 @@ pub const EventFeedOverlay = struct {
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         try self_.ensureProjectionUpToDate();
-        return self_.backend.recall(allocator, query, limit, session_id);
+        return self_.recallCanonical(allocator, query, limit, session_id);
     }
 
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         try self_.ensureProjectionUpToDate();
-        return self_.backend.get(allocator, key);
+        if (self_.findDefaultStatePtr(key)) |state| return try self_.cloneStateEntry(allocator, state.*);
+        if (self_.findLatestStatePtr(key)) |state| return try self_.cloneStateEntry(allocator, state.*);
+        return null;
     }
 
     fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         try self_.ensureProjectionUpToDate();
-        return self_.backend.getScoped(allocator, key, session_id);
+        const storage_key = try key_codec.encode(allocator, key, session_id);
+        defer allocator.free(storage_key);
+        const state = self_.state_entries.getPtr(storage_key) orelse return null;
+        return try self_.cloneStateEntry(allocator, state.*);
     }
 
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         try self_.ensureProjectionUpToDate();
-        return self_.backend.list(allocator, category, session_id);
+        return self_.listCanonical(allocator, category, session_id);
     }
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
@@ -243,7 +265,7 @@ pub const EventFeedOverlay = struct {
         var file = try self_.openJournalShared();
         defer file.close();
         try self_.refreshJournalLocked(&file);
-        return self_.state_meta.count();
+        return self_.state_entries.count();
     }
 
     fn implHealthCheck(ptr: *anyopaque) bool {
@@ -303,7 +325,7 @@ pub const EventFeedOverlay = struct {
         try self.refreshJournalLocked(&file);
         const storage_key = try key_codec.encode(self.allocator, key, session_id);
         defer self.allocator.free(storage_key);
-        const had_entry = self.state_meta.contains(storage_key);
+        const had_entry = self.state_entries.contains(storage_key);
         const input = try self.makeLocalInputLocked(.delete_scoped, key, session_id, null, null);
         _ = try self.recordEventLocked(&file, input);
         try self.replayProjectionLocked(&file);
@@ -353,10 +375,11 @@ pub const EventFeedOverlay = struct {
         const frontier = self.origin_frontiers.get(input.origin_instance_id) orelse 0;
         if (input.origin_sequence <= frontier) return false;
 
-        const effect = try self.computeMetadataEffect(input);
+        var decision = try self.computeDecision(input);
+        defer decision.deinit(self.allocator);
         const next_sequence = self.last_sequence + 1;
-        const end_offset = try self.appendEventLineLocked(file, next_sequence, input, effect);
-        try self.applyMetadataUpdate(next_sequence, input, effect);
+        const end_offset = try self.appendEventLineLocked(file, next_sequence, input, decision.effect, decision.resolved_state);
+        try self.applyMetadataUpdate(next_sequence, input, decision.effect, decision.resolved_state);
 
         // The journal is canonical. The backend is a projection that may lag
         // behind temporarily if replay fails after the append.
@@ -384,8 +407,15 @@ pub const EventFeedOverlay = struct {
             defer recorded.deinit(self.allocator);
 
             const input = memoryEventInput(recorded.event);
-            const effect = recorded.effect orelse try self.computeMetadataEffect(input);
-            try self.applyProjectionEffect(input, effect);
+            var decision = if (recorded.effect) |effect|
+                EventDecision{
+                    .effect = effect,
+                    .resolved_state = recorded.resolved_state,
+                }
+            else
+                try self.computeDecision(input);
+            defer if (recorded.effect == null) decision.deinit(self.allocator);
+            try self.applyProjectionEffect(input, decision.effect, decision.resolved_state);
             self.projection_offset_bytes = line_end;
         }
     }
@@ -420,52 +450,74 @@ pub const EventFeedOverlay = struct {
             defer recorded.deinit(self.allocator);
 
             const input = memoryEventInput(recorded.event);
-            const effect = recorded.effect orelse try self.computeMetadataEffect(input);
-            try self.applyMetadataUpdate(recorded.event.sequence, input, effect);
+            var decision = if (recorded.effect) |effect|
+                EventDecision{
+                    .effect = effect,
+                    .resolved_state = recorded.resolved_state,
+                }
+            else
+                try self.computeDecision(input);
+            defer if (recorded.effect == null) decision.deinit(self.allocator);
+            try self.applyMetadataUpdate(recorded.event.sequence, input, decision.effect, decision.resolved_state);
             self.loaded_size_bytes = line_end;
         }
     }
 
-    fn computeMetadataEffect(self: *Self, input: MemoryEventInput) !Effect {
+    fn computeDecision(self: *Self, input: MemoryEventInput) !EventDecision {
         return switch (input.operation) {
-            .put => blk: {
-                if (input.category == null or input.content == null) return error.InvalidEvent;
+            .put, .merge_object, .merge_string_set => blk: {
                 const storage_key = try key_codec.encode(self.allocator, input.key, input.session_id);
                 defer self.allocator.free(storage_key);
 
                 if (self.key_tombstones.get(input.key)) |meta| {
-                    if (compareMeta(meta, input) <= 0) break :blk .none;
+                    if (compareMeta(meta, input) <= 0) break :blk .{ .effect = .none };
                 }
                 if (self.scoped_tombstones.get(storage_key)) |meta| {
-                    if (compareMeta(meta, input) <= 0) break :blk .none;
+                    if (compareMeta(meta, input) <= 0) break :blk .{ .effect = .none };
                 }
-                if (self.state_meta.get(storage_key)) |meta| {
-                    if (compareMeta(meta, input) <= 0) break :blk .none;
+                const existing = self.state_entries.getPtr(storage_key);
+                if (existing) |state| {
+                    if (compareStoredState(state.*, input) <= 0) break :blk .{ .effect = .none };
                 }
-                break :blk .put;
+                break :blk .{
+                    .effect = .put,
+                    .resolved_state = try root.resolveMemoryEventState(
+                        self.allocator,
+                        if (existing) |state| state.content else null,
+                        if (existing) |state| state.category else null,
+                        if (existing) |state| state.value_kind else null,
+                        input,
+                    ) orelse return error.InvalidEvent,
+                };
             },
             .delete_scoped => blk: {
                 const storage_key = try key_codec.encode(self.allocator, input.key, input.session_id);
                 defer self.allocator.free(storage_key);
 
                 if (self.key_tombstones.get(input.key)) |meta| {
-                    if (compareMeta(meta, input) <= 0) break :blk .none;
+                    if (compareMeta(meta, input) <= 0) break :blk .{ .effect = .none };
                 }
                 if (self.scoped_tombstones.get(storage_key)) |meta| {
-                    if (compareMeta(meta, input) <= 0) break :blk .none;
+                    if (compareMeta(meta, input) <= 0) break :blk .{ .effect = .none };
                 }
-                break :blk .delete_scoped;
+                break :blk .{ .effect = .delete_scoped };
             },
             .delete_all => blk: {
                 if (self.key_tombstones.get(input.key)) |meta| {
-                    if (compareMeta(meta, input) <= 0) break :blk .none;
+                    if (compareMeta(meta, input) <= 0) break :blk .{ .effect = .none };
                 }
-                break :blk .delete_all;
+                break :blk .{ .effect = .delete_all };
             },
         };
     }
 
-    fn applyMetadataUpdate(self: *Self, sequence: u64, input: MemoryEventInput, effect: Effect) !void {
+    fn applyMetadataUpdate(
+        self: *Self,
+        sequence: u64,
+        input: MemoryEventInput,
+        effect: Effect,
+        resolved_state: ?ResolvedMemoryState,
+    ) !void {
         self.last_sequence = @max(self.last_sequence, sequence);
         self.last_timestamp_ms = @max(self.last_timestamp_ms, input.timestamp_ms);
         try self.rememberOriginFrontier(input.origin_instance_id, input.origin_sequence);
@@ -475,12 +527,13 @@ pub const EventFeedOverlay = struct {
             .put => {
                 const storage_key = try key_codec.encode(self.allocator, input.key, input.session_id);
                 defer self.allocator.free(storage_key);
-                try self.rememberStateMeta(storage_key, input);
+                const state = resolved_state orelse return error.InvalidEvent;
+                try self.upsertStateEntry(storage_key, input, state);
             },
             .delete_scoped => {
                 const storage_key = try key_codec.encode(self.allocator, input.key, input.session_id);
                 defer self.allocator.free(storage_key);
-                try self.removeStateMeta(storage_key);
+                try self.removeStateEntry(storage_key);
                 try self.rememberScopedTombstone(storage_key, input);
             },
             .delete_all => {
@@ -490,11 +543,17 @@ pub const EventFeedOverlay = struct {
         }
     }
 
-    fn applyProjectionEffect(self: *Self, input: MemoryEventInput, effect: Effect) !void {
+    fn applyProjectionEffect(
+        self: *Self,
+        input: MemoryEventInput,
+        effect: Effect,
+        resolved_state: ?ResolvedMemoryState,
+    ) !void {
         switch (effect) {
             .none => {},
             .put => {
-                try self.backend.store(input.key, input.content.?, input.category.?, input.session_id);
+                const state = resolved_state orelse return error.InvalidEvent;
+                try self.backend.store(input.key, state.content, state.category, input.session_id);
             },
             .delete_scoped => {
                 _ = try self.backend.forgetScoped(self.allocator, input.key, input.session_id);
@@ -513,21 +572,21 @@ pub const EventFeedOverlay = struct {
         try self.origin_frontiers.put(self.allocator, try self.allocator.dupe(u8, origin_instance_id), origin_sequence);
     }
 
-    fn rememberStateMeta(self: *Self, storage_key: []const u8, input: MemoryEventInput) !void {
-        const meta = try self.dupEventMeta(input);
-        errdefer self.freeEventMeta(meta);
-        if (self.state_meta.getPtr(storage_key)) |existing| {
-            self.freeEventMeta(existing.*);
-            existing.* = meta;
+    fn upsertStateEntry(self: *Self, storage_key: []const u8, input: MemoryEventInput, resolved_state: ResolvedMemoryState) !void {
+        const state = try self.dupStoredState(input, resolved_state);
+        errdefer self.freeStoredState(state);
+        if (self.state_entries.getPtr(storage_key)) |existing| {
+            self.freeStoredState(existing.*);
+            existing.* = state;
             return;
         }
-        try self.state_meta.put(self.allocator, try self.allocator.dupe(u8, storage_key), meta);
+        try self.state_entries.put(self.allocator, try self.allocator.dupe(u8, storage_key), state);
     }
 
-    fn removeStateMeta(self: *Self, storage_key: []const u8) !void {
-        if (self.state_meta.fetchRemove(storage_key)) |removed| {
+    fn removeStateEntry(self: *Self, storage_key: []const u8) !void {
+        if (self.state_entries.fetchRemove(storage_key)) |removed| {
             self.allocator.free(removed.key);
-            self.freeEventMeta(removed.value);
+            self.freeStoredState(removed.value);
         }
     }
 
@@ -569,15 +628,38 @@ pub const EventFeedOverlay = struct {
         };
     }
 
+    fn dupStoredState(self: *Self, input: MemoryEventInput, resolved_state: ResolvedMemoryState) !StoredState {
+        return .{
+            .key = try self.allocator.dupe(u8, input.key),
+            .content = try self.allocator.dupe(u8, resolved_state.content),
+            .category = try dupCategory(self.allocator, resolved_state.category),
+            .value_kind = resolved_state.value_kind,
+            .session_id = if (input.session_id) |sid| try self.allocator.dupe(u8, sid) else null,
+            .timestamp_ms = input.timestamp_ms,
+            .origin_instance_id = try self.allocator.dupe(u8, input.origin_instance_id),
+            .origin_sequence = input.origin_sequence,
+        };
+    }
+
     fn freeEventMeta(self: *Self, meta: EventMeta) void {
         self.allocator.free(meta.origin_instance_id);
     }
 
+    fn freeStoredState(self: *Self, state: StoredState) void {
+        self.allocator.free(state.key);
+        self.allocator.free(state.content);
+        self.allocator.free(state.origin_instance_id);
+        if (state.session_id) |sid| self.allocator.free(sid);
+        switch (state.category) {
+            .custom => |name| self.allocator.free(name),
+            else => {},
+        }
+    }
+
     fn hasAnyStateForKey(self: *Self, key: []const u8) bool {
-        var it = self.state_meta.iterator();
+        var it = self.state_entries.iterator();
         while (it.next()) |kv| {
-            const decoded = key_codec.decode(kv.key_ptr.*);
-            if (std.mem.eql(u8, decoded.logical_key, key)) return true;
+            if (std.mem.eql(u8, kv.value_ptr.key, key)) return true;
         }
         return false;
     }
@@ -589,20 +671,125 @@ pub const EventFeedOverlay = struct {
             to_remove.deinit(self.allocator);
         }
 
-        var it = self.state_meta.iterator();
+        var it = self.state_entries.iterator();
         while (it.next()) |kv| {
-            const decoded = key_codec.decode(kv.key_ptr.*);
-            if (std.mem.eql(u8, decoded.logical_key, key)) {
+            if (std.mem.eql(u8, kv.value_ptr.key, key)) {
                 try to_remove.append(self.allocator, try self.allocator.dupe(u8, kv.key_ptr.*));
             }
         }
 
         for (to_remove.items) |storage_key| {
-            try self.removeStateMeta(storage_key);
+            try self.removeStateEntry(storage_key);
         }
     }
 
-    fn appendEventLineLocked(self: *Self, file: *std.fs.File, sequence: u64, input: MemoryEventInput, effect: Effect) !u64 {
+    fn findDefaultStatePtr(self: *Self, key: []const u8) ?*StoredState {
+        var it = self.state_entries.iterator();
+        while (it.next()) |kv| {
+            if (!std.mem.eql(u8, kv.value_ptr.key, key)) continue;
+            if (kv.value_ptr.session_id == null) return kv.value_ptr;
+        }
+        return null;
+    }
+
+    fn findLatestStatePtr(self: *Self, key: []const u8) ?*StoredState {
+        var best: ?*StoredState = null;
+        var it = self.state_entries.iterator();
+        while (it.next()) |kv| {
+            if (!std.mem.eql(u8, kv.value_ptr.key, key)) continue;
+            if (best == null or compareStoredStates(kv.value_ptr.*, best.?.*) > 0) best = kv.value_ptr;
+        }
+        return best;
+    }
+
+    fn cloneStateEntry(self: *Self, allocator: std.mem.Allocator, state: StoredState) !MemoryEntry {
+        _ = self;
+        return .{
+            .id = try key_codec.encode(allocator, state.key, state.session_id),
+            .key = try allocator.dupe(u8, state.key),
+            .content = try allocator.dupe(u8, state.content),
+            .category = try dupCategory(allocator, state.category),
+            .timestamp = try std.fmt.allocPrint(allocator, "{d}", .{state.timestamp_ms}),
+            .session_id = if (state.session_id) |sid| try allocator.dupe(u8, sid) else null,
+        };
+    }
+
+    fn listCanonical(self: *Self, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) ![]MemoryEntry {
+        var results: std.ArrayListUnmanaged(MemoryEntry) = .empty;
+        errdefer {
+            for (results.items) |*entry| entry.deinit(allocator);
+            results.deinit(allocator);
+        }
+
+        var it = self.state_entries.iterator();
+        while (it.next()) |kv| {
+            const state = kv.value_ptr.*;
+            if (category) |cat| {
+                if (!state.category.eql(cat)) continue;
+            }
+            if (session_id) |sid| {
+                if (state.session_id) |entry_sid| {
+                    if (!std.mem.eql(u8, entry_sid, sid)) continue;
+                } else continue;
+            }
+            try results.append(allocator, try self.cloneStateEntry(allocator, state));
+        }
+
+        return results.toOwnedSlice(allocator);
+    }
+
+    fn recallCanonical(self: *Self, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) ![]MemoryEntry {
+        const trimmed = std.mem.trim(u8, query, " \t\r\n");
+        if (trimmed.len == 0 or limit == 0) return allocator.alloc(MemoryEntry, 0);
+
+        const Match = struct {
+            state: StoredState,
+        };
+        var matches: std.ArrayListUnmanaged(Match) = .empty;
+        defer matches.deinit(allocator);
+
+        var it = self.state_entries.iterator();
+        while (it.next()) |kv| {
+            const state = kv.value_ptr.*;
+            if (session_id) |sid| {
+                if (state.session_id) |entry_sid| {
+                    if (!std.mem.eql(u8, entry_sid, sid)) continue;
+                } else continue;
+            }
+            if (std.mem.indexOf(u8, state.key, trimmed) == null and std.mem.indexOf(u8, state.content, trimmed) == null) continue;
+            try matches.append(allocator, .{ .state = state });
+        }
+
+        std.mem.sort(Match, matches.items, {}, struct {
+            fn lessThan(_: void, a: Match, b: Match) bool {
+                return compareStoredStates(a.state, b.state) > 0;
+            }
+        }.lessThan);
+
+        const result_len = @min(matches.items.len, limit);
+        const results = try allocator.alloc(MemoryEntry, result_len);
+        var filled: usize = 0;
+        errdefer {
+            for (results[0..filled]) |*entry| entry.deinit(allocator);
+            allocator.free(results);
+        }
+
+        for (results, 0..) |*slot, idx| {
+            slot.* = try self.cloneStateEntry(allocator, matches.items[idx].state);
+            filled += 1;
+        }
+
+        return results;
+    }
+
+    fn appendEventLineLocked(
+        self: *Self,
+        file: *std.fs.File,
+        sequence: u64,
+        input: MemoryEventInput,
+        effect: Effect,
+        resolved_state: ?ResolvedMemoryState,
+    ) !u64 {
         var payload: std.ArrayListUnmanaged(u8) = .empty;
         defer payload.deinit(self.allocator);
 
@@ -640,11 +827,33 @@ pub const EventFeedOverlay = struct {
             try payload.appendSlice(self.allocator, "null");
         }
         try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "value_kind");
+        if (input.value_kind) |value_kind| {
+            try json_util.appendJsonString(&payload, self.allocator, value_kind.toString());
+        } else {
+            try payload.appendSlice(self.allocator, "null");
+        }
+        try payload.append(self.allocator, ',');
         try json_util.appendJsonKey(&payload, self.allocator, "content");
         if (input.content) |content| {
             try json_util.appendJsonString(&payload, self.allocator, content);
         } else {
             try payload.appendSlice(self.allocator, "null");
+        }
+        if (resolved_state) |state| {
+            try payload.append(self.allocator, ',');
+            try json_util.appendJsonKey(&payload, self.allocator, "resolved_category");
+            try json_util.appendJsonString(&payload, self.allocator, state.category.toString());
+            try payload.append(self.allocator, ',');
+            try json_util.appendJsonKey(&payload, self.allocator, "resolved_value_kind");
+            if (state.value_kind) |value_kind| {
+                try json_util.appendJsonString(&payload, self.allocator, value_kind.toString());
+            } else {
+                try payload.appendSlice(self.allocator, "null");
+            }
+            try payload.append(self.allocator, ',');
+            try json_util.appendJsonKey(&payload, self.allocator, "resolved_content");
+            try json_util.appendJsonString(&payload, self.allocator, state.content);
         }
         try payload.appendSlice(self.allocator, "}\n");
 
@@ -676,84 +885,22 @@ pub const EventFeedOverlay = struct {
             if (line.len == 0) continue;
 
             var recorded = try parseRecordedEventLine(allocator, line);
+            errdefer recorded.deinit(allocator);
             if (recorded.event.sequence <= after_sequence) {
                 recorded.deinit(allocator);
                 continue;
             }
 
+            if (recorded.resolved_state) |*state| {
+                state.deinit(allocator);
+                recorded.resolved_state = null;
+            }
             try events.append(allocator, recorded.event);
+            recorded.event = undefined;
             if (events.items.len >= limit) break;
         }
 
         return events.toOwnedSlice(allocator);
-    }
-
-    fn bootstrapFromBackendLocked(self: *Self, file: *std.fs.File) !void {
-        const entries = if (std.mem.eql(u8, self.backend.name(), "markdown"))
-            try blk: {
-                const markdown_backend: *root.MarkdownMemory = @ptrCast(@alignCast(self.backend.ptr));
-                break :blk markdown_backend.exportAllEntries(self.allocator);
-            }
-        else
-            try self.backend.list(self.allocator, null, null);
-        defer root.freeEntries(self.allocator, entries);
-
-        if (entries.len == 0) return;
-
-        var bootstrap_entries = try self.allocator.alloc(BootstrapEntry, entries.len);
-        defer {
-            for (bootstrap_entries) |entry| {
-                self.allocator.free(entry.key);
-                self.allocator.free(entry.content);
-                if (entry.session_id) |sid| self.allocator.free(sid);
-                switch (entry.category) {
-                    .custom => |name| self.allocator.free(name),
-                    else => {},
-                }
-            }
-            self.allocator.free(bootstrap_entries);
-        }
-
-        for (entries, 0..) |entry, idx| {
-            bootstrap_entries[idx] = .{
-                .key = try self.allocator.dupe(u8, entry.key),
-                .content = try self.allocator.dupe(u8, entry.content),
-                .category = try dupCategory(self.allocator, entry.category),
-                .session_id = if (entry.session_id) |sid| try self.allocator.dupe(u8, sid) else null,
-            };
-        }
-
-        std.mem.sort(BootstrapEntry, bootstrap_entries, {}, struct {
-            fn lessThan(_: void, a: BootstrapEntry, b: BootstrapEntry) bool {
-                const key_order = std.mem.order(u8, a.key, b.key);
-                if (key_order == .lt) return true;
-                if (key_order == .gt) return false;
-                if (a.session_id == null and b.session_id != null) return true;
-                if (a.session_id != null and b.session_id == null) return false;
-                if (a.session_id) |sid_a| {
-                    return std.mem.order(u8, sid_a, b.session_id.?) == .lt;
-                }
-                return false;
-            }
-        }.lessThan);
-
-        for (bootstrap_entries, 0..) |entry, idx| {
-            const sequence: u64 = @intCast(idx + 1);
-            const input = MemoryEventInput{
-                .origin_instance_id = self.instance_id,
-                .origin_sequence = sequence,
-                .timestamp_ms = @intCast(sequence),
-                .operation = .put,
-                .key = entry.key,
-                .session_id = entry.session_id,
-                .category = entry.category,
-                .content = entry.content,
-            };
-            const end_offset = try self.appendEventLineLocked(file, sequence, input, .put);
-            try self.applyMetadataUpdate(sequence, input, .put);
-            self.loaded_size_bytes = end_offset;
-            self.projection_offset_bytes = end_offset;
-        }
     }
 
     fn openJournalExclusive(self: *Self) !std.fs.File {
@@ -798,6 +945,32 @@ fn compareMeta(meta: EventFeedOverlay.EventMeta, input: MemoryEventInput) i8 {
     return 0;
 }
 
+fn compareStoredState(state: EventFeedOverlay.StoredState, input: MemoryEventInput) i8 {
+    if (input.timestamp_ms < state.timestamp_ms) return -1;
+    if (input.timestamp_ms > state.timestamp_ms) return 1;
+
+    const order = std.mem.order(u8, input.origin_instance_id, state.origin_instance_id);
+    if (order == .lt) return -1;
+    if (order == .gt) return 1;
+
+    if (input.origin_sequence < state.origin_sequence) return -1;
+    if (input.origin_sequence > state.origin_sequence) return 1;
+    return 0;
+}
+
+fn compareStoredStates(a: EventFeedOverlay.StoredState, b: EventFeedOverlay.StoredState) i8 {
+    if (a.timestamp_ms < b.timestamp_ms) return -1;
+    if (a.timestamp_ms > b.timestamp_ms) return 1;
+
+    const order = std.mem.order(u8, a.origin_instance_id, b.origin_instance_id);
+    if (order == .lt) return -1;
+    if (order == .gt) return 1;
+
+    if (a.origin_sequence < b.origin_sequence) return -1;
+    if (a.origin_sequence > b.origin_sequence) return 1;
+    return 0;
+}
+
 fn ensureJournalParent(journal_path: []const u8) !void {
     const parent = std.fs.path.dirname(journal_path) orelse return;
     std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
@@ -824,6 +997,7 @@ fn memoryEventInput(event: MemoryEvent) MemoryEventInput {
         .key = event.key,
         .session_id = event.session_id,
         .category = event.category,
+        .value_kind = event.value_kind,
         .content = event.content,
     };
 }
@@ -840,6 +1014,15 @@ fn parseRecordedEventLine(allocator: std.mem.Allocator, line: []const u8) !Event
     const operation_str = jsonStringField(val, "operation") orelse return error.InvalidEvent;
     const key = jsonStringField(val, "key") orelse return error.InvalidEvent;
 
+    const event_category = if (jsonNullableStringField(val, "category")) |cat|
+        try root.cloneMemoryCategory(allocator, root.MemoryCategory.fromString(cat))
+    else
+        null;
+    errdefer if (event_category) |category| switch (category) {
+        .custom => |name| allocator.free(name),
+        else => {},
+    };
+
     return .{
         .event = .{
             .schema_version = @intCast(jsonUnsignedField(val, "schema_version") orelse 1),
@@ -850,12 +1033,33 @@ fn parseRecordedEventLine(allocator: std.mem.Allocator, line: []const u8) !Event
             .operation = root.MemoryEventOp.fromString(operation_str) orelse return error.InvalidEvent,
             .key = try allocator.dupe(u8, key),
             .session_id = if (jsonNullableStringField(val, "session_id")) |sid| try allocator.dupe(u8, sid) else null,
-            .category = if (jsonNullableStringField(val, "category")) |cat| root.MemoryCategory.fromString(cat) else null,
+            .category = event_category,
+            .value_kind = if (jsonNullableStringField(val, "value_kind")) |kind|
+                MemoryValueKind.fromString(kind) orelse return error.InvalidEvent
+            else
+                null,
             .content = if (jsonNullableStringField(val, "content")) |content| try allocator.dupe(u8, content) else null,
         },
         .effect = blk: {
             const effect_str = jsonStringField(val, "effect") orelse break :blk null;
             break :blk EventFeedOverlay.Effect.fromString(effect_str) orelse return error.InvalidEvent;
+        },
+        .resolved_state = blk: {
+            const resolved_category_text = jsonNullableStringField(val, "resolved_category") orelse break :blk null;
+            const resolved_content = jsonNullableStringField(val, "resolved_content") orelse return error.InvalidEvent;
+            const resolved_category = try root.cloneMemoryCategory(allocator, root.MemoryCategory.fromString(resolved_category_text));
+            errdefer switch (resolved_category) {
+                .custom => |name| allocator.free(name),
+                else => {},
+            };
+            break :blk ResolvedMemoryState{
+                .content = try allocator.dupe(u8, resolved_content),
+                .category = resolved_category,
+                .value_kind = if (jsonNullableStringField(val, "resolved_value_kind")) |kind|
+                    MemoryValueKind.fromString(kind) orelse return error.InvalidEvent
+                else
+                    null,
+            };
         },
     };
 }
@@ -1043,7 +1247,7 @@ const FailingProjectionBackend = struct {
     };
 };
 
-test "feed overlay bootstraps markdown backend state into events" {
+test "feed overlay does not auto-bootstrap backend state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1060,13 +1264,11 @@ test "feed overlay bootstraps markdown backend state into events" {
 
     const events = try overlay.memory().listEvents(std.testing.allocator, 0, 10);
     defer root.freeEvents(std.testing.allocator, events);
-    try std.testing.expectEqual(@as(usize, 2), events.len);
-    try std.testing.expect(std.mem.eql(u8, events[0].key, "preferences.locale") or std.mem.eql(u8, events[1].key, "preferences.locale"));
-    if (std.mem.eql(u8, events[0].key, "preferences.locale")) {
-        try std.testing.expectEqualStrings("sess-a", events[0].session_id.?);
-    } else {
-        try std.testing.expectEqualStrings("sess-a", events[1].session_id.?);
-    }
+    try std.testing.expectEqual(@as(usize, 0), events.len);
+
+    const listed = try overlay.memory().list(std.testing.allocator, null, null);
+    defer root.freeEntries(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 0), listed.len);
 }
 
 test "feed overlay converges markdown replicas" {
@@ -1143,4 +1345,31 @@ test "feed overlay journals before backend projection" {
     const entry = (try mem.getScoped(std.testing.allocator, "preferences.theme", null)).?;
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("dark", entry.content);
+}
+
+test "feed overlay canonical reads ignore projection drift" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var backend = FailingProjectionBackend.init(std.testing.allocator);
+    backend.fail_writes = false;
+    var overlay = try EventFeedOverlay.init(std.testing.allocator, backend.memory(), workspace, "drift-check", "agent-a");
+    defer overlay.deinit();
+
+    const mem = overlay.memory();
+    try mem.store("preferences.theme", "dark", .core, null);
+
+    try backend.memory().store("outofband.key", "should-not-appear", .core, null);
+
+    const out_of_band = try mem.getScoped(std.testing.allocator, "outofband.key", null);
+    defer if (out_of_band) |entry| entry.deinit(std.testing.allocator);
+    try std.testing.expect(out_of_band == null);
+
+    const listed = try mem.list(std.testing.allocator, null, null);
+    defer root.freeEntries(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("preferences.theme", listed[0].key);
 }

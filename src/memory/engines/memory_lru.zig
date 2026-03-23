@@ -13,6 +13,8 @@ const MemoryEvent = root.MemoryEvent;
 const MemoryEventFeedInfo = root.MemoryEventFeedInfo;
 const MemoryEventInput = root.MemoryEventInput;
 const MemoryEventOp = root.MemoryEventOp;
+const MemoryValueKind = root.MemoryValueKind;
+const ResolvedMemoryState = root.ResolvedMemoryState;
 
 pub const InMemoryLruMemory = struct {
     allocator: std.mem.Allocator,
@@ -34,6 +36,7 @@ pub const InMemoryLruMemory = struct {
         key: []const u8,
         content: []const u8,
         category: MemoryCategory,
+        value_kind: ?MemoryValueKind,
         session_id: ?[]const u8,
         created_at: []const u8,
         updated_at: []const u8,
@@ -52,6 +55,7 @@ pub const InMemoryLruMemory = struct {
         key: []const u8,
         session_id: ?[]const u8,
         category: ?MemoryCategory,
+        value_kind: ?MemoryValueKind,
         content: ?[]const u8,
     };
 
@@ -274,6 +278,7 @@ pub const InMemoryLruMemory = struct {
             .key = try allocator.dupe(u8, e.key),
             .session_id = dup_sid,
             .category = dup_category,
+            .value_kind = e.value_kind,
             .content = dup_content,
         };
     }
@@ -289,6 +294,7 @@ pub const InMemoryLruMemory = struct {
             .key = try self.allocator.dupe(u8, input.key),
             .session_id = if (input.session_id) |sid| try self.allocator.dupe(u8, sid) else null,
             .category = try self.dupOptionalCategory(input.category),
+            .value_kind = input.value_kind,
             .content = if (input.content) |content| try self.allocator.dupe(u8, content) else null,
         });
     }
@@ -346,12 +352,9 @@ pub const InMemoryLruMemory = struct {
         });
     }
 
-    fn applyPut(self: *Self, input: MemoryEventInput) !void {
+    fn applyPutResolved(self: *Self, input: MemoryEventInput, resolved_state: ResolvedMemoryState) !void {
         const storage_key = try key_codec.encode(self.allocator, input.key, input.session_id);
         defer self.allocator.free(storage_key);
-
-        const category = input.category orelse return error.InvalidEvent;
-        const content = input.content orelse return error.InvalidEvent;
 
         if (self.key_tombstones.get(input.key)) |meta| {
             if (compareEventOrderMeta(meta, input) <= 0) return;
@@ -364,14 +367,15 @@ pub const InMemoryLruMemory = struct {
             if (compareEventOrder(existing.*, input) < 0) return;
 
             self.allocator.free(existing.content);
-            existing.content = try self.allocator.dupe(u8, content);
+            existing.content = try self.allocator.dupe(u8, resolved_state.content);
             self.allocator.free(existing.updated_at);
             existing.updated_at = try self.timestampFromMillis(input.timestamp_ms);
             switch (existing.category) {
                 .custom => |name| self.allocator.free(name),
                 else => {},
             }
-            existing.category = try self.dupCategory(category);
+            existing.category = try self.dupCategory(resolved_state.category);
+            existing.value_kind = resolved_state.value_kind;
             if (existing.session_id) |sid| self.allocator.free(sid);
             existing.session_id = if (input.session_id) |sid| try self.allocator.dupe(u8, sid) else null;
             existing.event_timestamp_ms = input.timestamp_ms;
@@ -392,8 +396,9 @@ pub const InMemoryLruMemory = struct {
 
         const stored = StoredEntry{
             .key = try self.allocator.dupe(u8, input.key),
-            .content = try self.allocator.dupe(u8, content),
-            .category = try self.dupCategory(category),
+            .content = try self.allocator.dupe(u8, resolved_state.content),
+            .category = try self.dupCategory(resolved_state.category),
+            .value_kind = resolved_state.value_kind,
             .session_id = if (input.session_id) |sid| try self.allocator.dupe(u8, sid) else null,
             .created_at = ts,
             .updated_at = ts2,
@@ -453,7 +458,20 @@ pub const InMemoryLruMemory = struct {
         if (record_event) try self.appendEventRecord(input);
 
         switch (input.operation) {
-            .put => try self.applyPut(input),
+            .put, .merge_object, .merge_string_set => {
+                const storage_key = try key_codec.encode(self.allocator, input.key, input.session_id);
+                defer self.allocator.free(storage_key);
+                const existing = self.entries.getPtr(storage_key);
+                const resolved_state = try root.resolveMemoryEventState(
+                    self.allocator,
+                    if (existing) |entry| entry.content else null,
+                    if (existing) |entry| entry.category else null,
+                    if (existing) |entry| entry.value_kind else null,
+                    input,
+                ) orelse return error.InvalidEvent;
+                defer resolved_state.deinit(self.allocator);
+                try self.applyPutResolved(input, resolved_state);
+            },
             .delete_scoped => try self.applyDeleteScoped(input),
             .delete_all => try self.applyDeleteAll(input),
         }
