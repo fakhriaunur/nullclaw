@@ -421,13 +421,32 @@ pub const MemoryEventInput = struct {
     content: ?[]const u8 = null,
 };
 
+pub const MemoryEventFeedStorage = enum {
+    native,
+    overlay,
+
+    pub fn toString(self: MemoryEventFeedStorage) []const u8 {
+        return switch (self) {
+            .native => "native",
+            .overlay => "overlay",
+        };
+    }
+};
+
 pub const MemoryEventFeedInfo = struct {
     instance_id: []const u8,
     last_sequence: u64,
     supports_compaction: bool = false,
+    storage_kind: MemoryEventFeedStorage = .native,
+    journal_path: ?[]const u8 = null,
+    checkpoint_path: ?[]const u8 = null,
+    compacted_through_sequence: u64 = 0,
+    oldest_available_sequence: u64 = 1,
 
     pub fn deinit(self: *const MemoryEventFeedInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.instance_id);
+        if (self.journal_path) |path| allocator.free(path);
+        if (self.checkpoint_path) |path| allocator.free(path);
     }
 };
 
@@ -884,6 +903,7 @@ pub const Memory = struct {
         applyEvent: ?*const fn (ptr: *anyopaque, input: MemoryEventInput) anyerror!void = null,
         lastEventSequence: ?*const fn (ptr: *anyopaque) anyerror!u64 = null,
         eventFeedInfo: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!MemoryEventFeedInfo = null,
+        compactEvents: ?*const fn (ptr: *anyopaque) anyerror!u64 = null,
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         healthCheck: *const fn (ptr: *anyopaque) bool,
         deinit: *const fn (ptr: *anyopaque) void,
@@ -970,6 +990,11 @@ pub const Memory = struct {
     pub fn eventFeedInfo(self: Memory, allocator: std.mem.Allocator) !MemoryEventFeedInfo {
         const func = self.vtable.eventFeedInfo orelse return error.NotSupported;
         return func(self.ptr, allocator);
+    }
+
+    pub fn compactEvents(self: Memory) !u64 {
+        const func = self.vtable.compactEvents orelse return error.NotSupported;
+        return func(self.ptr);
     }
 
     pub fn count(self: Memory) !usize {

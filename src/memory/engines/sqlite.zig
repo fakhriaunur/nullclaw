@@ -614,11 +614,48 @@ pub const SqliteMemory = struct {
             \\);
         );
         try self.execSql("event stream migration", "CREATE INDEX IF NOT EXISTS idx_memory_tombstones_key ON memory_tombstones(key);");
+        try self.execSql(
+            "event stream migration",
+            \\CREATE TABLE IF NOT EXISTS memory_feed_meta (
+            \\  key TEXT PRIMARY KEY,
+            \\  value TEXT NOT NULL
+            \\);
+        );
         try self.bootstrapEventFeedFromExistingMemories();
     }
 
     fn localInstanceId(self: *Self) []const u8 {
         return if (self.instance_id.len > 0) self.instance_id else "default";
+    }
+
+    fn getCompactedThroughSequence(self: *Self) !u64 {
+        const sql = "SELECT value FROM memory_feed_meta WHERE key = 'compacted_through_sequence' LIMIT 1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_ROW) return 0;
+        const value_ptr = c.sqlite3_column_text(stmt, 0) orelse return 0;
+        const value_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        const value = @as([*]const u8, @ptrCast(value_ptr))[0..value_len];
+        return std.fmt.parseInt(u64, value, 10) catch 0;
+    }
+
+    fn setCompactedThroughSequenceTx(self: *Self, sequence: u64) !void {
+        const sql =
+            "INSERT INTO memory_feed_meta (key, value) VALUES ('compacted_through_sequence', ?1) " ++
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var value_buf: [32]u8 = undefined;
+        const value = try std.fmt.bufPrint(&value_buf, "{d}", .{sequence});
+        _ = c.sqlite3_bind_text(stmt, 1, value.ptr, @intCast(value.len), SQLITE_STATIC);
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
     }
 
     fn compareInputToMetadata(input: MemoryEventInput, timestamp_ms: i64, origin_instance_id: []const u8, origin_sequence: u64) i8 {
@@ -727,6 +764,7 @@ pub const SqliteMemory = struct {
     }
 
     fn bootstrapEventFeedFromExistingMemories(self: *Self) !void {
+        if (try self.getCompactedThroughSequence() > 0) return;
         const event_count = try self.queryCount("SELECT COUNT(*) FROM memory_events");
         if (event_count > 0) return;
 
@@ -1317,6 +1355,8 @@ pub const SqliteMemory = struct {
 
     fn implListEvents(ptr: *anyopaque, allocator: std.mem.Allocator, after_sequence: u64, limit: usize) anyerror![]MemoryEvent {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const compacted_through = try self_.getCompactedThroughSequence();
+        if (after_sequence < compacted_through) return error.CursorExpired;
         const sql =
             "SELECT local_sequence, schema_version, origin_instance_id, origin_sequence, timestamp_ms, operation, key, session_id, category, value_kind, content " ++
             "FROM memory_events WHERE local_sequence > ?1 ORDER BY local_sequence ASC LIMIT ?2";
@@ -1356,20 +1396,53 @@ pub const SqliteMemory = struct {
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
         rc = c.sqlite3_step(stmt);
+        const compacted_through = try self_.getCompactedThroughSequence();
         if (rc == c.SQLITE_ROW) {
             const value = c.sqlite3_column_int64(stmt, 0);
-            return if (value < 0) 0 else @intCast(value);
+            const last_in_events = if (value < 0) 0 else @as(u64, @intCast(value));
+            return @max(last_in_events, compacted_through);
         }
-        return 0;
+        return compacted_through;
     }
 
     fn implEventFeedInfo(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!MemoryEventFeedInfo {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const compacted_through = try self_.getCompactedThroughSequence();
         return .{
             .instance_id = try allocator.dupe(u8, self_.localInstanceId()),
             .last_sequence = try implLastEventSequence(ptr),
-            .supports_compaction = false,
+            .supports_compaction = true,
+            .compacted_through_sequence = compacted_through,
+            .oldest_available_sequence = compacted_through + 1,
         };
+    }
+
+    fn implCompactEvents(ptr: *anyopaque) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const compacted_through = try implLastEventSequence(ptr);
+        if (compacted_through == 0) {
+            try self_.setCompactedThroughSequenceTx(0);
+            return 0;
+        }
+
+        var owns_tx = c.sqlite3_get_autocommit(self_.db) != 0;
+        if (owns_tx) owns_tx = try self_.beginImmediate();
+        var committed = false;
+        errdefer if (owns_tx and !committed) self_.rollbackTxn();
+
+        const delete_sql = "DELETE FROM memory_events WHERE local_sequence <= ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, delete_sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(compacted_through));
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+        try self_.setCompactedThroughSequenceTx(compacted_through);
+        if (owns_tx) try self_.commitTxn();
+        committed = true;
+        return compacted_through;
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -1418,6 +1491,7 @@ pub const SqliteMemory = struct {
         .applyEvent = &implApplyEvent,
         .lastEventSequence = &implLastEventSequence,
         .eventFeedInfo = &implEventFeedInfo,
+        .compactEvents = &implCompactEvents,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -3414,6 +3488,56 @@ test "sqlite migration backfills existing memories into event feed" {
     try std.testing.expectEqualStrings("en", events[1].content.?);
     try std.testing.expect(events[0].sequence < events[1].sequence);
     try std.testing.expectEqual(events[1].sequence, try reopened_mem.lastEventSequence());
+}
+
+test "sqlite event feed compaction enforces cursor floor and preserves state across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ws_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    const db_path = try std.fs.path.joinZ(std.testing.allocator, &.{ ws_path, "compact.db" });
+    defer std.testing.allocator.free(db_path);
+
+    var compacted_through: u64 = 0;
+    {
+        var mem = try SqliteMemory.initWithInstanceId(std.testing.allocator, db_path, "agent-a");
+        defer mem.deinit();
+        const memory = mem.memory();
+
+        try memory.store("preferences.theme", "dark", .core, null);
+        compacted_through = try memory.compactEvents();
+        try std.testing.expect(compacted_through > 0);
+        try std.testing.expectError(error.CursorExpired, memory.listEvents(std.testing.allocator, 0, 8));
+
+        const info = try memory.eventFeedInfo(std.testing.allocator);
+        defer info.deinit(std.testing.allocator);
+        try std.testing.expect(info.supports_compaction);
+        try std.testing.expectEqual(compacted_through, info.compacted_through_sequence);
+        try std.testing.expectEqual(compacted_through + 1, info.oldest_available_sequence);
+    }
+
+    {
+        var reopened = try SqliteMemory.initWithInstanceId(std.testing.allocator, db_path, "agent-a");
+        defer reopened.deinit();
+        const memory = reopened.memory();
+
+        const entry = (try memory.getScoped(std.testing.allocator, "preferences.theme", null)).?;
+        defer entry.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("dark", entry.content);
+        try std.testing.expectEqual(compacted_through, try memory.lastEventSequence());
+
+        const no_tail = try memory.listEvents(std.testing.allocator, compacted_through, 8);
+        defer root.freeEvents(std.testing.allocator, no_tail);
+        try std.testing.expectEqual(@as(usize, 0), no_tail.len);
+
+        try memory.store("preferences.locale", "en", .core, null);
+        const tail = try memory.listEvents(std.testing.allocator, compacted_through, 8);
+        defer root.freeEvents(std.testing.allocator, tail);
+        try std.testing.expectEqual(@as(usize, 1), tail.len);
+        try std.testing.expectEqual(compacted_through + 1, tail[0].sequence);
+    }
 }
 
 test "sqlite tombstones block older cross-origin put replay" {

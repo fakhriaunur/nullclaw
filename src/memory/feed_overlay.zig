@@ -12,6 +12,7 @@ const MemoryEventFeedInfo = root.MemoryEventFeedInfo;
 const MemoryEventInput = root.MemoryEventInput;
 const MemoryValueKind = root.MemoryValueKind;
 const ResolvedMemoryState = root.ResolvedMemoryState;
+const log = std.log.scoped(.memory_feed_overlay);
 
 const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
 
@@ -19,9 +20,11 @@ pub const EventFeedOverlay = struct {
     allocator: std.mem.Allocator,
     backend: Memory,
     journal_path: []u8,
+    checkpoint_path: []u8,
     instance_id: []u8,
     last_sequence: u64 = 0,
     last_timestamp_ms: i64 = 0,
+    compacted_through_sequence: u64 = 0,
     loaded_size_bytes: u64 = 0,
     projection_offset_bytes: u64 = 0,
     origin_frontiers: std.StringHashMapUnmanaged(u64) = .{},
@@ -102,8 +105,10 @@ pub const EventFeedOverlay = struct {
     ) !Self {
         const effective_instance_id = if (instance_id.len > 0) instance_id else "default";
         const journal_path = try buildJournalPath(allocator, journal_root_dir, journal_identity);
+        const checkpoint_path = try buildCheckpointPath(allocator, journal_root_dir, journal_identity);
         const owned_instance_id = allocator.dupe(u8, effective_instance_id) catch |err| {
             allocator.free(journal_path);
+            allocator.free(checkpoint_path);
             return err;
         };
 
@@ -111,17 +116,21 @@ pub const EventFeedOverlay = struct {
             .allocator = allocator,
             .backend = backend,
             .journal_path = journal_path,
+            .checkpoint_path = checkpoint_path,
             .instance_id = owned_instance_id,
         };
         errdefer self.deinitMembers();
 
         try ensureJournalParent(journal_path);
+        try ensureJournalParent(checkpoint_path);
 
         var file = try self.openJournalExclusive();
         defer file.close();
 
+        try self.loadCheckpoint();
         try self.refreshJournalLocked(&file);
-        try self.replayProjectionLocked(&file);
+        try self.rebuildProjectionFromCanonical();
+        self.projection_offset_bytes = self.loaded_size_bytes;
 
         return self;
     }
@@ -134,6 +143,7 @@ pub const EventFeedOverlay = struct {
 
     fn deinitMembers(self: *Self) void {
         self.allocator.free(self.journal_path);
+        self.allocator.free(self.checkpoint_path);
         self.allocator.free(self.instance_id);
         self.clearJournalState();
     }
@@ -141,6 +151,7 @@ pub const EventFeedOverlay = struct {
     fn clearJournalState(self: *Self) void {
         self.last_sequence = 0;
         self.last_timestamp_ms = 0;
+        self.compacted_through_sequence = 0;
         self.loaded_size_bytes = 0;
         self.projection_offset_bytes = 0;
 
@@ -194,7 +205,15 @@ pub const EventFeedOverlay = struct {
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         try self_.ensureProjectionUpToDate();
-        return self_.recallCanonical(allocator, query, limit, session_id);
+        return self_.backend.recall(allocator, query, limit, session_id) catch |err| {
+            if (err != error.NotSupported) {
+                log.warn("projection recall failed for overlay journal {s}: {}; falling back to canonical recall", .{
+                    self_.journal_path,
+                    err,
+                });
+            }
+            return self_.recallCanonical(allocator, query, limit, session_id);
+        };
     }
 
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
@@ -232,6 +251,10 @@ pub const EventFeedOverlay = struct {
 
     fn implListEvents(ptr: *anyopaque, allocator: std.mem.Allocator, after_sequence: u64, limit: usize) anyerror![]MemoryEvent {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        var file = try self_.openJournalShared();
+        defer file.close();
+        try self_.refreshJournalLocked(&file);
+        if (after_sequence < self_.compacted_through_sequence) return error.CursorExpired;
         return self_.readEvents(allocator, after_sequence, limit);
     }
 
@@ -256,8 +279,18 @@ pub const EventFeedOverlay = struct {
         return .{
             .instance_id = try allocator.dupe(u8, self_.instance_id),
             .last_sequence = self_.last_sequence,
-            .supports_compaction = false,
+            .supports_compaction = true,
+            .storage_kind = .overlay,
+            .journal_path = try allocator.dupe(u8, self_.journal_path),
+            .checkpoint_path = try allocator.dupe(u8, self_.checkpoint_path),
+            .compacted_through_sequence = self_.compacted_through_sequence,
+            .oldest_available_sequence = self_.compacted_through_sequence + 1,
         };
+    }
+
+    fn implCompactEvents(ptr: *anyopaque) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.compactEventsInternal();
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -291,6 +324,7 @@ pub const EventFeedOverlay = struct {
         .applyEvent = &implApplyEvent,
         .lastEventSequence = &implLastEventSequence,
         .eventFeedInfo = &implEventFeedInfo,
+        .compactEvents = &implCompactEvents,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -424,12 +458,32 @@ pub const EventFeedOverlay = struct {
         const end_pos = try file.getEndPos();
         if (end_pos < self.loaded_size_bytes) {
             self.clearJournalState();
+            try self.loadCheckpoint();
             try self.loadJournalFromOffsetLocked(file, 0);
             return;
         }
 
         if (end_pos == self.loaded_size_bytes) return;
         try self.loadJournalFromOffsetLocked(file, self.loaded_size_bytes);
+    }
+
+    fn loadCheckpoint(self: *Self) !void {
+        var file = std.fs.openFileAbsolute(self.checkpoint_path, .{
+            .mode = .read_only,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer file.close();
+
+        const read_buf = try self.allocator.alloc(u8, MAX_EVENT_LINE_BYTES);
+        defer self.allocator.free(read_buf);
+        var reader = file.readerStreaming(read_buf);
+        while (try reader.interface.takeDelimiter('\n')) |line_with_no_delim| {
+            const line = std.mem.trim(u8, line_with_no_delim, " \t\r\n");
+            if (line.len == 0) continue;
+            try self.applyCheckpointLine(line);
+        }
     }
 
     fn loadJournalFromOffsetLocked(self: *Self, file: *std.fs.File, start_offset: u64) !void {
@@ -461,6 +515,303 @@ pub const EventFeedOverlay = struct {
             try self.applyMetadataUpdate(recorded.event.sequence, input, decision.effect, decision.resolved_state);
             self.loaded_size_bytes = line_end;
         }
+    }
+
+    fn compactEventsInternal(self: *Self) !u64 {
+        var file = try self.openJournalExclusive();
+        defer file.close();
+
+        try self.refreshJournalLocked(&file);
+        try self.writeCheckpoint();
+        try file.setEndPos(0);
+        try file.sync();
+
+        self.loaded_size_bytes = 0;
+        self.projection_offset_bytes = 0;
+        self.compacted_through_sequence = self.last_sequence;
+        return self.compacted_through_sequence;
+    }
+
+    fn rebuildProjectionFromCanonical(self: *Self) !void {
+        const projected = try self.backend.list(self.allocator, null, null);
+        defer root.freeEntries(self.allocator, projected);
+
+        for (projected) |entry| {
+            const storage_key = try key_codec.encode(self.allocator, entry.key, entry.session_id);
+            defer self.allocator.free(storage_key);
+
+            const canonical = self.state_entries.getPtr(storage_key);
+            const matches = canonical != null and
+                std.mem.eql(u8, canonical.?.content, entry.content) and
+                canonical.?.category.eql(entry.category);
+            if (!matches) {
+                _ = try self.backend.forgetScoped(self.allocator, entry.key, entry.session_id);
+            }
+        }
+
+        var it = self.state_entries.iterator();
+        while (it.next()) |kv| {
+            const state = kv.value_ptr.*;
+            const existing = try self.backend.getScoped(self.allocator, state.key, state.session_id);
+            defer if (existing) |entry| entry.deinit(self.allocator);
+
+            const needs_upsert = if (existing) |entry|
+                !std.mem.eql(u8, entry.content, state.content) or !entry.category.eql(state.category)
+            else
+                true;
+            if (needs_upsert) {
+                try self.backend.store(state.key, state.content, state.category, state.session_id);
+            }
+        }
+    }
+
+    fn writeCheckpoint(self: *Self) !void {
+        var file = try std.fs.createFileAbsolute(self.checkpoint_path, .{
+            .truncate = true,
+            .read = true,
+        });
+        defer file.close();
+
+        try self.writeCheckpointMetaLine(&file);
+
+        var frontier_it = self.origin_frontiers.iterator();
+        while (frontier_it.next()) |kv| {
+            try self.writeCheckpointFrontierLine(&file, kv.key_ptr.*, kv.value_ptr.*);
+        }
+
+        var state_it = self.state_entries.iterator();
+        while (state_it.next()) |kv| {
+            try self.writeCheckpointStateLine(&file, kv.value_ptr.*);
+        }
+
+        var scoped_it = self.scoped_tombstones.iterator();
+        while (scoped_it.next()) |kv| {
+            try self.writeCheckpointTombstoneLine(&file, "scoped_tombstone", kv.key_ptr.*, kv.value_ptr.*);
+        }
+
+        var key_it = self.key_tombstones.iterator();
+        while (key_it.next()) |kv| {
+            try self.writeCheckpointTombstoneLine(&file, "key_tombstone", kv.key_ptr.*, kv.value_ptr.*);
+        }
+
+        try file.sync();
+    }
+
+    fn writeCheckpointMetaLine(self: *Self, file: *std.fs.File) !void {
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
+        defer payload.deinit(self.allocator);
+
+        try payload.append(self.allocator, '{');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "kind", "meta");
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonInt(&payload, self.allocator, "schema_version", 1);
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "last_sequence");
+        try payload.writer(self.allocator).print("{d}", .{self.last_sequence});
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "last_timestamp_ms");
+        try payload.writer(self.allocator).print("{d}", .{self.last_timestamp_ms});
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "compacted_through_sequence");
+        try payload.writer(self.allocator).print("{d}", .{self.last_sequence});
+        try payload.appendSlice(self.allocator, "}\n");
+        try file.writeAll(payload.items);
+    }
+
+    fn writeCheckpointFrontierLine(self: *Self, file: *std.fs.File, origin_instance_id: []const u8, origin_sequence: u64) !void {
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
+        defer payload.deinit(self.allocator);
+
+        try payload.append(self.allocator, '{');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "kind", "frontier");
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "origin_instance_id", origin_instance_id);
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "origin_sequence");
+        try payload.writer(self.allocator).print("{d}", .{origin_sequence});
+        try payload.appendSlice(self.allocator, "}\n");
+        try file.writeAll(payload.items);
+    }
+
+    fn writeCheckpointStateLine(self: *Self, file: *std.fs.File, state: StoredState) !void {
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
+        defer payload.deinit(self.allocator);
+
+        try payload.append(self.allocator, '{');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "kind", "state");
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "key", state.key);
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "session_id");
+        if (state.session_id) |sid| {
+            try json_util.appendJsonString(&payload, self.allocator, sid);
+        } else {
+            try payload.appendSlice(self.allocator, "null");
+        }
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "category", state.category.toString());
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "value_kind");
+        if (state.value_kind) |value_kind| {
+            try json_util.appendJsonString(&payload, self.allocator, value_kind.toString());
+        } else {
+            try payload.appendSlice(self.allocator, "null");
+        }
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "content", state.content);
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "timestamp_ms");
+        try payload.writer(self.allocator).print("{d}", .{state.timestamp_ms});
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "origin_instance_id", state.origin_instance_id);
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "origin_sequence");
+        try payload.writer(self.allocator).print("{d}", .{state.origin_sequence});
+        try payload.appendSlice(self.allocator, "}\n");
+        try file.writeAll(payload.items);
+    }
+
+    fn writeCheckpointTombstoneLine(self: *Self, file: *std.fs.File, kind: []const u8, key: []const u8, meta: EventMeta) !void {
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
+        defer payload.deinit(self.allocator);
+
+        try payload.append(self.allocator, '{');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "kind", kind);
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "key", key);
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "timestamp_ms");
+        try payload.writer(self.allocator).print("{d}", .{meta.timestamp_ms});
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKeyValue(&payload, self.allocator, "origin_instance_id", meta.origin_instance_id);
+        try payload.append(self.allocator, ',');
+        try json_util.appendJsonKey(&payload, self.allocator, "origin_sequence");
+        try payload.writer(self.allocator).print("{d}", .{meta.origin_sequence});
+        try payload.appendSlice(self.allocator, "}\n");
+        try file.writeAll(payload.items);
+    }
+
+    fn applyCheckpointLine(self: *Self, line: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, line, .{});
+        defer parsed.deinit();
+
+        const kind = jsonStringField(parsed.value, "kind") orelse return error.InvalidEvent;
+        if (std.mem.eql(u8, kind, "meta")) {
+            self.last_sequence = jsonUnsignedField(parsed.value, "last_sequence") orelse 0;
+            self.last_timestamp_ms = jsonIntegerField(parsed.value, "last_timestamp_ms") orelse 0;
+            self.compacted_through_sequence = jsonUnsignedField(parsed.value, "compacted_through_sequence") orelse self.last_sequence;
+            return;
+        }
+        if (std.mem.eql(u8, kind, "frontier")) {
+            const origin_instance_id = jsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
+            const origin_sequence = jsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
+            try self.rememberOriginFrontier(origin_instance_id, origin_sequence);
+            return;
+        }
+        if (std.mem.eql(u8, kind, "state")) {
+            const key = jsonStringField(parsed.value, "key") orelse return error.InvalidEvent;
+            const content = jsonStringField(parsed.value, "content") orelse return error.InvalidEvent;
+            const category_str = jsonStringField(parsed.value, "category") orelse return error.InvalidEvent;
+            const category = try dupCategory(self.allocator, MemoryCategory.fromString(category_str));
+            errdefer switch (category) {
+                .custom => |name| self.allocator.free(name),
+                else => {},
+            };
+            const value_kind = if (jsonNullableStringField(parsed.value, "value_kind")) |kind_name|
+                MemoryValueKind.fromString(kind_name) orelse return error.InvalidEvent
+            else
+                null;
+            const timestamp_ms = jsonIntegerField(parsed.value, "timestamp_ms") orelse return error.InvalidEvent;
+            const origin_instance_id = jsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
+            const origin_sequence = jsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
+            try self.restoreCheckpointState(
+                key,
+                if (jsonNullableStringField(parsed.value, "session_id")) |sid| sid else null,
+                category,
+                value_kind,
+                content,
+                timestamp_ms,
+                origin_instance_id,
+                origin_sequence,
+            );
+            return;
+        }
+        if (std.mem.eql(u8, kind, "scoped_tombstone") or std.mem.eql(u8, kind, "key_tombstone")) {
+            const key = jsonStringField(parsed.value, "key") orelse return error.InvalidEvent;
+            const timestamp_ms = jsonIntegerField(parsed.value, "timestamp_ms") orelse return error.InvalidEvent;
+            const origin_instance_id = jsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
+            const origin_sequence = jsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
+            try self.restoreCheckpointTombstone(kind, key, timestamp_ms, origin_instance_id, origin_sequence);
+            return;
+        }
+        return error.InvalidEvent;
+    }
+
+    fn restoreCheckpointState(
+        self: *Self,
+        key: []const u8,
+        session_id: ?[]const u8,
+        category: MemoryCategory,
+        value_kind: ?MemoryValueKind,
+        content: []const u8,
+        timestamp_ms: i64,
+        origin_instance_id: []const u8,
+        origin_sequence: u64,
+    ) !void {
+        const storage_key = try key_codec.encode(self.allocator, key, session_id);
+        defer self.allocator.free(storage_key);
+
+        const state = StoredState{
+            .key = try self.allocator.dupe(u8, key),
+            .content = try self.allocator.dupe(u8, content),
+            .category = category,
+            .value_kind = value_kind,
+            .session_id = if (session_id) |sid| try self.allocator.dupe(u8, sid) else null,
+            .timestamp_ms = timestamp_ms,
+            .origin_instance_id = try self.allocator.dupe(u8, origin_instance_id),
+            .origin_sequence = origin_sequence,
+        };
+        errdefer self.freeStoredState(state);
+
+        if (self.state_entries.getPtr(storage_key)) |existing| {
+            self.freeStoredState(existing.*);
+            existing.* = state;
+            return;
+        }
+        try self.state_entries.put(self.allocator, try self.allocator.dupe(u8, storage_key), state);
+    }
+
+    fn restoreCheckpointTombstone(
+        self: *Self,
+        kind: []const u8,
+        key: []const u8,
+        timestamp_ms: i64,
+        origin_instance_id: []const u8,
+        origin_sequence: u64,
+    ) !void {
+        const meta = EventMeta{
+            .timestamp_ms = timestamp_ms,
+            .origin_instance_id = try self.allocator.dupe(u8, origin_instance_id),
+            .origin_sequence = origin_sequence,
+        };
+        errdefer self.freeEventMeta(meta);
+
+        if (std.mem.eql(u8, kind, "scoped_tombstone")) {
+            if (self.scoped_tombstones.getPtr(key)) |existing| {
+                self.freeEventMeta(existing.*);
+                existing.* = meta;
+                return;
+            }
+            try self.scoped_tombstones.put(self.allocator, try self.allocator.dupe(u8, key), meta);
+            return;
+        }
+
+        if (self.key_tombstones.getPtr(key)) |existing| {
+            self.freeEventMeta(existing.*);
+            existing.* = meta;
+            return;
+        }
+        try self.key_tombstones.put(self.allocator, try self.allocator.dupe(u8, key), meta);
     }
 
     fn computeDecision(self: *Self, input: MemoryEventInput) !EventDecision {
@@ -988,6 +1339,15 @@ fn buildJournalPath(allocator: std.mem.Allocator, journal_root_dir: []const u8, 
     return std.fs.path.join(allocator, &.{ journal_root_dir, filename });
 }
 
+fn buildCheckpointPath(allocator: std.mem.Allocator, journal_root_dir: []const u8, journal_identity: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(journal_identity, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const filename = try std.fmt.allocPrint(allocator, ".nullclaw-feed.{s}.checkpoint.jsonl", .{hex[0..]});
+    defer allocator.free(filename);
+    return std.fs.path.join(allocator, &.{ journal_root_dir, filename });
+}
+
 fn memoryEventInput(event: MemoryEvent) MemoryEventInput {
     return .{
         .origin_instance_id = event.origin_instance_id,
@@ -1103,6 +1463,8 @@ const FailingProjectionBackend = struct {
     allocator: std.mem.Allocator,
     state: std.StringHashMapUnmanaged([]u8) = .{},
     fail_writes: bool = true,
+    fail_recalls: bool = false,
+    recall_calls: usize = 0,
 
     fn init(allocator: std.mem.Allocator) FailingProjectionBackend {
         return .{ .allocator = allocator };
@@ -1140,6 +1502,8 @@ const FailingProjectionBackend = struct {
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, _: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *FailingProjectionBackend = @ptrCast(@alignCast(ptr));
+        self_.recall_calls += 1;
+        if (self_.fail_recalls) return error.BackendUnavailable;
         var out: std.ArrayListUnmanaged(MemoryEntry) = .empty;
         errdefer {
             for (out.items) |*entry| entry.deinit(allocator);
@@ -1372,4 +1736,104 @@ test "feed overlay canonical reads ignore projection drift" {
     defer root.freeEntries(std.testing.allocator, listed);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
     try std.testing.expectEqualStrings("preferences.theme", listed[0].key);
+}
+
+test "feed overlay delegates recall to projection backend when available" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var backend = FailingProjectionBackend.init(std.testing.allocator);
+    backend.fail_writes = false;
+    var overlay = try EventFeedOverlay.init(std.testing.allocator, backend.memory(), workspace, "recall-projection", "agent-a");
+    defer overlay.deinit();
+
+    const mem = overlay.memory();
+    try mem.store("preferences.theme", "dark", .core, null);
+
+    const recalled = try mem.recall(std.testing.allocator, "dark", 8, null);
+    defer root.freeEntries(std.testing.allocator, recalled);
+    try std.testing.expectEqual(@as(usize, 1), recalled.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.recall_calls);
+
+    const info = try mem.eventFeedInfo(std.testing.allocator);
+    defer info.deinit(std.testing.allocator);
+    try std.testing.expectEqual(root.MemoryEventFeedStorage.overlay, info.storage_kind);
+    try std.testing.expect(info.journal_path != null);
+}
+
+test "feed overlay falls back to canonical recall when projection recall fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var backend = FailingProjectionBackend.init(std.testing.allocator);
+    backend.fail_writes = false;
+    var overlay = try EventFeedOverlay.init(std.testing.allocator, backend.memory(), workspace, "recall-fallback", "agent-a");
+    defer overlay.deinit();
+
+    const mem = overlay.memory();
+    try mem.store("traits.tags", "friendly", .core, null);
+    backend.fail_recalls = true;
+
+    const recalled = try mem.recall(std.testing.allocator, "friendly", 8, null);
+    defer root.freeEntries(std.testing.allocator, recalled);
+    try std.testing.expectEqual(@as(usize, 1), recalled.len);
+    try std.testing.expectEqualStrings("traits.tags", recalled[0].key);
+    try std.testing.expectEqual(@as(usize, 1), backend.recall_calls);
+}
+
+test "feed overlay compaction creates checkpoint, enforces cursor floor, and survives restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var compacted_through: u64 = 0;
+    {
+        var backend = FailingProjectionBackend.init(std.testing.allocator);
+        backend.fail_writes = false;
+        var overlay = try EventFeedOverlay.init(std.testing.allocator, backend.memory(), workspace, "compaction-check", "agent-a");
+        defer overlay.deinit();
+
+        const mem = overlay.memory();
+        try mem.store("preferences.theme", "dark", .core, null);
+        compacted_through = try mem.compactEvents();
+        try std.testing.expect(compacted_through > 0);
+        try std.testing.expectError(error.CursorExpired, mem.listEvents(std.testing.allocator, 0, 8));
+
+        const info = try mem.eventFeedInfo(std.testing.allocator);
+        defer info.deinit(std.testing.allocator);
+        try std.testing.expect(info.supports_compaction);
+        try std.testing.expectEqual(compacted_through, info.compacted_through_sequence);
+        try std.testing.expectEqual(compacted_through + 1, info.oldest_available_sequence);
+        try std.testing.expect(info.checkpoint_path != null);
+    }
+
+    {
+        var backend = FailingProjectionBackend.init(std.testing.allocator);
+        backend.fail_writes = false;
+        var overlay = try EventFeedOverlay.init(std.testing.allocator, backend.memory(), workspace, "compaction-check", "agent-a");
+        defer overlay.deinit();
+
+        const mem = overlay.memory();
+        const entry = (try mem.getScoped(std.testing.allocator, "preferences.theme", null)).?;
+        defer entry.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("dark", entry.content);
+
+        const no_tail = try mem.listEvents(std.testing.allocator, compacted_through, 8);
+        defer root.freeEvents(std.testing.allocator, no_tail);
+        try std.testing.expectEqual(@as(usize, 0), no_tail.len);
+
+        try mem.store("preferences.locale", "en", .core, null);
+        const tail = try mem.listEvents(std.testing.allocator, compacted_through, 8);
+        defer root.freeEvents(std.testing.allocator, tail);
+        try std.testing.expectEqual(@as(usize, 1), tail.len);
+        try std.testing.expectEqual(compacted_through + 1, tail[0].sequence);
+    }
 }

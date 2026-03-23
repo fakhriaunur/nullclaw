@@ -26,6 +26,7 @@ pub const InMemoryLruMemory = struct {
     max_entries: usize,
     access_counter: u64,
     next_event_sequence: u64,
+    compacted_through_sequence: u64 = 0,
     instance_id: []const u8 = "default",
     owns_instance_id: bool = false,
     owns_self: bool = false,
@@ -669,6 +670,7 @@ pub const InMemoryLruMemory = struct {
 
     fn implListEvents(ptr: *anyopaque, allocator: std.mem.Allocator, after_sequence: u64, limit: usize) anyerror![]MemoryEvent {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        if (after_sequence < self_.compacted_through_sequence) return error.CursorExpired;
         var events: std.ArrayListUnmanaged(MemoryEvent) = .empty;
         errdefer {
             for (events.items) |*event| event.deinit(allocator);
@@ -699,8 +701,18 @@ pub const InMemoryLruMemory = struct {
         return .{
             .instance_id = try allocator.dupe(u8, self_.localInstanceId()),
             .last_sequence = self_.next_event_sequence,
-            .supports_compaction = false,
+            .supports_compaction = true,
+            .compacted_through_sequence = self_.compacted_through_sequence,
+            .oldest_available_sequence = self_.compacted_through_sequence + 1,
         };
+    }
+
+    fn implCompactEvents(ptr: *anyopaque) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        self_.compacted_through_sequence = self_.next_event_sequence;
+        for (self_.events.items) |event| self_.freeStoredEvent(event);
+        self_.events.clearRetainingCapacity();
+        return self_.compacted_through_sequence;
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -730,6 +742,7 @@ pub const InMemoryLruMemory = struct {
         .applyEvent = &implApplyEvent,
         .lastEventSequence = &implLastEventSequence,
         .eventFeedInfo = &implEventFeedInfo,
+        .compactEvents = &implCompactEvents,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,

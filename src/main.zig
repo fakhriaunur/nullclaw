@@ -43,7 +43,7 @@ const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
-const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|put|merge-object|merge-set|delete|events|apply|drain-outbox|forget";
+const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|put|merge-object|merge-set|delete|events|apply|compact|drain-outbox|forget";
 const HISTORY_SUBCOMMANDS = "list|show";
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
 const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
@@ -1014,6 +1014,7 @@ fn printMemoryUsage() void {
         \\  events [--after N] [--limit N] [--json|--ndjson|--status]
         \\                                Inspect deterministic memory event feed
         \\  apply <path|->                Apply JSON array or NDJSON event feed from file/stdin
+        \\  compact                       Checkpoint current state and compact event feed history
         \\  drain-outbox                  Drain durable vector outbox queue
         \\  forget <key> [--session-id ID]
         \\                                Alias for delete
@@ -1349,10 +1350,16 @@ fn nextLocalMemoryEventOrigin(allocator: std.mem.Allocator, memory: yc.memory.Me
     var info = try memory.eventFeedInfo(allocator);
     errdefer info.deinit(allocator);
 
-    var after_sequence: u64 = 0;
+    var after_sequence: u64 = info.compacted_through_sequence;
     var max_origin_sequence: u64 = 0;
     while (true) {
-        const events = try memory.listEvents(allocator, after_sequence, 256);
+        const events = memory.listEvents(allocator, after_sequence, 256) catch |err| switch (err) {
+            error.CursorExpired => blk: {
+                after_sequence = info.compacted_through_sequence;
+                break :blk try memory.listEvents(allocator, after_sequence, 256);
+            },
+            else => return err,
+        };
         defer yc.memory.freeEvents(allocator, events);
         if (events.len == 0) break;
 
@@ -1751,21 +1758,48 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             defer info.deinit(allocator);
 
             if (json_mode or ndjson_mode) {
-                var buf: [1024]u8 = undefined;
+                var buf: [4096]u8 = undefined;
                 var bw = std.fs.File.stdout().writer(&buf);
                 const out = &bw.interface;
                 out.writeAll("{\"instance_id\":") catch return;
                 writeJsonString(out, info.instance_id) catch return;
                 out.print(",\"last_sequence\":{d},\"supports_compaction\":", .{info.last_sequence}) catch return;
                 writeJsonBool(out, info.supports_compaction) catch return;
+                out.print(",\"compacted_through_sequence\":{d},\"oldest_available_sequence\":{d}", .{
+                    info.compacted_through_sequence,
+                    info.oldest_available_sequence,
+                }) catch return;
+                out.writeAll(",\"storage_kind\":") catch return;
+                writeJsonString(out, info.storage_kind.toString()) catch return;
+                out.writeAll(",\"journal_path\":") catch return;
+                if (info.journal_path) |journal_path| {
+                    writeJsonString(out, journal_path) catch return;
+                } else {
+                    out.writeAll("null") catch return;
+                }
+                out.writeAll(",\"checkpoint_path\":") catch return;
+                if (info.checkpoint_path) |checkpoint_path| {
+                    writeJsonString(out, checkpoint_path) catch return;
+                } else {
+                    out.writeAll("null") catch return;
+                }
                 out.writeAll("}\n") catch return;
                 out.flush() catch return;
             } else {
-                std.debug.print("Memory feed status:\n  instance_id: {s}\n  last_sequence: {d}\n  supports_compaction: {s}\n", .{
+                std.debug.print("Memory feed status:\n  instance_id: {s}\n  last_sequence: {d}\n  compacted_through_sequence: {d}\n  oldest_available_sequence: {d}\n  supports_compaction: {s}\n  storage_kind: {s}\n", .{
                     info.instance_id,
                     info.last_sequence,
+                    info.compacted_through_sequence,
+                    info.oldest_available_sequence,
                     if (info.supports_compaction) "true" else "false",
+                    info.storage_kind.toString(),
                 });
+                if (info.journal_path) |journal_path| {
+                    std.debug.print("  journal_path: {s}\n", .{journal_path});
+                }
+                if (info.checkpoint_path) |checkpoint_path| {
+                    std.debug.print("  checkpoint_path: {s}\n", .{checkpoint_path});
+                }
             }
             return;
         }
@@ -1773,6 +1807,20 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const events = mem_rt.memory.listEvents(allocator, after_sequence, limit) catch |err| {
             if (err == error.NotSupported) {
                 std.debug.print("memory events are not supported for backend: {s}\n", .{cfg.memory.backend});
+                std.process.exit(1);
+            }
+            if (err == error.CursorExpired) {
+                const info = mem_rt.memory.eventFeedInfo(allocator) catch null;
+                defer if (info) |value| value.deinit(allocator);
+                if (info) |value| {
+                    std.debug.print("memory events cursor expired: requested after={d}, compacted_through={d}, oldest_available={d}\n", .{
+                        after_sequence,
+                        value.compacted_through_sequence,
+                        value.oldest_available_sequence,
+                    });
+                } else {
+                    std.debug.print("memory events cursor expired at after={d}\n", .{after_sequence});
+                }
                 std.process.exit(1);
             }
             std.debug.print("memory events failed: {s}\n", .{@errorName(err)});
@@ -1889,6 +1937,30 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         }
 
         std.debug.print("Applied {d} event(s).\n", .{applied});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "compact")) {
+        const compacted_through = mem_rt.memory.compactEvents() catch |err| {
+            if (err == error.NotSupported) {
+                std.debug.print("memory compact is not supported for backend: {s}\n", .{cfg.memory.backend});
+                std.process.exit(1);
+            }
+            std.debug.print("memory compact failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        const info = mem_rt.memory.eventFeedInfo(allocator) catch |err| {
+            std.debug.print("memory compact status failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer info.deinit(allocator);
+        std.debug.print("Compacted memory feed through sequence {d}. Oldest available sequence is now {d}.\n", .{
+            compacted_through,
+            info.oldest_available_sequence,
+        });
+        if (info.checkpoint_path) |checkpoint_path| {
+            std.debug.print("Checkpoint path: {s}\n", .{checkpoint_path});
+        }
         return;
     }
 
