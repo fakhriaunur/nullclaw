@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const root = @import("../root.zig");
+const key_codec = @import("../vector/key_codec.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
@@ -318,8 +319,11 @@ pub const RedisMemory = struct {
         defer self_.allocator.free(id);
         const cat_str = category.toString();
 
-        // entry key: {prefix}:entry:{key}
-        const entry_key = try self_.prefixedKey("entry", key);
+        const storage_key = try key_codec.encode(self_.allocator, key, session_id);
+        defer self_.allocator.free(storage_key);
+
+        // entry key: {prefix}:entry:{storage_key}
+        const entry_key = try self_.prefixedKey("entry", storage_key);
         defer self_.allocator.free(entry_key);
 
         // On upsert, clean up stale category/session index sets before overwriting.
@@ -337,7 +341,7 @@ pub const RedisMemory = struct {
             if (old_cat.len > 0 and !std.mem.eql(u8, old_cat, cat_str)) {
                 const old_cat_set = try self_.prefixedKey("cat", old_cat);
                 defer self_.allocator.free(old_cat_set);
-                var srem_resp = try self_.sendCommand(&.{ "SREM", old_cat_set, key });
+                var srem_resp = try self_.sendCommand(&.{ "SREM", old_cat_set, storage_key });
                 srem_resp.deinit(self_.allocator);
             }
         }
@@ -347,7 +351,7 @@ pub const RedisMemory = struct {
             if (old_sid.len > 0 and !std.mem.eql(u8, old_sid, new_sid)) {
                 const old_sess_set = try self_.prefixedKey("sessions", old_sid);
                 defer self_.allocator.free(old_sess_set);
-                var srem_resp = try self_.sendCommand(&.{ "SREM", old_sess_set, key });
+                var srem_resp = try self_.sendCommand(&.{ "SREM", old_sess_set, storage_key });
                 srem_resp.deinit(self_.allocator);
             }
         }
@@ -365,23 +369,23 @@ pub const RedisMemory = struct {
         });
         resp.deinit(self_.allocator);
 
-        // SADD {prefix}:keys {key}
+        // SADD {prefix}:keys {storage_key}
         const keys_set = try self_.prefixedSimple("keys");
         defer self_.allocator.free(keys_set);
-        resp = try self_.sendCommand(&.{ "SADD", keys_set, key });
+        resp = try self_.sendCommand(&.{ "SADD", keys_set, storage_key });
         resp.deinit(self_.allocator);
 
-        // SADD {prefix}:cat:{category} {key}
+        // SADD {prefix}:cat:{category} {storage_key}
         const cat_set = try self_.prefixedKey("cat", cat_str);
         defer self_.allocator.free(cat_set);
-        resp = try self_.sendCommand(&.{ "SADD", cat_set, key });
+        resp = try self_.sendCommand(&.{ "SADD", cat_set, storage_key });
         resp.deinit(self_.allocator);
 
-        // If session_id: SADD {prefix}:sessions:{sid} {key}
+        // If session_id: SADD {prefix}:sessions:{sid} {storage_key}
         if (session_id) |sid_val| {
             const sess_set = try self_.prefixedKey("sessions", sid_val);
             defer self_.allocator.free(sess_set);
-            resp = try self_.sendCommand(&.{ "SADD", sess_set, key });
+            resp = try self_.sendCommand(&.{ "SADD", sess_set, storage_key });
             resp.deinit(self_.allocator);
         }
 
@@ -397,7 +401,10 @@ pub const RedisMemory = struct {
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
-        const entry_key = try self_.prefixedKey("entry", key);
+        const storage_key = try key_codec.encode(allocator, key, null);
+        defer allocator.free(storage_key);
+
+        const entry_key = try self_.prefixedKey("entry", storage_key);
         defer self_.allocator.free(entry_key);
 
         var resp = try self_.sendCommandAlloc(allocator, &.{ "HGETALL", entry_key });
@@ -410,7 +417,28 @@ pub const RedisMemory = struct {
 
         if (fields.len == 0) return null;
 
-        return try parseHashFields(allocator, key, fields);
+        return try parseHashFields(allocator, storage_key, fields);
+    }
+
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const storage_key = try key_codec.encode(allocator, key, session_id);
+        defer allocator.free(storage_key);
+
+        const entry_key = try self_.prefixedKey("entry", storage_key);
+        defer self_.allocator.free(entry_key);
+
+        var resp = try self_.sendCommandAlloc(allocator, &.{ "HGETALL", entry_key });
+        defer resp.deinit(allocator);
+
+        const fields = switch (resp) {
+            .array => |maybe_arr| maybe_arr orelse return null,
+            else => return null,
+        };
+        if (fields.len == 0) return null;
+
+        return try parseHashFields(allocator, storage_key, fields);
     }
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
@@ -576,56 +604,33 @@ pub const RedisMemory = struct {
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-
-        const entry_key = try self_.prefixedKey("entry", key);
-        defer self_.allocator.free(entry_key);
-
-        // Get category and session_id before deleting
-        var cat_resp = try self_.sendCommand(&.{ "HGET", entry_key, "category" });
-        const cat_str = cat_resp.asString();
-        defer cat_resp.deinit(self_.allocator);
-
-        var sid_resp = try self_.sendCommand(&.{ "HGET", entry_key, "session_id" });
-        const sid_str = sid_resp.asString();
-        defer sid_resp.deinit(self_.allocator);
-
-        // DEL {prefix}:entry:{key}
-        var del_resp = try self_.sendCommand(&.{ "DEL", entry_key });
-        const deleted = switch (del_resp) {
-            .integer => |n| n > 0,
-            else => false,
-        };
-        del_resp.deinit(self_.allocator);
-
-        if (!deleted) return false;
-
-        // SREM {prefix}:keys {key}
         const keys_set = try self_.prefixedSimple("keys");
         defer self_.allocator.free(keys_set);
-        var srem_resp = try self_.sendCommand(&.{ "SREM", keys_set, key });
-        srem_resp.deinit(self_.allocator);
 
-        // SREM {prefix}:cat:{category} {key}
-        if (cat_str) |cat| {
-            if (cat.len > 0) {
-                const cat_set = try self_.prefixedKey("cat", cat);
-                defer self_.allocator.free(cat_set);
-                var cat_srem = try self_.sendCommand(&.{ "SREM", cat_set, key });
-                cat_srem.deinit(self_.allocator);
-            }
+        var keys_resp = try self_.sendCommandAlloc(self_.allocator, &.{ "SMEMBERS", keys_set });
+        defer keys_resp.deinit(self_.allocator);
+
+        const storage_keys = switch (keys_resp) {
+            .array => |maybe_arr| maybe_arr orelse return false,
+            else => return false,
+        };
+
+        var deleted_any = false;
+        for (storage_keys) |kv| {
+            const storage_key = kv.asString() orelse continue;
+            const decoded = key_codec.decode(storage_key);
+            if (!std.mem.eql(u8, decoded.logical_key, key)) continue;
+            if (try deleteStorageKey(self_, storage_key)) deleted_any = true;
         }
 
-        // SREM {prefix}:sessions:{sid} {key}
-        if (sid_str) |sid| {
-            if (sid.len > 0) {
-                const sess_set = try self_.prefixedKey("sessions", sid);
-                defer self_.allocator.free(sess_set);
-                var sess_srem = try self_.sendCommand(&.{ "SREM", sess_set, key });
-                sess_srem.deinit(self_.allocator);
-            }
-        }
+        return deleted_any;
+    }
 
-        return true;
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const storage_key = try key_codec.encode(self_.allocator, key, session_id);
+        defer self_.allocator.free(storage_key);
+        return deleteStorageKey(self_, storage_key);
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -663,8 +668,10 @@ pub const RedisMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -680,8 +687,9 @@ pub const RedisMemory = struct {
 
 // ── Hash field parser ──────────────────────────────────────────────
 
-fn parseHashFields(allocator: std.mem.Allocator, key: []const u8, fields: []RespValue) !MemoryEntry {
+fn parseHashFields(allocator: std.mem.Allocator, stored_key: []const u8, fields: []RespValue) !MemoryEntry {
     // HGETALL returns [field, value, field, value, ...]
+    const decoded = key_codec.decode(stored_key);
     var id_val: ?[]const u8 = null;
     var content_val: ?[]const u8 = null;
     var category_val: ?[]const u8 = null;
@@ -708,7 +716,7 @@ fn parseHashFields(allocator: std.mem.Allocator, key: []const u8, fields: []Resp
 
     const id = try allocator.dupe(u8, id_val orelse "");
     errdefer allocator.free(id);
-    const entry_key = try allocator.dupe(u8, key);
+    const entry_key = try allocator.dupe(u8, decoded.logical_key);
     errdefer allocator.free(entry_key);
     const content = try allocator.dupe(u8, content_val orelse "");
     errdefer allocator.free(content);
@@ -724,7 +732,9 @@ fn parseHashFields(allocator: std.mem.Allocator, key: []const u8, fields: []Resp
     };
 
     var sid: ?[]const u8 = null;
-    if (session_id_val) |sv| {
+    if (decoded.session_id) |decoded_sid| {
+        sid = try allocator.dupe(u8, decoded_sid);
+    } else if (session_id_val) |sv| {
         if (sv.len > 0) {
             sid = try allocator.dupe(u8, sv);
         }
@@ -738,6 +748,52 @@ fn parseHashFields(allocator: std.mem.Allocator, key: []const u8, fields: []Resp
         .timestamp = timestamp,
         .session_id = sid,
     };
+}
+
+fn deleteStorageKey(self: *RedisMemory, storage_key: []const u8) !bool {
+    const entry_key = try RedisMemory.prefixedKey(self, "entry", storage_key);
+    defer self.allocator.free(entry_key);
+
+    var cat_resp = try RedisMemory.sendCommand(self, &.{ "HGET", entry_key, "category" });
+    const cat_str = cat_resp.asString();
+    defer cat_resp.deinit(self.allocator);
+
+    var sid_resp = try RedisMemory.sendCommand(self, &.{ "HGET", entry_key, "session_id" });
+    const sid_str = sid_resp.asString();
+    defer sid_resp.deinit(self.allocator);
+
+    var del_resp = try RedisMemory.sendCommand(self, &.{ "DEL", entry_key });
+    const deleted = switch (del_resp) {
+        .integer => |n| n > 0,
+        else => false,
+    };
+    del_resp.deinit(self.allocator);
+    if (!deleted) return false;
+
+    const keys_set = try RedisMemory.prefixedSimple(self, "keys");
+    defer self.allocator.free(keys_set);
+    var srem_resp = try RedisMemory.sendCommand(self, &.{ "SREM", keys_set, storage_key });
+    srem_resp.deinit(self.allocator);
+
+    if (cat_str) |cat| {
+        if (cat.len > 0) {
+            const cat_set = try RedisMemory.prefixedKey(self, "cat", cat);
+            defer self.allocator.free(cat_set);
+            var cat_srem = try RedisMemory.sendCommand(self, &.{ "SREM", cat_set, storage_key });
+            cat_srem.deinit(self.allocator);
+        }
+    }
+
+    if (sid_str) |sid| {
+        if (sid.len > 0) {
+            const sess_set = try RedisMemory.prefixedKey(self, "sessions", sid);
+            defer self.allocator.free(sess_set);
+            var sess_srem = try RedisMemory.sendCommand(self, &.{ "SREM", sess_set, storage_key });
+            sess_srem.deinit(self.allocator);
+        }
+    }
+
+    return true;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

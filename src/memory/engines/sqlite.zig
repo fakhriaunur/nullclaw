@@ -15,6 +15,10 @@ const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
+const MemoryEvent = root.MemoryEvent;
+const MemoryEventFeedInfo = root.MemoryEventFeedInfo;
+const MemoryEventInput = root.MemoryEventInput;
+const MemoryEventOp = root.MemoryEventOp;
 const log = std.log.scoped(.memory_sqlite);
 
 pub const c = @cImport({
@@ -208,11 +212,17 @@ fn statfsSupportsWal(path: [*:0]const u8) ?bool {
 pub const SqliteMemory = struct {
     db: ?*c.sqlite3,
     allocator: std.mem.Allocator,
+    instance_id: []const u8 = "default",
+    owns_instance_id: bool = false,
     owns_self: bool = false,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, db_path: [*:0]const u8) !Self {
+        return initWithInstanceId(allocator, db_path, "default");
+    }
+
+    pub fn initWithInstanceId(allocator: std.mem.Allocator, db_path: [*:0]const u8, instance_id: []const u8) !Self {
         const use_wal = shouldUseWal(db_path);
 
         var db: ?*c.sqlite3 = null;
@@ -226,10 +236,18 @@ pub const SqliteMemory = struct {
             _ = c.sqlite3_busy_timeout(d, BUSY_TIMEOUT_MS);
         }
 
-        var self_ = Self{ .db = db, .allocator = allocator };
+        const effective_instance_id = if (instance_id.len > 0) instance_id else "default";
+        var self_ = Self{
+            .db = db,
+            .allocator = allocator,
+            .instance_id = try allocator.dupe(u8, effective_instance_id),
+            .owns_instance_id = true,
+        };
+        errdefer if (self_.owns_instance_id) allocator.free(self_.instance_id);
         try self_.configurePragmas(use_wal);
         try self_.migrate();
         try self_.migrateSessionId();
+        try self_.migrateEventStream();
         try self_.migrateAgentNamespace();
         return self_;
     }
@@ -238,6 +256,10 @@ pub const SqliteMemory = struct {
         if (self.db) |db| {
             _ = c.sqlite3_close(db);
             self.db = null;
+        }
+        if (self.owns_instance_id) {
+            self.allocator.free(self.instance_id);
+            self.owns_instance_id = false;
         }
     }
 
@@ -289,13 +311,15 @@ pub const SqliteMemory = struct {
             \\  content    TEXT NOT NULL,
             \\  category   TEXT NOT NULL DEFAULT 'core',
             \\  session_id TEXT,
+            \\  event_timestamp_ms INTEGER NOT NULL DEFAULT 0,
+            \\  event_origin_instance_id TEXT NOT NULL DEFAULT 'default',
+            \\  event_origin_sequence INTEGER NOT NULL DEFAULT 0,
             \\  created_at TEXT NOT NULL,
             \\  updated_at TEXT NOT NULL
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             \\CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
             \\CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
-            \\
             \\-- FTS5 full-text search (BM25 scoring)
             \\CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
             \\  key, content, content=memories, content_rowid=rowid
@@ -439,15 +463,25 @@ pub const SqliteMemory = struct {
                 \\  content    TEXT NOT NULL,
                 \\  category   TEXT NOT NULL DEFAULT 'core',
                 \\  session_id TEXT,
+                \\  event_timestamp_ms INTEGER NOT NULL DEFAULT 0,
+                \\  event_origin_instance_id TEXT NOT NULL DEFAULT 'default',
+                \\  event_origin_sequence INTEGER NOT NULL DEFAULT 0,
                 \\  created_at TEXT NOT NULL,
                 \\  updated_at TEXT NOT NULL
                 \\);
-                \\INSERT INTO memories_new SELECT id, key, content, category, session_id, created_at, updated_at FROM memories;
+                \\INSERT INTO memories_new (id, key, content, category, session_id, event_timestamp_ms, event_origin_instance_id, event_origin_sequence, created_at, updated_at)
+                \\SELECT id, key, content, category, session_id,
+                \\       COALESCE(event_timestamp_ms, 0),
+                \\       COALESCE(event_origin_instance_id, 'default'),
+                \\       COALESCE(event_origin_sequence, 0),
+                \\       created_at, updated_at
+                \\FROM memories;
                 \\DROP TABLE memories;
                 \\ALTER TABLE memories_new RENAME TO memories;
                 \\CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
                 \\CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
                 \\CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+                \\CREATE INDEX IF NOT EXISTS idx_memories_event_order ON memories(event_timestamp_ms, event_origin_instance_id, event_origin_sequence);
                 \\CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
                 \\  INSERT INTO memories_fts(rowid, key, content)
                 \\  VALUES (new.rowid, new.key, new.content);
@@ -503,6 +537,500 @@ pub const SqliteMemory = struct {
         }
     }
 
+    fn execSql(self: *Self, context: []const u8, sql: [:0]const u8) !void {
+        var err_msg: [*c]u8 = null;
+        const rc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
+        if (rc != c.SQLITE_OK) {
+            self.logExecFailure(context, sql, rc, err_msg);
+            if (err_msg) |msg| c.sqlite3_free(msg);
+            return error.MigrationFailed;
+        }
+    }
+
+    fn execSqlAllowDuplicateColumn(self: *Self, context: []const u8, sql: [:0]const u8) !void {
+        var err_msg: [*c]u8 = null;
+        const rc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
+        if (rc == c.SQLITE_OK) return;
+
+        var ignore_error = false;
+        if (err_msg) |msg| {
+            const msg_text = std.mem.span(msg);
+            ignore_error = std.mem.indexOf(u8, msg_text, "duplicate column name") != null;
+        }
+        if (!ignore_error) {
+            self.logExecFailure(context, sql, rc, err_msg);
+            if (err_msg) |msg| c.sqlite3_free(msg);
+            return error.MigrationFailed;
+        }
+    }
+
+    pub fn migrateEventStream(self: *Self) !void {
+        try self.execSqlAllowDuplicateColumn("event stream migration", "ALTER TABLE memories ADD COLUMN event_timestamp_ms INTEGER NOT NULL DEFAULT 0;");
+        try self.execSqlAllowDuplicateColumn("event stream migration", "ALTER TABLE memories ADD COLUMN event_origin_instance_id TEXT NOT NULL DEFAULT 'default';");
+        try self.execSqlAllowDuplicateColumn("event stream migration", "ALTER TABLE memories ADD COLUMN event_origin_sequence INTEGER NOT NULL DEFAULT 0;");
+        try self.execSql("event stream migration", "CREATE INDEX IF NOT EXISTS idx_memories_event_order ON memories(event_timestamp_ms, event_origin_instance_id, event_origin_sequence);");
+        try self.execSql(
+            "event stream migration",
+            \\CREATE TABLE IF NOT EXISTS memory_events (
+            \\  local_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  schema_version INTEGER NOT NULL DEFAULT 1,
+            \\  origin_instance_id TEXT NOT NULL,
+            \\  origin_sequence INTEGER NOT NULL,
+            \\  timestamp_ms INTEGER NOT NULL,
+            \\  operation TEXT NOT NULL,
+            \\  key TEXT NOT NULL,
+            \\  session_id TEXT,
+            \\  category TEXT,
+            \\  content TEXT,
+            \\  UNIQUE(origin_instance_id, origin_sequence)
+            \\);
+        );
+        try self.execSql("event stream migration", "CREATE INDEX IF NOT EXISTS idx_memory_events_local_sequence ON memory_events(local_sequence);");
+        try self.execSql("event stream migration", "CREATE INDEX IF NOT EXISTS idx_memory_events_origin ON memory_events(origin_instance_id, origin_sequence);");
+        try self.execSql(
+            "event stream migration",
+            \\CREATE TABLE IF NOT EXISTS memory_event_frontiers (
+            \\  origin_instance_id TEXT PRIMARY KEY,
+            \\  last_origin_sequence INTEGER NOT NULL
+            \\);
+        );
+        try self.execSql(
+            "event stream migration",
+            \\CREATE TABLE IF NOT EXISTS memory_tombstones (
+            \\  key TEXT NOT NULL,
+            \\  scope TEXT NOT NULL,
+            \\  session_key TEXT NOT NULL,
+            \\  session_id TEXT,
+            \\  timestamp_ms INTEGER NOT NULL,
+            \\  origin_instance_id TEXT NOT NULL,
+            \\  origin_sequence INTEGER NOT NULL,
+            \\  PRIMARY KEY (key, scope, session_key)
+            \\);
+        );
+        try self.execSql("event stream migration", "CREATE INDEX IF NOT EXISTS idx_memory_tombstones_key ON memory_tombstones(key);");
+    }
+
+    fn localInstanceId(self: *Self) []const u8 {
+        return if (self.instance_id.len > 0) self.instance_id else "default";
+    }
+
+    fn compareInputToMetadata(input: MemoryEventInput, timestamp_ms: i64, origin_instance_id: []const u8, origin_sequence: u64) i8 {
+        if (input.timestamp_ms < timestamp_ms) return -1;
+        if (input.timestamp_ms > timestamp_ms) return 1;
+
+        const order = std.mem.order(u8, input.origin_instance_id, origin_instance_id);
+        if (order == .lt) return -1;
+        if (order == .gt) return 1;
+
+        if (input.origin_sequence < origin_sequence) return -1;
+        if (input.origin_sequence > origin_sequence) return 1;
+        return 0;
+    }
+
+    fn execTxnSql(self: *Self, sql: [:0]const u8) !void {
+        var err_msg: [*c]u8 = null;
+        const rc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
+        if (rc != c.SQLITE_OK) {
+            self.logExecFailure("transaction", sql, rc, err_msg);
+            if (err_msg) |msg| c.sqlite3_free(msg);
+            return error.StepFailed;
+        }
+    }
+
+    fn beginImmediate(self: *Self) !bool {
+        var err_msg: [*c]u8 = null;
+        const sql = "BEGIN IMMEDIATE;";
+        const rc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
+        if (rc == c.SQLITE_OK) return true;
+
+        if (err_msg) |msg| {
+            const text = std.mem.span(msg);
+            if (std.mem.indexOf(u8, text, "cannot start a transaction within a transaction") != null) {
+                c.sqlite3_free(msg);
+                return false;
+            }
+        }
+
+        self.logExecFailure("transaction", sql, rc, err_msg);
+        if (err_msg) |msg| c.sqlite3_free(msg);
+        return error.StepFailed;
+    }
+
+    fn commitTxn(self: *Self) !void {
+        try self.execTxnSql("COMMIT;");
+    }
+
+    fn rollbackTxn(self: *Self) void {
+        var err_msg: [*c]u8 = null;
+        _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, &err_msg);
+        if (err_msg) |msg| c.sqlite3_free(msg);
+    }
+
+    fn bindNullableText(stmt: ?*c.sqlite3_stmt, index: c_int, value: ?[]const u8) void {
+        if (value) |text| {
+            _ = c.sqlite3_bind_text(stmt, index, text.ptr, @intCast(text.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, index);
+        }
+    }
+
+    fn getFrontierTx(self: *Self, origin_instance_id: []const u8) !u64 {
+        const sql = "SELECT last_origin_sequence FROM memory_event_frontiers WHERE origin_instance_id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, origin_instance_id.ptr, @intCast(origin_instance_id.len), SQLITE_STATIC);
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            const frontier = c.sqlite3_column_int64(stmt, 0);
+            return if (frontier < 0) 0 else @intCast(frontier);
+        }
+        return 0;
+    }
+
+    fn setFrontierTx(self: *Self, origin_instance_id: []const u8, origin_sequence: u64) !void {
+        const sql =
+            "INSERT INTO memory_event_frontiers (origin_instance_id, last_origin_sequence) VALUES (?1, ?2) " ++
+            "ON CONFLICT(origin_instance_id) DO UPDATE SET last_origin_sequence = MAX(last_origin_sequence, excluded.last_origin_sequence)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, origin_instance_id.ptr, @intCast(origin_instance_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(origin_sequence));
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn nextLocalOriginSequenceTx(self: *Self) !u64 {
+        return (try self.getFrontierTx(self.localInstanceId())) + 1;
+    }
+
+    fn insertEventTx(self: *Self, input: MemoryEventInput) !bool {
+        const sql =
+            "INSERT INTO memory_events (schema_version, origin_instance_id, origin_sequence, timestamp_ms, operation, key, session_id, category, content) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const category_str = if (input.category) |category| category.toString() else null;
+        _ = c.sqlite3_bind_int64(stmt, 1, 1);
+        _ = c.sqlite3_bind_text(stmt, 2, input.origin_instance_id.ptr, @intCast(input.origin_instance_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 3, @intCast(input.origin_sequence));
+        _ = c.sqlite3_bind_int64(stmt, 4, input.timestamp_ms);
+        const op_str = input.operation.toString();
+        _ = c.sqlite3_bind_text(stmt, 5, op_str.ptr, @intCast(op_str.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 6, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+        bindNullableText(stmt, 7, input.session_id);
+        bindNullableText(stmt, 8, category_str);
+        bindNullableText(stmt, 9, input.content);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return true;
+        if (rc == c.SQLITE_CONSTRAINT) return false;
+        return error.StepFailed;
+    }
+
+    fn sessionKeyFor(session_id: ?[]const u8) []const u8 {
+        return if (session_id) |sid| sid else "__global__";
+    }
+
+    fn tombstoneBlocksPutTx(self: *Self, input: MemoryEventInput) !bool {
+        const scoped_session_key = sessionKeyFor(input.session_id);
+        const sql =
+            "SELECT timestamp_ms, origin_instance_id, origin_sequence FROM memory_tombstones " ++
+            "WHERE key = ?1 AND ((scope = 'scoped' AND session_key = ?2) OR (scope = 'all' AND session_key = '*'))";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, scoped_session_key.ptr, @intCast(scoped_session_key.len), SQLITE_STATIC);
+
+        while (true) {
+            rc = c.sqlite3_step(stmt);
+            if (rc != c.SQLITE_ROW) break;
+            const timestamp_ms = c.sqlite3_column_int64(stmt, 0);
+            const origin_ptr = c.sqlite3_column_text(stmt, 1);
+            const origin_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const origin = if (origin_ptr == null) "" else @as([*]const u8, @ptrCast(origin_ptr))[0..origin_len];
+            const origin_sequence: u64 = @intCast(@max(c.sqlite3_column_int64(stmt, 2), 0));
+            if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) <= 0) return true;
+        }
+
+        return false;
+    }
+
+    fn putStateTx(self: *Self, input: MemoryEventInput) !void {
+        const category = input.category orelse return error.InvalidEvent;
+        const content = input.content orelse return error.InvalidEvent;
+        if (try self.tombstoneBlocksPutTx(input)) return;
+
+        const select_sql = if (input.session_id != null)
+            "SELECT event_timestamp_ms, event_origin_instance_id, event_origin_sequence FROM memories WHERE key = ?1 AND session_id = ?2 LIMIT 1"
+        else
+            "SELECT event_timestamp_ms, event_origin_instance_id, event_origin_sequence FROM memories WHERE key = ?1 AND session_id IS NULL LIMIT 1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, select_sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+        if (input.session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        }
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            const timestamp_ms = c.sqlite3_column_int64(stmt, 0);
+            const origin_ptr = c.sqlite3_column_text(stmt, 1);
+            const origin_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const origin = if (origin_ptr == null) "" else @as([*]const u8, @ptrCast(origin_ptr))[0..origin_len];
+            const origin_sequence: u64 = @intCast(@max(c.sqlite3_column_int64(stmt, 2), 0));
+            if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) <= 0) return;
+        }
+
+        const now = try std.fmt.allocPrint(self.allocator, "{d}", .{@divTrunc(input.timestamp_ms, 1000)});
+        defer self.allocator.free(now);
+        const id = try generateId(self.allocator);
+        defer self.allocator.free(id);
+        const cat_str = category.toString();
+
+        const sql =
+            "INSERT INTO memories (id, key, content, category, session_id, event_timestamp_ms, event_origin_instance_id, event_origin_sequence, created_at, updated_at) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) " ++
+            "ON CONFLICT(key, COALESCE(session_id, '__global__')) DO UPDATE SET " ++
+            "id = excluded.id, " ++
+            "content = excluded.content, " ++
+            "category = excluded.category, " ++
+            "event_timestamp_ms = excluded.event_timestamp_ms, " ++
+            "event_origin_instance_id = excluded.event_origin_instance_id, " ++
+            "event_origin_sequence = excluded.event_origin_sequence, " ++
+            "updated_at = excluded.updated_at";
+        var upsert_stmt: ?*c.sqlite3_stmt = null;
+        rc = c.sqlite3_prepare_v2(self.db, sql, -1, &upsert_stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(upsert_stmt);
+
+        _ = c.sqlite3_bind_text(upsert_stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(upsert_stmt, 2, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(upsert_stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(upsert_stmt, 4, cat_str.ptr, @intCast(cat_str.len), SQLITE_STATIC);
+        bindNullableText(upsert_stmt, 5, input.session_id);
+        _ = c.sqlite3_bind_int64(upsert_stmt, 6, input.timestamp_ms);
+        _ = c.sqlite3_bind_text(upsert_stmt, 7, input.origin_instance_id.ptr, @intCast(input.origin_instance_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(upsert_stmt, 8, @intCast(input.origin_sequence));
+        _ = c.sqlite3_bind_text(upsert_stmt, 9, now.ptr, @intCast(now.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(upsert_stmt, 10, now.ptr, @intCast(now.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(upsert_stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn deleteScopedStateTx(self: *Self, input: MemoryEventInput) !void {
+        const select_sql = if (input.session_id != null)
+            "SELECT event_timestamp_ms, event_origin_instance_id, event_origin_sequence FROM memories WHERE key = ?1 AND session_id = ?2 LIMIT 1"
+        else
+            "SELECT event_timestamp_ms, event_origin_instance_id, event_origin_sequence FROM memories WHERE key = ?1 AND session_id IS NULL LIMIT 1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, select_sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+        if (input.session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        }
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            const timestamp_ms = c.sqlite3_column_int64(stmt, 0);
+            const origin_ptr = c.sqlite3_column_text(stmt, 1);
+            const origin_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const origin = if (origin_ptr == null) "" else @as([*]const u8, @ptrCast(origin_ptr))[0..origin_len];
+            const origin_sequence: u64 = @intCast(@max(c.sqlite3_column_int64(stmt, 2), 0));
+            if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) >= 0) {
+                const delete_sql = if (input.session_id != null)
+                    "DELETE FROM memories WHERE key = ?1 AND session_id = ?2"
+                else
+                    "DELETE FROM memories WHERE key = ?1 AND session_id IS NULL";
+                var delete_stmt: ?*c.sqlite3_stmt = null;
+                rc = c.sqlite3_prepare_v2(self.db, delete_sql, -1, &delete_stmt, null);
+                if (rc != c.SQLITE_OK) return error.PrepareFailed;
+                defer _ = c.sqlite3_finalize(delete_stmt);
+
+                _ = c.sqlite3_bind_text(delete_stmt, 1, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+                if (input.session_id) |sid| {
+                    _ = c.sqlite3_bind_text(delete_stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+                }
+                rc = c.sqlite3_step(delete_stmt);
+                if (rc != c.SQLITE_DONE) return error.StepFailed;
+            }
+        }
+    }
+
+    fn deleteAllStateTx(self: *Self, input: MemoryEventInput) !void {
+        const select_sql =
+            "SELECT session_id, event_timestamp_ms, event_origin_instance_id, event_origin_sequence FROM memories WHERE key = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, select_sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+
+        var sessions_to_delete: std.ArrayListUnmanaged(?[]u8) = .empty;
+        defer {
+            for (sessions_to_delete.items) |sid_opt| if (sid_opt) |sid| self.allocator.free(sid);
+            sessions_to_delete.deinit(self.allocator);
+        }
+
+        while (true) {
+            rc = c.sqlite3_step(stmt);
+            if (rc != c.SQLITE_ROW) break;
+            const sid = try dupeColumnTextNullable(stmt.?, 0, self.allocator);
+            errdefer if (sid) |value| self.allocator.free(value);
+            const timestamp_ms = c.sqlite3_column_int64(stmt, 1);
+            const origin_ptr = c.sqlite3_column_text(stmt, 2);
+            const origin_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+            const origin = if (origin_ptr == null) "" else @as([*]const u8, @ptrCast(origin_ptr))[0..origin_len];
+            const origin_sequence: u64 = @intCast(@max(c.sqlite3_column_int64(stmt, 3), 0));
+            if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) >= 0) {
+                try sessions_to_delete.append(self.allocator, sid);
+            } else if (sid) |value| {
+                self.allocator.free(value);
+            }
+        }
+
+        for (sessions_to_delete.items) |sid_opt| {
+            const delete_sql = if (sid_opt != null)
+                "DELETE FROM memories WHERE key = ?1 AND session_id = ?2"
+            else
+                "DELETE FROM memories WHERE key = ?1 AND session_id IS NULL";
+            var delete_stmt: ?*c.sqlite3_stmt = null;
+            rc = c.sqlite3_prepare_v2(self.db, delete_sql, -1, &delete_stmt, null);
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(delete_stmt);
+
+            _ = c.sqlite3_bind_text(delete_stmt, 1, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+            if (sid_opt) |sid| {
+                _ = c.sqlite3_bind_text(delete_stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+            }
+            rc = c.sqlite3_step(delete_stmt);
+            if (rc != c.SQLITE_DONE) return error.StepFailed;
+        }
+    }
+
+    fn upsertTombstoneTx(self: *Self, input: MemoryEventInput, scope: []const u8, session_key: []const u8, session_id: ?[]const u8) !void {
+        const select_sql =
+            "SELECT timestamp_ms, origin_instance_id, origin_sequence FROM memory_tombstones WHERE key = ?1 AND scope = ?2 AND session_key = ?3 LIMIT 1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, select_sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, scope.ptr, @intCast(scope.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 3, session_key.ptr, @intCast(session_key.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            const timestamp_ms = c.sqlite3_column_int64(stmt, 0);
+            const origin_ptr = c.sqlite3_column_text(stmt, 1);
+            const origin_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 1));
+            const origin = if (origin_ptr == null) "" else @as([*]const u8, @ptrCast(origin_ptr))[0..origin_len];
+            const origin_sequence: u64 = @intCast(@max(c.sqlite3_column_int64(stmt, 2), 0));
+            if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) <= 0) return;
+        }
+
+        const upsert_sql =
+            "INSERT INTO memory_tombstones (key, scope, session_key, session_id, timestamp_ms, origin_instance_id, origin_sequence) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) " ++
+            "ON CONFLICT(key, scope, session_key) DO UPDATE SET " ++
+            "session_id = excluded.session_id, " ++
+            "timestamp_ms = excluded.timestamp_ms, " ++
+            "origin_instance_id = excluded.origin_instance_id, " ++
+            "origin_sequence = excluded.origin_sequence";
+        var upsert_stmt: ?*c.sqlite3_stmt = null;
+        rc = c.sqlite3_prepare_v2(self.db, upsert_sql, -1, &upsert_stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(upsert_stmt);
+
+        _ = c.sqlite3_bind_text(upsert_stmt, 1, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(upsert_stmt, 2, scope.ptr, @intCast(scope.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(upsert_stmt, 3, session_key.ptr, @intCast(session_key.len), SQLITE_STATIC);
+        bindNullableText(upsert_stmt, 4, session_id);
+        _ = c.sqlite3_bind_int64(upsert_stmt, 5, input.timestamp_ms);
+        _ = c.sqlite3_bind_text(upsert_stmt, 6, input.origin_instance_id.ptr, @intCast(input.origin_instance_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(upsert_stmt, 7, @intCast(input.origin_sequence));
+        rc = c.sqlite3_step(upsert_stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn applyEventTx(self: *Self, input: MemoryEventInput) !void {
+        if (input.operation == .put and (input.category == null or input.content == null)) return error.InvalidEvent;
+
+        const frontier = try self.getFrontierTx(input.origin_instance_id);
+        if (input.origin_sequence <= frontier) return;
+
+        const inserted = try self.insertEventTx(input);
+        if (!inserted) {
+            try self.setFrontierTx(input.origin_instance_id, input.origin_sequence);
+            return;
+        }
+
+        switch (input.operation) {
+            .put => try self.putStateTx(input),
+            .delete_scoped => {
+                try self.deleteScopedStateTx(input);
+                try self.upsertTombstoneTx(input, "scoped", sessionKeyFor(input.session_id), input.session_id);
+            },
+            .delete_all => {
+                try self.deleteAllStateTx(input);
+                try self.upsertTombstoneTx(input, "all", "*", null);
+            },
+        }
+
+        try self.setFrontierTx(input.origin_instance_id, input.origin_sequence);
+    }
+
+    fn applyEventInternal(self: *Self, input: MemoryEventInput) !void {
+        var owns_tx = c.sqlite3_get_autocommit(self.db) != 0;
+        if (owns_tx) owns_tx = try self.beginImmediate();
+        var committed = false;
+        errdefer if (owns_tx and !committed) self.rollbackTxn();
+        try self.applyEventTx(input);
+        if (owns_tx) try self.commitTxn();
+        committed = true;
+    }
+
+    fn emitLocalEvent(self: *Self, operation: MemoryEventOp, key: []const u8, session_id: ?[]const u8, category: ?MemoryCategory, content: ?[]const u8) !void {
+        var owns_tx = c.sqlite3_get_autocommit(self.db) != 0;
+        if (owns_tx) owns_tx = try self.beginImmediate();
+        var committed = false;
+        errdefer if (owns_tx and !committed) self.rollbackTxn();
+
+        const input = MemoryEventInput{
+            .origin_instance_id = self.localInstanceId(),
+            .origin_sequence = try self.nextLocalOriginSequenceTx(),
+            .timestamp_ms = std.time.milliTimestamp(),
+            .operation = operation,
+            .key = key,
+            .session_id = session_id,
+            .category = category,
+            .content = content,
+        };
+        try self.applyEventTx(input);
+        if (owns_tx) try self.commitTxn();
+        committed = true;
+    }
+
     // ── Memory trait implementation ────────────────────────────────
 
     fn implName(_: *anyopaque) []const u8 {
@@ -511,41 +1039,7 @@ pub const SqliteMemory = struct {
 
     fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-
-        const now = getNowTimestamp(self_.allocator) catch return error.StepFailed;
-        defer self_.allocator.free(now);
-
-        const id = generateId(self_.allocator) catch return error.StepFailed;
-        defer self_.allocator.free(id);
-
-        const cat_str = category.toString();
-
-        const sql = "INSERT INTO memories (id, key, content, category, session_id, created_at, updated_at) " ++
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) " ++
-            "ON CONFLICT(key, COALESCE(session_id, '__global__')) DO UPDATE SET " ++
-            "content = excluded.content, " ++
-            "category = excluded.category, " ++
-            "updated_at = excluded.updated_at";
-
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return error.PrepareFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_text(stmt, 4, cat_str.ptr, @intCast(cat_str.len), SQLITE_STATIC);
-        if (session_id) |sid| {
-            _ = c.sqlite3_bind_text(stmt, 5, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
-        } else {
-            _ = c.sqlite3_bind_null(stmt, 5);
-        }
-        _ = c.sqlite3_bind_text(stmt, 6, now.ptr, @intCast(now.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_text(stmt, 7, now.ptr, @intCast(now.len), SQLITE_STATIC);
-
-        rc = c.sqlite3_step(stmt);
-        if (rc != c.SQLITE_DONE) return error.StepFailed;
+        try self_.emitLocalEvent(.put, key, session_id, category, content);
     }
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
@@ -564,7 +1058,7 @@ pub const SqliteMemory = struct {
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
-        const sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1";
+        const sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1 AND session_id IS NULL LIMIT 1";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -575,6 +1069,19 @@ pub const SqliteMemory = struct {
         rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_ROW) {
             return try readEntryFromRow(stmt.?, allocator);
+        }
+
+        const fallback_sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1 ORDER BY updated_at DESC LIMIT 1";
+        var fallback_stmt: ?*c.sqlite3_stmt = null;
+        rc = c.sqlite3_prepare_v2(self_.db, fallback_sql, -1, &fallback_stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(fallback_stmt);
+
+        _ = c.sqlite3_bind_text(fallback_stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(fallback_stmt);
+        if (rc == c.SQLITE_ROW) {
+            return try readEntryFromRow(fallback_stmt.?, allocator);
         }
         return null;
     }
@@ -663,41 +1170,77 @@ pub const SqliteMemory = struct {
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-
-        const sql = "DELETE FROM memories WHERE key = ?1";
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return error.PrepareFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
-
-        rc = c.sqlite3_step(stmt);
-        if (rc != c.SQLITE_DONE) return error.StepFailed;
-
-        return c.sqlite3_changes(self_.db) > 0;
+        const existing = try implGet(ptr, self_.allocator, key);
+        if (existing == null) return false;
+        existing.?.deinit(self_.allocator);
+        try self_.emitLocalEvent(.delete_all, key, null, null, null);
+        return true;
     }
 
     fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const existing = try implGetScoped(ptr, self_.allocator, key, session_id);
+        if (existing == null) return false;
+        existing.?.deinit(self_.allocator);
+        try self_.emitLocalEvent(.delete_scoped, key, session_id, null, null);
+        return true;
+    }
 
-        const sql = if (session_id != null)
-            "DELETE FROM memories WHERE key = ?1 AND session_id = ?2"
-        else
-            "DELETE FROM memories WHERE key = ?1 AND session_id IS NULL";
+    fn implListEvents(ptr: *anyopaque, allocator: std.mem.Allocator, after_sequence: u64, limit: usize) anyerror![]MemoryEvent {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const sql =
+            "SELECT local_sequence, schema_version, origin_instance_id, origin_sequence, timestamp_ms, operation, key, session_id, category, content " ++
+            "FROM memory_events WHERE local_sequence > ?1 ORDER BY local_sequence ASC LIMIT ?2";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
-        if (session_id) |sid| {
-            _ = c.sqlite3_bind_text(stmt, 2, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(after_sequence));
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+
+        var events: std.ArrayListUnmanaged(MemoryEvent) = .empty;
+        errdefer {
+            for (events.items) |*event| event.deinit(allocator);
+            events.deinit(allocator);
         }
 
+        while (true) {
+            rc = c.sqlite3_step(stmt);
+            if (rc != c.SQLITE_ROW) break;
+            try events.append(allocator, try readEventFromRow(stmt.?, allocator));
+        }
+
+        return events.toOwnedSlice(allocator);
+    }
+
+    fn implApplyEvent(ptr: *anyopaque, input: MemoryEventInput) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        try self_.applyEventInternal(input);
+    }
+
+    fn implLastEventSequence(ptr: *anyopaque) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const sql = "SELECT COALESCE(MAX(local_sequence), 0) FROM memory_events";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
         rc = c.sqlite3_step(stmt);
-        if (rc != c.SQLITE_DONE) return error.StepFailed;
-        return c.sqlite3_changes(self_.db) > 0;
+        if (rc == c.SQLITE_ROW) {
+            const value = c.sqlite3_column_int64(stmt, 0);
+            return if (value < 0) 0 else @intCast(value);
+        }
+        return 0;
+    }
+
+    fn implEventFeedInfo(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!MemoryEventFeedInfo {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return .{
+            .instance_id = try allocator.dupe(u8, self_.localInstanceId()),
+            .last_sequence = try implLastEventSequence(ptr),
+            .supports_compaction = false,
+        };
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -742,6 +1285,10 @@ pub const SqliteMemory = struct {
         .list = &implList,
         .forget = &implForget,
         .forgetScoped = &implForgetScoped,
+        .listEvents = &implListEvents,
+        .applyEvent = &implApplyEvent,
+        .lastEventSequence = &implLastEventSequence,
+        .eventFeedInfo = &implEventFeedInfo,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -1231,6 +1778,46 @@ pub const SqliteMemory = struct {
 
     // ── Utility functions ──────────────────────────────────────────
 
+    fn parseCategoryOwned(allocator: std.mem.Allocator, value: []const u8) !MemoryCategory {
+        if (std.mem.eql(u8, value, "core")) return .core;
+        if (std.mem.eql(u8, value, "daily")) return .daily;
+        if (std.mem.eql(u8, value, "conversation")) return .conversation;
+        return .{ .custom = try allocator.dupe(u8, value) };
+    }
+
+    fn readEventFromRow(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !MemoryEvent {
+        const schema_version_raw = c.sqlite3_column_int64(stmt, 1);
+        const schema_version: u32 = @intCast(@max(schema_version_raw, 0));
+        const operation_str = try dupeColumnText(stmt, 5, allocator);
+        defer allocator.free(operation_str);
+        const operation = MemoryEventOp.fromString(operation_str) orelse return error.InvalidEvent;
+
+        const category_text = try dupeColumnTextNullable(stmt, 8, allocator);
+        errdefer if (category_text) |text| allocator.free(text);
+        const category = if (category_text) |text|
+            try parseCategoryOwned(allocator, text)
+        else
+            null;
+        if (category_text) |text| allocator.free(text);
+        errdefer if (category) |value| switch (value) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        };
+
+        return .{
+            .schema_version = schema_version,
+            .sequence = @intCast(@max(c.sqlite3_column_int64(stmt, 0), 0)),
+            .origin_instance_id = try dupeColumnText(stmt, 2, allocator),
+            .origin_sequence = @intCast(@max(c.sqlite3_column_int64(stmt, 3), 0)),
+            .timestamp_ms = c.sqlite3_column_int64(stmt, 4),
+            .operation = operation,
+            .key = try dupeColumnText(stmt, 6, allocator),
+            .session_id = try dupeColumnTextNullable(stmt, 7, allocator),
+            .category = category,
+            .content = try dupeColumnTextNullable(stmt, 9, allocator),
+        };
+    }
+
     fn readEntryFromRow(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !MemoryEntry {
         return readEntryFromRowWithSessionCol(stmt, allocator, 5);
     }
@@ -1250,18 +1837,9 @@ pub const SqliteMemory = struct {
         errdefer if (sid) |s| allocator.free(s);
 
         const category = blk: {
-            if (std.mem.eql(u8, cat_str, "core")) {
-                allocator.free(cat_str);
-                break :blk MemoryCategory.core;
-            } else if (std.mem.eql(u8, cat_str, "daily")) {
-                allocator.free(cat_str);
-                break :blk MemoryCategory.daily;
-            } else if (std.mem.eql(u8, cat_str, "conversation")) {
-                allocator.free(cat_str);
-                break :blk MemoryCategory.conversation;
-            } else {
-                break :blk MemoryCategory{ .custom = cat_str };
-            }
+            const parsed = try parseCategoryOwned(allocator, cat_str);
+            allocator.free(cat_str);
+            break :blk parsed;
         };
 
         return MemoryEntry{
@@ -2548,4 +3126,85 @@ test "sqlite clearMessages does not affect other sessions" {
     const s2_msgs = try mem.loadMessages(std.testing.allocator, "s2");
     defer root.freeMessages(std.testing.allocator, s2_msgs);
     try std.testing.expectEqual(@as(usize, 1), s2_msgs.len);
+}
+
+test "sqlite event feed converges across replicas and is idempotent" {
+    var source = try SqliteMemory.initWithInstanceId(std.testing.allocator, ":memory:", "agent-a");
+    defer source.deinit();
+    var replica = try SqliteMemory.initWithInstanceId(std.testing.allocator, ":memory:", "agent-b");
+    defer replica.deinit();
+
+    const source_mem = source.memory();
+    const replica_mem = replica.memory();
+
+    try source_mem.store("preferences.theme", "dark", .core, null);
+    try source_mem.store("preferences.style", "concise", .core, "sess-1");
+    try std.testing.expect(try source_mem.forgetScoped(std.testing.allocator, "preferences.style", "sess-1"));
+
+    const events = try source_mem.listEvents(std.testing.allocator, 0, 32);
+    defer root.freeEvents(std.testing.allocator, events);
+    try std.testing.expectEqual(@as(usize, 3), events.len);
+
+    for (events) |event| {
+        try replica_mem.applyEvent(.{
+            .origin_instance_id = event.origin_instance_id,
+            .origin_sequence = event.origin_sequence,
+            .timestamp_ms = event.timestamp_ms,
+            .operation = event.operation,
+            .key = event.key,
+            .session_id = event.session_id,
+            .category = event.category,
+            .content = event.content,
+        });
+    }
+
+    const theme = (try replica_mem.getScoped(std.testing.allocator, "preferences.theme", null)).?;
+    defer theme.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("dark", theme.content);
+
+    const style = try replica_mem.getScoped(std.testing.allocator, "preferences.style", "sess-1");
+    defer if (style) |entry| entry.deinit(std.testing.allocator);
+    try std.testing.expect(style == null);
+
+    for (events) |event| {
+        try replica_mem.applyEvent(.{
+            .origin_instance_id = event.origin_instance_id,
+            .origin_sequence = event.origin_sequence,
+            .timestamp_ms = event.timestamp_ms,
+            .operation = event.operation,
+            .key = event.key,
+            .session_id = event.session_id,
+            .category = event.category,
+            .content = event.content,
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 1), try replica_mem.count());
+    try std.testing.expectEqual(@as(u64, 3), try replica_mem.lastEventSequence());
+}
+
+test "sqlite tombstones block older cross-origin put replay" {
+    var mem = try SqliteMemory.initWithInstanceId(std.testing.allocator, ":memory:", "replica");
+    defer mem.deinit();
+    const memory = mem.memory();
+
+    try memory.applyEvent(.{
+        .origin_instance_id = "agent-delete",
+        .origin_sequence = 1,
+        .timestamp_ms = 2000,
+        .operation = .delete_all,
+        .key = "preferences.locale",
+    });
+    try memory.applyEvent(.{
+        .origin_instance_id = "agent-put",
+        .origin_sequence = 1,
+        .timestamp_ms = 1000,
+        .operation = .put,
+        .key = "preferences.locale",
+        .category = .core,
+        .content = "ru",
+    });
+
+    const entry = try memory.getScoped(std.testing.allocator, "preferences.locale", null);
+    defer if (entry) |value| value.deinit(std.testing.allocator);
+    try std.testing.expect(entry == null);
 }

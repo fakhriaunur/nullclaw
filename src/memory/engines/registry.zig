@@ -271,6 +271,7 @@ pub fn resolvePaths(
     allocator: std.mem.Allocator,
     desc: *const BackendDescriptor,
     workspace_dir: []const u8,
+    instance_id: []const u8,
     postgres_cfg: ?config_types.MemoryPostgresConfig,
     redis_cfg: ?config_types.MemoryRedisConfig,
     api_cfg: ?config_types.MemoryApiConfig,
@@ -305,6 +306,7 @@ pub fn resolvePaths(
         .redis_config = redis_cfg,
         .api_config = api_cfg,
         .clickhouse_config = clickhouse_cfg,
+        .instance_id = instance_id,
     };
 }
 
@@ -317,7 +319,7 @@ fn createHybrid(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstan
 fn createSqlite(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     const impl_ = try allocator.create(root.SqliteMemory);
     errdefer allocator.destroy(impl_);
-    impl_.* = try root.SqliteMemory.init(allocator, cfg.db_path.?);
+    impl_.* = try root.SqliteMemory.initWithInstanceId(allocator, cfg.db_path.?, cfg.instance_id);
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
 }
@@ -338,9 +340,9 @@ fn createLucid(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstanc
     return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
 }
 
-fn createMemoryLru(allocator: std.mem.Allocator, _: BackendConfig) !BackendInstance {
+fn createMemoryLru(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     const impl_ = try allocator.create(memory_lru.InMemoryLruMemory);
-    impl_.* = memory_lru.InMemoryLruMemory.init(allocator, 1000);
+    impl_.* = try memory_lru.InMemoryLruMemory.initWithInstanceId(allocator, 1000, cfg.instance_id);
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = null };
 }
@@ -639,7 +641,7 @@ test "resolvePaths sqlite has db_path" {
         return;
     }
     const desc = findBackend("sqlite") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "", null, null, null, null);
     defer if (cfg.db_path) |p| std.testing.allocator.free(std.mem.span(p));
 
     try std.testing.expect(cfg.db_path != null);
@@ -654,7 +656,7 @@ test "resolvePaths markdown has no db_path" {
         return;
     }
     const desc = findBackend("markdown") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "", null, null, null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
@@ -666,7 +668,7 @@ test "resolvePaths none has no db_path" {
         return;
     }
     const desc = findBackend("none") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null, null);
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "", null, null, null, null);
 
     try std.testing.expect(cfg.db_path == null);
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
@@ -708,7 +710,7 @@ test "resolvePaths redis config is preserved" {
         return;
     }
     const desc = findBackend("redis") orelse return error.TestUnexpectedResult;
-    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, .{
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "", null, .{
         .host = "10.10.10.10",
         .port = 6380,
         .password = "pw",

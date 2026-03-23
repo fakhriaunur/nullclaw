@@ -94,10 +94,12 @@ const PostgresMemoryImpl = struct {
     // Pre-built query templates
     q_store: []const u8,
     q_get: []const u8,
+    q_get_scoped: []const u8,
     q_list_cat: []const u8,
     q_list_all: []const u8,
     q_recall: []const u8,
     q_forget: []const u8,
+    q_forget_scoped: []const u8,
     q_count: []const u8,
     q_save_msg: []const u8,
     q_load_msgs: []const u8,
@@ -141,10 +143,12 @@ const PostgresMemoryImpl = struct {
             .instance_id = instance_id,
             .q_store = undefined,
             .q_get = undefined,
+            .q_get_scoped = undefined,
             .q_list_cat = undefined,
             .q_list_all = undefined,
             .q_recall = undefined,
             .q_forget = undefined,
+            .q_forget_scoped = undefined,
             .q_count = undefined,
             .q_save_msg = undefined,
             .q_load_msgs = undefined,
@@ -165,14 +169,22 @@ const PostgresMemoryImpl = struct {
 
         // Build query templates
         // instance_id filtering is always included; empty string matches the default column value.
-        self_.q_store = try buildQuery(allocator, "INSERT INTO {schema}.{table} (id, key, content, category, session_id, instance_id, created_at, updated_at) " ++
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) " ++
-            "ON CONFLICT (key, instance_id) DO UPDATE SET content = EXCLUDED.content, category = EXCLUDED.category, " ++
-            "session_id = EXCLUDED.session_id, updated_at = EXCLUDED.updated_at", schema_q, table_q);
+        self_.q_store = try buildQuery(allocator,
+            "WITH deleted AS (" ++
+                "DELETE FROM {schema}.{table} WHERE key = $2 AND instance_id = $6 AND ((session_id IS NULL AND $5 IS NULL) OR session_id = $5)" ++
+            ") " ++
+            "INSERT INTO {schema}.{table} (id, key, content, category, session_id, instance_id, created_at, updated_at) " ++
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            schema_q,
+            table_q,
+        );
         errdefer allocator.free(self_.q_store);
 
-        self_.q_get = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE key = $1 AND instance_id = $2", schema_q, table_q);
+        self_.q_get = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE key = $1 AND session_id IS NULL AND instance_id = $2 LIMIT 1", schema_q, table_q);
         errdefer allocator.free(self_.q_get);
+
+        self_.q_get_scoped = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE key = $1 AND ((session_id IS NULL AND $2 IS NULL) OR session_id = $2) AND instance_id = $3 LIMIT 1", schema_q, table_q);
+        errdefer allocator.free(self_.q_get_scoped);
 
         self_.q_list_cat = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE category = $1 AND instance_id = $2 ORDER BY updated_at DESC", schema_q, table_q);
         errdefer allocator.free(self_.q_list_cat);
@@ -189,6 +201,9 @@ const PostgresMemoryImpl = struct {
 
         self_.q_forget = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key = $1 AND instance_id = $2", schema_q, table_q);
         errdefer allocator.free(self_.q_forget);
+
+        self_.q_forget_scoped = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key = $1 AND ((session_id IS NULL AND $2 IS NULL) OR session_id = $2) AND instance_id = $3", schema_q, table_q);
+        errdefer allocator.free(self_.q_forget_scoped);
 
         self_.q_count = try buildQuery(allocator, "SELECT COUNT(*) FROM {schema}.{table} WHERE instance_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_count);
@@ -273,10 +288,12 @@ const PostgresMemoryImpl = struct {
         c.PQfinish(self.conn);
         self.allocator.free(self.q_store);
         self.allocator.free(self.q_get);
+        self.allocator.free(self.q_get_scoped);
         self.allocator.free(self.q_list_cat);
         self.allocator.free(self.q_list_all);
         self.allocator.free(self.q_recall);
         self.allocator.free(self.q_forget);
+        self.allocator.free(self.q_forget_scoped);
         self.allocator.free(self.q_count);
         self.allocator.free(self.q_save_msg);
         self.allocator.free(self.q_load_msgs);
@@ -316,7 +333,8 @@ const PostgresMemoryImpl = struct {
             \\);
             \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
             \\DROP INDEX IF EXISTS {s}.idx_{s}_key;
-            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_{s}_key_instance ON {s}.{s}(key, instance_id);
+            \\DROP INDEX IF EXISTS {s}.idx_{s}_key_instance;
+            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_{s}_key_instance_session ON {s}.{s}(key, instance_id, COALESCE(session_id, '__global__'));
             \\CREATE INDEX IF NOT EXISTS idx_{s}_category ON {s}.{s}(category);
             \\CREATE INDEX IF NOT EXISTS idx_{s}_session ON {s}.{s}(session_id);
             \\CREATE INDEX IF NOT EXISTS idx_{s}_instance ON {s}.{s}(instance_id);
@@ -593,6 +611,30 @@ const PostgresMemoryImpl = struct {
         return try readEntryFromResult(allocator, result, 0);
     }
 
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+        const sid_z: ?[*:0]u8 = if (session_id) |sid| try allocator.dupeZ(u8, sid) else null;
+        defer if (sid_z) |sid| allocator.free(sid);
+        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        defer allocator.free(iid_z);
+
+        const params = [_]?[*:0]const u8{ key_z, sid_z, iid_z };
+        const lengths = [_]c_int{
+            @intCast(key.len),
+            if (session_id) |sid| @intCast(sid.len) else 0,
+            @intCast(self_.instance_id.len),
+        };
+
+        const result = try self_.execParams(self_.q_get_scoped, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return null;
+        return try readEntryFromResult(allocator, result, 0);
+    }
+
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -664,6 +706,32 @@ const PostgresMemoryImpl = struct {
         return !std.mem.eql(u8, affected_str, "0");
     }
 
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const key_z = try self_.allocator.dupeZ(u8, key);
+        defer self_.allocator.free(key_z);
+        const sid_z: ?[*:0]u8 = if (session_id) |sid| try self_.allocator.dupeZ(u8, sid) else null;
+        defer if (sid_z) |sid| self_.allocator.free(sid);
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
+
+        const params = [_]?[*:0]const u8{ key_z, sid_z, iid_z };
+        const lengths = [_]c_int{
+            @intCast(key.len),
+            if (session_id) |sid| @intCast(sid.len) else 0,
+            @intCast(self_.instance_id.len),
+        };
+
+        const result = try self_.execParams(self_.q_forget_scoped, &params, &lengths);
+        defer c.PQclear(result);
+
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return false;
+        const affected_str: []const u8 = std.mem.span(affected);
+        return !std.mem.eql(u8, affected_str, "0");
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -702,8 +770,10 @@ const PostgresMemoryImpl = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,

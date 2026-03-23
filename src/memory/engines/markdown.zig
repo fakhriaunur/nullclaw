@@ -1,10 +1,12 @@
 //! Markdown-based memory — plain files as source of truth.
 //!
 //! Layout:
-//!   workspace/MEMORY.md          — curated long-term memory (core)
-//!   workspace/memory/YYYY-MM-DD.md — daily logs (append-only)
+//!   workspace/MEMORY.md            — core memory
+//!   workspace/memory/<category>.md — non-core categories
 //!
-//! This backend is append-only: forget() is a no-op to preserve audit trail.
+//! Entries are stored as markdown bullets with inline metadata comments so the
+//! backend can preserve exact `(key, session_id)` semantics while staying human
+//! readable and easy to inspect.
 
 const std = @import("std");
 const fs_compat = @import("../../fs_compat.zig");
@@ -43,19 +45,29 @@ pub const MarkdownMemory = struct {
         return std.fmt.allocPrint(allocator, "{s}/memory", .{self.workspace_dir});
     }
 
-    fn dailyPath(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.timestamp();
-        const epoch: u64 = @intCast(ts);
-        const es = std.time.epoch.EpochSeconds{ .secs = epoch };
-        const day = es.getEpochDay().calculateYearDay();
-        const md = day.calculateMonthDay();
+    fn categoryFileStem(allocator: std.mem.Allocator, category: MemoryCategory) ![]u8 {
+        const raw = category.toString();
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
 
-        return std.fmt.allocPrint(allocator, "{s}/memory/{d:0>4}-{d:0>2}-{d:0>2}.md", .{
-            self.workspace_dir,
-            day.year,
-            @intFromEnum(md.month),
-            md.day_index + 1,
-        });
+        for (raw) |ch| {
+            if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.') {
+                try buf.append(allocator, ch);
+            } else {
+                try buf.append(allocator, '_');
+            }
+        }
+
+        if (buf.items.len == 0) try buf.appendSlice(allocator, "custom");
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn categoryPath(self: *const Self, allocator: std.mem.Allocator, category: MemoryCategory) ![]u8 {
+        if (category.eql(.core)) return self.corePath(allocator);
+
+        const stem = try categoryFileStem(allocator, category);
+        defer allocator.free(stem);
+        return std.fmt.allocPrint(allocator, "{s}/memory/{s}.md", .{ self.workspace_dir, stem });
     }
 
     fn ensureDir(path: []const u8) !void {
@@ -67,37 +79,155 @@ pub const MarkdownMemory = struct {
         }
     }
 
-    fn appendToFile(path: []const u8, content: []const u8, allocator: std.mem.Allocator) !void {
+    fn writeFileContents(path: []const u8, content: []const u8, allocator: std.mem.Allocator) !void {
         try ensureDir(path);
-
-        // Open (or create) without truncation and seek to end to append.
-        // This avoids the read-concat-rewrite pattern which loses data if
-        // the process crashes between truncation and write completion.
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true });
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true, .read = true });
         defer file.close();
+        _ = allocator;
+        try file.writeAll(content);
+        if (content.len == 0 or content[content.len - 1] != '\n') {
+            try file.writeAll("\n");
+        }
+    }
 
-        const stat = try fs_compat.stat(file);
-        const size = stat.size;
+    const ParsedMeta = struct {
+        category: MemoryCategory,
+        session_id: ?[]u8 = null,
 
-        try file.seekTo(size);
+        fn deinit(self: ParsedMeta, allocator: std.mem.Allocator) void {
+            if (self.session_id) |sid| allocator.free(sid);
+            switch (self.category) {
+                .custom => |name| allocator.free(name),
+                else => {},
+            }
+        }
+    };
 
-        // If the file already has content and doesn't end with a newline,
-        // prepend one to keep entries on separate lines.
-        if (size > 0) {
-            try file.seekTo(size - 1);
-            var last_byte: [1]u8 = undefined;
-            const n = try file.read(&last_byte);
-            if (n == 1 and last_byte[0] != '\n') {
-                try file.seekTo(size);
-                try file.writeAll("\n");
-            } else {
-                try file.seekTo(size);
+    fn parseMetaComment(meta: []const u8, fallback_category: MemoryCategory, allocator: std.mem.Allocator) !ParsedMeta {
+        var parsed = ParsedMeta{
+            .category = switch (fallback_category) {
+                .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+                else => fallback_category,
+            },
+            .session_id = null,
+        };
+        errdefer parsed.deinit(allocator);
+
+        var iter = std.mem.splitScalar(u8, meta, ';');
+        while (iter.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t");
+            const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+            const name = trimmed[0..eq];
+            const value = trimmed[eq + 1 ..];
+
+            if (std.mem.eql(u8, name, "category")) {
+                switch (parsed.category) {
+                    .custom => |existing| allocator.free(existing),
+                    else => {},
+                }
+                const cat = MemoryCategory.fromString(value);
+                parsed.category = switch (cat) {
+                    .custom => |custom_name| .{ .custom = try allocator.dupe(u8, custom_name) },
+                    else => cat,
+                };
+            } else if (std.mem.eql(u8, name, "session")) {
+                if (parsed.session_id) |sid| allocator.free(sid);
+                parsed.session_id = if (value.len > 0) try allocator.dupe(u8, value) else null;
             }
         }
 
-        const line = try std.fmt.allocPrint(allocator, "{s}\n", .{content});
-        defer allocator.free(line);
-        try file.writeAll(line);
+        return parsed;
+    }
+
+    fn sameSession(entry_session: ?[]const u8, target_session: ?[]const u8) bool {
+        if (entry_session == null and target_session == null) return true;
+        if (entry_session == null or target_session == null) return false;
+        return std.mem.eql(u8, entry_session.?, target_session.?);
+    }
+
+    fn serializeEntry(allocator: std.mem.Allocator, entry: MemoryEntry) ![]u8 {
+        return std.fmt.allocPrint(allocator, "- **{s}**: {s} <!-- nullclaw:category={s};session={s} -->", .{
+            entry.key,
+            entry.content,
+            entry.category.toString(),
+            entry.session_id orelse "",
+        });
+    }
+
+    fn clearManagedFiles(self: *Self, allocator: std.mem.Allocator) !void {
+        const core = try self.corePath(allocator);
+        defer allocator.free(core);
+        std.fs.deleteFileAbsolute(core) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+
+        const md = try self.memoryDir(allocator);
+        defer allocator.free(md);
+        if (std.fs.openDirAbsolute(md, .{ .iterate = true })) |*dir_handle| {
+            var dir = dir_handle.*;
+            defer dir.close();
+            var it = dir.iterate();
+            while (try it.next()) |entry| {
+                if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+                const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ md, entry.name });
+                defer allocator.free(path);
+                std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+            }
+        } else |_| {}
+    }
+
+    fn writeEntries(self: *Self, entries: []const MemoryEntry, allocator: std.mem.Allocator) !void {
+        const Group = struct {
+            path: []u8,
+            buffer: std.ArrayListUnmanaged(u8) = .empty,
+        };
+
+        var groups: std.ArrayListUnmanaged(Group) = .empty;
+        defer {
+            for (groups.items) |*group| {
+                allocator.free(group.path);
+                group.buffer.deinit(allocator);
+            }
+            groups.deinit(allocator);
+        }
+
+        try self.clearManagedFiles(allocator);
+        if (entries.len == 0) return;
+
+        for (entries) |entry| {
+            const path = try self.categoryPath(allocator, entry.category);
+            defer allocator.free(path);
+
+            var found_index: ?usize = null;
+            for (groups.items, 0..) |group, idx| {
+                if (std.mem.eql(u8, group.path, path)) {
+                    found_index = idx;
+                    break;
+                }
+            }
+
+            if (found_index == null) {
+                try groups.append(allocator, .{
+                    .path = try allocator.dupe(u8, path),
+                });
+                found_index = groups.items.len - 1;
+            }
+
+            const line = try serializeEntry(allocator, entry);
+            defer allocator.free(line);
+
+            var group = &groups.items[found_index.?];
+            if (group.buffer.items.len > 0) try group.buffer.append(allocator, '\n');
+            try group.buffer.appendSlice(allocator, line);
+        }
+
+        for (groups.items) |group| {
+            try writeFileContents(group.path, group.buffer.items, allocator);
+        }
     }
 
     fn parseEntries(text: []const u8, filename: []const u8, category: MemoryCategory, allocator: std.mem.Allocator) ![]MemoryEntry {
@@ -120,27 +250,60 @@ pub const MarkdownMemory = struct {
             else
                 trimmed;
 
+            const metadata_prefix = "<!-- nullclaw:";
+            const metadata_start = std.mem.indexOf(u8, clean, metadata_prefix);
+            const content_part = if (metadata_start) |idx|
+                std.mem.trimRight(u8, clean[0..idx], " \t")
+            else
+                clean;
+
+            var parsed_meta = ParsedMeta{
+                .category = switch (category) {
+                    .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+                    else => category,
+                },
+                .session_id = null,
+            };
+            errdefer parsed_meta.deinit(allocator);
+
+            if (metadata_start) |idx| {
+                const meta_with_suffix = clean[idx + metadata_prefix.len ..];
+                if (std.mem.indexOf(u8, meta_with_suffix, "-->")) |end_idx| {
+                    parsed_meta.deinit(allocator);
+                    parsed_meta = try parseMetaComment(meta_with_suffix[0..end_idx], category, allocator);
+                }
+            }
+
             const id = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ filename, line_idx });
             errdefer allocator.free(id);
-            const key = try allocator.dupe(u8, id);
+            const explicit_key = blk: {
+                if (!std.mem.startsWith(u8, content_part, "**")) break :blk null;
+                const rest = content_part[2..];
+                const suffix = std.mem.indexOf(u8, rest, "**:") orelse break :blk null;
+                if (suffix == 0) break :blk null;
+                break :blk rest[0..suffix];
+            };
+            const value_slice = if (explicit_key != null)
+                std.mem.trim(u8, content_part[(2 + explicit_key.?.len + 3)..], " \t")
+            else
+                content_part;
+
+            const key = try allocator.dupe(u8, explicit_key orelse id);
             errdefer allocator.free(key);
-            const content_dup = try allocator.dupe(u8, clean);
+            const content_dup = try allocator.dupe(u8, value_slice);
             errdefer allocator.free(content_dup);
             const timestamp = try allocator.dupe(u8, filename);
             errdefer allocator.free(timestamp);
-
-            const cat = switch (category) {
-                .custom => |name| MemoryCategory{ .custom = try allocator.dupe(u8, name) },
-                else => category,
-            };
 
             try entries.append(allocator, MemoryEntry{
                 .id = id,
                 .key = key,
                 .content = content_dup,
-                .category = cat,
+                .category = parsed_meta.category,
                 .timestamp = timestamp,
+                .session_id = parsed_meta.session_id,
             });
+            parsed_meta = .{ .category = .core, .session_id = null };
 
             line_idx += 1;
         }
@@ -204,7 +367,8 @@ pub const MarkdownMemory = struct {
                 if (fs_compat.readFileAlloc(std.fs.cwd(), allocator, fpath, 1024 * 1024)) |content| {
                     defer allocator.free(content);
                     const fname = entry.name[0 .. entry.name.len - 3];
-                    const entries = try parseEntries(content, fname, .daily, allocator);
+                    const inferred_category = MemoryCategory.fromString(fname);
+                    const entries = try parseEntries(content, fname, inferred_category, allocator);
                     defer allocator.free(entries);
                     for (entries) |e| try all.append(allocator, e);
                 } else |_| {}
@@ -220,21 +384,70 @@ pub const MarkdownMemory = struct {
         return "markdown";
     }
 
-    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, _: ?[]const u8) anyerror!void {
+    fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-        const entry_text = try std.fmt.allocPrint(self_.allocator, "- **{s}**: {s}", .{ key, content });
-        defer self_.allocator.free(entry_text);
+        var entries = try self_.readAllEntries(self_.allocator);
+        defer root.freeEntries(self_.allocator, entries);
 
-        const path = switch (category) {
-            .core => try self_.corePath(self_.allocator),
-            else => try self_.dailyPath(self_.allocator),
-        };
-        defer self_.allocator.free(path);
+        var updated = false;
+        for (entries) |*entry| {
+            if (!std.mem.eql(u8, entry.key, key)) continue;
+            if (!sameSession(entry.session_id, session_id)) continue;
 
-        try appendToFile(path, entry_text, self_.allocator);
+            self_.allocator.free(entry.content);
+            entry.content = try self_.allocator.dupe(u8, content);
+            self_.allocator.free(entry.timestamp);
+            entry.timestamp = try std.fmt.allocPrint(self_.allocator, "{d}", .{std.time.timestamp()});
+            if (entry.session_id) |sid| self_.allocator.free(sid);
+            entry.session_id = if (session_id) |sid| try self_.allocator.dupe(u8, sid) else null;
+            switch (entry.category) {
+                .custom => |name| self_.allocator.free(name),
+                else => {},
+            }
+            entry.category = switch (category) {
+                .custom => |name| .{ .custom = try self_.allocator.dupe(u8, name) },
+                else => category,
+            };
+            updated = true;
+            break;
+        }
+
+        if (!updated) {
+            const id = try std.fmt.allocPrint(self_.allocator, "md:{d}", .{std.time.nanoTimestamp()});
+            errdefer self_.allocator.free(id);
+            const stored_key = try self_.allocator.dupe(u8, key);
+            errdefer self_.allocator.free(stored_key);
+            const stored_content = try self_.allocator.dupe(u8, content);
+            errdefer self_.allocator.free(stored_content);
+            const timestamp = try std.fmt.allocPrint(self_.allocator, "{d}", .{std.time.timestamp()});
+            errdefer self_.allocator.free(timestamp);
+            const stored_category: MemoryCategory = switch (category) {
+                .custom => |name| .{ .custom = try self_.allocator.dupe(u8, name) },
+                else => category,
+            };
+            errdefer switch (stored_category) {
+                .custom => |name| self_.allocator.free(name),
+                else => {},
+            };
+            const stored_session = if (session_id) |sid| try self_.allocator.dupe(u8, sid) else null;
+            errdefer if (stored_session) |sid| self_.allocator.free(sid);
+
+            const new_entries = try self_.allocator.realloc(entries, entries.len + 1);
+            entries = new_entries;
+            entries[entries.len - 1] = .{
+                .id = id,
+                .key = stored_key,
+                .content = stored_content,
+                .category = stored_category,
+                .timestamp = timestamp,
+                .session_id = stored_session,
+            };
+        }
+
+        try self_.writeEntries(entries, self_.allocator);
     }
 
-    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, _: ?[]const u8) anyerror![]MemoryEntry {
+    fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
         const all = try self_.readAllEntries(allocator);
@@ -261,12 +474,19 @@ pub const MarkdownMemory = struct {
 
         for (all) |*entry_ptr| {
             var entry = entry_ptr.*;
+            if (!sameSession(entry.session_id, session_id)) {
+                @constCast(entry_ptr).deinit(allocator);
+                continue;
+            }
             const content_lower = try std.ascii.allocLowerString(allocator, entry.content);
             defer allocator.free(content_lower);
+            const key_lower = try std.ascii.allocLowerString(allocator, entry.key);
+            defer allocator.free(key_lower);
 
             var matched: usize = 0;
             for (keywords.items) |kw| {
                 if (std.mem.indexOf(u8, content_lower, kw) != null) matched += 1;
+                if (std.mem.indexOf(u8, key_lower, kw) != null) matched += 1;
             }
 
             if (matched > 0) {
@@ -301,25 +521,15 @@ pub const MarkdownMemory = struct {
         var found: ?MemoryEntry = null;
         for (all) |*entry_ptr| {
             const entry = entry_ptr.*;
-            const matches = blk: {
-                if (std.mem.eql(u8, entry.key, key)) break :blk true;
-
-                const trimmed = std.mem.trim(u8, entry.content, " \t\r");
-                if (std.mem.startsWith(u8, trimmed, "**")) {
-                    const rest = trimmed[2..];
-                    if (std.mem.indexOf(u8, rest, "**:")) |suffix| {
-                        if (suffix > 0 and std.mem.eql(u8, rest[0..suffix], key)) {
-                            break :blk true;
-                        }
-                    }
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.session_id == null) {
+                    if (found) |*prev| prev.deinit(allocator);
+                    found = entry;
+                } else if (found == null) {
+                    found = entry;
+                } else {
+                    @constCast(entry_ptr).deinit(allocator);
                 }
-
-                break :blk std.mem.indexOf(u8, entry.content, key) != null;
-            };
-
-            if (matches) {
-                if (found) |*prev| prev.deinit(allocator);
-                found = entry;
             } else {
                 @constCast(entry_ptr).deinit(allocator);
             }
@@ -328,20 +538,46 @@ pub const MarkdownMemory = struct {
         return found;
     }
 
-    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, _: ?[]const u8) anyerror!?MemoryEntry {
-        return implGet(ptr, allocator, key);
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const all = try self_.readAllEntries(allocator);
+        defer allocator.free(all);
+
+        var found: ?MemoryEntry = null;
+        for (all) |*entry_ptr| {
+            if (std.mem.eql(u8, entry_ptr.key, key) and sameSession(entry_ptr.session_id, session_id)) {
+                if (found) |*prev| prev.deinit(allocator);
+                found = entry_ptr.*;
+            } else {
+                @constCast(entry_ptr).deinit(allocator);
+            }
+        }
+
+        return found;
     }
 
-    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
+    fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
         const all = try self_.readAllEntries(allocator);
         defer allocator.free(all);
 
         if (category == null) {
-            const result = try allocator.alloc(MemoryEntry, all.len);
-            @memcpy(result, all);
-            return result;
+            var filtered_all: std.ArrayList(MemoryEntry) = .empty;
+            errdefer {
+                for (filtered_all.items) |*e| e.deinit(allocator);
+                filtered_all.deinit(allocator);
+            }
+
+            for (all) |*entry_ptr| {
+                if (sameSession(entry_ptr.session_id, session_id)) {
+                    try filtered_all.append(allocator, entry_ptr.*);
+                } else {
+                    @constCast(entry_ptr).deinit(allocator);
+                }
+            }
+
+            return filtered_all.toOwnedSlice(allocator);
         }
 
         var filtered: std.ArrayList(MemoryEntry) = .empty;
@@ -352,7 +588,7 @@ pub const MarkdownMemory = struct {
 
         for (all) |*entry_ptr| {
             var entry = entry_ptr.*;
-            if (entry.category.eql(category.?)) {
+            if (entry.category.eql(category.?) and sameSession(entry.session_id, session_id)) {
                 try filtered.append(allocator, entry);
             } else {
                 @constCast(entry_ptr).deinit(allocator);
@@ -362,12 +598,72 @@ pub const MarkdownMemory = struct {
         return filtered.toOwnedSlice(allocator);
     }
 
-    fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
-        return false;
+    fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const all = try self_.readAllEntries(self_.allocator);
+        defer root.freeEntries(self_.allocator, all);
+
+        var kept: std.ArrayListUnmanaged(MemoryEntry) = .empty;
+        defer {
+            for (kept.items) |*entry| entry.deinit(self_.allocator);
+            kept.deinit(self_.allocator);
+        }
+
+        var deleted = false;
+        for (all) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                deleted = true;
+                continue;
+            }
+            try kept.append(self_.allocator, .{
+                .id = try self_.allocator.dupe(u8, entry.id),
+                .key = try self_.allocator.dupe(u8, entry.key),
+                .content = try self_.allocator.dupe(u8, entry.content),
+                .category = switch (entry.category) {
+                    .custom => |name| .{ .custom = try self_.allocator.dupe(u8, name) },
+                    else => entry.category,
+                },
+                .timestamp = try self_.allocator.dupe(u8, entry.timestamp),
+                .session_id = if (entry.session_id) |sid| try self_.allocator.dupe(u8, sid) else null,
+            });
+        }
+
+        if (deleted) try self_.writeEntries(kept.items, self_.allocator);
+        return deleted;
     }
 
-    fn implForgetScoped(_: *anyopaque, _: []const u8, _: ?[]const u8) anyerror!bool {
-        return false;
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const all = try self_.readAllEntries(self_.allocator);
+        defer root.freeEntries(self_.allocator, all);
+
+        var kept: std.ArrayListUnmanaged(MemoryEntry) = .empty;
+        defer {
+            for (kept.items) |*entry| entry.deinit(self_.allocator);
+            kept.deinit(self_.allocator);
+        }
+
+        var deleted = false;
+        for (all) |entry| {
+            if (std.mem.eql(u8, entry.key, key) and sameSession(entry.session_id, session_id)) {
+                deleted = true;
+                continue;
+            }
+            try kept.append(self_.allocator, .{
+                .id = try self_.allocator.dupe(u8, entry.id),
+                .key = try self_.allocator.dupe(u8, entry.key),
+                .content = try self_.allocator.dupe(u8, entry.content),
+                .category = switch (entry.category) {
+                    .custom => |name| .{ .custom = try self_.allocator.dupe(u8, name) },
+                    else => entry.category,
+                },
+                .timestamp = try self_.allocator.dupe(u8, entry.timestamp),
+                .session_id = if (entry.session_id) |sid| try self_.allocator.dupe(u8, sid) else null,
+            });
+        }
+
+        if (deleted) try self_.writeEntries(kept.items, self_.allocator);
+        return deleted;
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -418,15 +714,23 @@ pub const MarkdownMemory = struct {
 
 // ── Tests ──────────────────────────────────────────────────────────
 
-test "markdown forget always returns false" {
-    var mem = try MarkdownMemory.init(std.testing.allocator, "/tmp/nullclaw-test-md-forget");
+test "markdown forget removes matching entry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
     defer mem.deinit();
     const m = mem.memory();
 
-    // Multiple forget calls all return false
-    try std.testing.expect(!(try m.forget("key1")));
-    try std.testing.expect(!(try m.forget("key2")));
-    try std.testing.expect(!(try m.forget("")));
+    try m.store("key1", "value1", .core, null);
+    try m.store("key2", "value2", .core, "sess-a");
+
+    try std.testing.expect(try m.forgetScoped(std.testing.allocator, "key2", "sess-a"));
+    try std.testing.expect((try m.getScoped(std.testing.allocator, "key2", "sess-a")) == null);
+    try std.testing.expect(try m.forget("key1"));
+    try std.testing.expect((try m.getScoped(std.testing.allocator, "key1", null)) == null);
 }
 
 test "markdown parseEntries skips empty lines" {
@@ -503,7 +807,7 @@ test "markdown parseEntries preserves category" {
     try std.testing.expect(entries[0].category.eql(.daily));
 }
 
-test "markdown accepts session_id param" {
+test "markdown persists exact session_id namespaces" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
@@ -513,8 +817,8 @@ test "markdown accepts session_id param" {
     defer mem.deinit();
     const m = mem.memory();
 
-    // session_id is accepted but ignored by markdown backend
     try m.store("sess_key", "session data", .core, "session-123");
+    try m.store("sess_key", "global data", .core, null);
 
     const recalled = try m.recall(std.testing.allocator, "session", 10, "session-123");
     defer {
@@ -522,11 +826,18 @@ test "markdown accepts session_id param" {
         std.testing.allocator.free(recalled);
     }
 
+    try std.testing.expectEqual(@as(usize, 1), recalled.len);
+    try std.testing.expect(recalled[0].session_id != null);
+    try std.testing.expectEqualStrings("session-123", recalled[0].session_id.?);
+
     const listed = try m.list(std.testing.allocator, null, "session-123");
     defer {
         for (listed) |*e| e.deinit(std.testing.allocator);
         std.testing.allocator.free(listed);
     }
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expect(listed[0].session_id != null);
+    try std.testing.expectEqualStrings("session-123", listed[0].session_id.?);
 }
 
 test "markdown getScoped returns entry inside isolated workspace" {
@@ -543,7 +854,8 @@ test "markdown getScoped returns entry inside isolated workspace" {
 
     const entry = (try m.getScoped(std.testing.allocator, "scoped_key", "session-123")).?;
     defer entry.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, entry.content, "session data") != null);
+    try std.testing.expectEqualStrings("session data", entry.content);
+    try std.testing.expectEqualStrings("session-123", entry.session_id.?);
 }
 
 test "markdown reads memory.md when MEMORY.md is absent" {

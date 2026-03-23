@@ -632,8 +632,8 @@ const ClickHouseMemoryImpl = struct {
             \\        argMax(updated_at, tuple(version, id)) AS updated_at,
             \\        argMax(session_id, tuple(version, id)) AS session_id
             \\    FROM {s}.{s}
-            \\    WHERE key = {{key:String}} AND instance_id = {{iid:String}}
-            \\    GROUP BY key
+            \\    WHERE key = {{key:String}} AND instance_id = {{iid:String}} AND session_id = ''
+            \\    GROUP BY key, session_id
             \\)
             \\LIMIT 1
         , .{ self_.db_q, self_.table_q });
@@ -642,6 +642,42 @@ const ClickHouseMemoryImpl = struct {
         const body = try self_.executeQuery(allocator, query, &.{
             .{ "key", key },
             .{ "iid", self_.instance_id },
+        });
+        defer allocator.free(body);
+
+        const rows = try parseTsvRows(allocator, body);
+        defer freeTsvRows(allocator, rows);
+
+        if (rows.len == 0) return null;
+        return try buildEntry(allocator, rows[0]);
+    }
+
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const scoped_sid = session_id orelse "";
+
+        const query = try std.fmt.allocPrint(allocator,
+            \\SELECT id, key, content, category, toString(updated_at), session_id
+            \\FROM (
+            \\    SELECT
+            \\        argMax(id, tuple(version, id)) AS id,
+            \\        key,
+            \\        argMax(content, tuple(version, id)) AS content,
+            \\        argMax(category, tuple(version, id)) AS category,
+            \\        argMax(updated_at, tuple(version, id)) AS updated_at,
+            \\        argMax(session_id, tuple(version, id)) AS session_id
+            \\    FROM {s}.{s}
+            \\    WHERE key = {{key:String}} AND instance_id = {{iid:String}} AND session_id = {{sid:String}}
+            \\    GROUP BY key, session_id
+            \\)
+            \\LIMIT 1
+        , .{ self_.db_q, self_.table_q });
+        defer allocator.free(query);
+
+        const body = try self_.executeQuery(allocator, query, &.{
+            .{ "key", key },
+            .{ "iid", self_.instance_id },
+            .{ "sid", scoped_sid },
         });
         defer allocator.free(body);
 
@@ -683,7 +719,7 @@ const ClickHouseMemoryImpl = struct {
                 \\        argMax(session_id, tuple(version, id)) AS session_id
                 \\    FROM {s}.{s}
                 \\    WHERE instance_id = {{iid:String}}
-                \\    GROUP BY key
+                \\    GROUP BY key, session_id
                 \\)
                 \\WHERE (key ILIKE {{q:String}} OR content ILIKE {{q:String}})
                 \\  AND session_id = {{sid:String}}
@@ -712,7 +748,7 @@ const ClickHouseMemoryImpl = struct {
                 \\        argMax(session_id, tuple(version, id)) AS session_id
                 \\    FROM {s}.{s}
                 \\    WHERE instance_id = {{iid:String}}
-                \\    GROUP BY key
+                \\    GROUP BY key, session_id
                 \\)
                 \\WHERE (key ILIKE {{q:String}} OR content ILIKE {{q:String}})
                 \\ORDER BY score DESC, updated_at DESC, id DESC
@@ -779,7 +815,7 @@ const ClickHouseMemoryImpl = struct {
                     \\        argMax(session_id, tuple(version, id)) AS session_id
                     \\    FROM {s}.{s}
                     \\    WHERE instance_id = {{iid:String}}
-                    \\    GROUP BY key
+                    \\    GROUP BY key, session_id
                     \\)
                     \\WHERE category = {{cat:String}} AND session_id = {{sid:String}}
                     \\ORDER BY updated_at DESC, id DESC
@@ -801,7 +837,7 @@ const ClickHouseMemoryImpl = struct {
                     \\        argMax(session_id, tuple(version, id)) AS session_id
                     \\    FROM {s}.{s}
                     \\    WHERE instance_id = {{iid:String}}
-                    \\    GROUP BY key
+                    \\    GROUP BY key, session_id
                     \\)
                     \\WHERE category = {{cat:String}}
                     \\ORDER BY updated_at DESC, id DESC
@@ -822,7 +858,7 @@ const ClickHouseMemoryImpl = struct {
                 \\        argMax(session_id, tuple(version, id)) AS session_id
                 \\    FROM {s}.{s}
                 \\    WHERE instance_id = {{iid:String}}
-                \\    GROUP BY key
+                \\    GROUP BY key, session_id
                 \\)
                 \\WHERE session_id = {{sid:String}}
                 \\ORDER BY updated_at DESC, id DESC
@@ -842,7 +878,7 @@ const ClickHouseMemoryImpl = struct {
                 \\        argMax(session_id, tuple(version, id)) AS session_id
                 \\    FROM {s}.{s}
                 \\    WHERE instance_id = {{iid:String}}
-                \\    GROUP BY key
+                \\    GROUP BY key, session_id
                 \\)
                 \\ORDER BY updated_at DESC, id DESC
             , .{ self_.db_q, self_.table_q });
@@ -904,16 +940,52 @@ const ClickHouseMemoryImpl = struct {
         return true;
     }
 
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const scoped_sid = session_id orelse "";
+
+        const count_query = try std.fmt.allocPrint(self_.allocator,
+            \\SELECT count() FROM {s}.{s}
+            \\WHERE key = {{key:String}} AND session_id = {{sid:String}} AND instance_id = {{iid:String}}
+        , .{ self_.db_q, self_.table_q });
+        defer self_.allocator.free(count_query);
+
+        const count_body = try self_.executeQuery(self_.allocator, count_query, &.{
+            .{ "key", key },
+            .{ "sid", scoped_sid },
+            .{ "iid", self_.instance_id },
+        });
+        defer self_.allocator.free(count_body);
+
+        const count_trimmed = std.mem.trim(u8, count_body, " \t\n\r");
+        const count = std.fmt.parseInt(usize, count_trimmed, 10) catch 0;
+        if (count == 0) return false;
+
+        const delete_query = try std.fmt.allocPrint(self_.allocator,
+            \\ALTER TABLE {s}.{s} DELETE
+            \\WHERE key = {{key:String}} AND session_id = {{sid:String}} AND instance_id = {{iid:String}}
+        , .{ self_.db_q, self_.table_q });
+        defer self_.allocator.free(delete_query);
+
+        try self_.executeMutation(delete_query, &.{
+            .{ "key", key },
+            .{ "sid", scoped_sid },
+            .{ "iid", self_.instance_id },
+        });
+
+        return true;
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
         const query = try std.fmt.allocPrint(self_.allocator,
             \\SELECT count()
             \\FROM (
-            \\    SELECT key
+            \\    SELECT key, session_id
             \\    FROM {s}.{s}
             \\    WHERE instance_id = {{iid:String}}
-            \\    GROUP BY key
+            \\    GROUP BY key, session_id
             \\)
         , .{ self_.db_q, self_.table_q });
         defer self_.allocator.free(query);
@@ -945,8 +1017,10 @@ const ClickHouseMemoryImpl = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,

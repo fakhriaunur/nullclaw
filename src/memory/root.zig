@@ -331,6 +331,77 @@ pub fn freeEntries(allocator: std.mem.Allocator, entries: []MemoryEntry) void {
     allocator.free(entries);
 }
 
+pub const MemoryEventOp = enum {
+    put,
+    delete_scoped,
+    delete_all,
+
+    pub fn toString(self: MemoryEventOp) []const u8 {
+        return switch (self) {
+            .put => "put",
+            .delete_scoped => "delete_scoped",
+            .delete_all => "delete_all",
+        };
+    }
+
+    pub fn fromString(value: []const u8) ?MemoryEventOp {
+        if (std.mem.eql(u8, value, "put")) return .put;
+        if (std.mem.eql(u8, value, "delete_scoped")) return .delete_scoped;
+        if (std.mem.eql(u8, value, "delete_all")) return .delete_all;
+        return null;
+    }
+};
+
+pub const MemoryEvent = struct {
+    schema_version: u32 = 1,
+    sequence: u64,
+    origin_instance_id: []const u8,
+    origin_sequence: u64,
+    timestamp_ms: i64,
+    operation: MemoryEventOp,
+    key: []const u8,
+    session_id: ?[]const u8 = null,
+    category: ?MemoryCategory = null,
+    content: ?[]const u8 = null,
+
+    pub fn deinit(self: *const MemoryEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.origin_instance_id);
+        allocator.free(self.key);
+        if (self.session_id) |sid| allocator.free(sid);
+        if (self.content) |content| allocator.free(content);
+        if (self.category) |category| switch (category) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        };
+    }
+};
+
+pub fn freeEvents(allocator: std.mem.Allocator, events: []MemoryEvent) void {
+    for (events) |*event| event.deinit(allocator);
+    allocator.free(events);
+}
+
+pub const MemoryEventInput = struct {
+    origin_instance_id: []const u8,
+    origin_sequence: u64,
+    timestamp_ms: i64,
+    operation: MemoryEventOp,
+    key: []const u8,
+    session_id: ?[]const u8 = null,
+    category: ?MemoryCategory = null,
+    content: ?[]const u8 = null,
+};
+
+pub const MemoryEventFeedInfo = struct {
+    instance_id: []const u8,
+    last_sequence: u64,
+    supports_compaction: bool = false,
+
+    pub fn deinit(self: *const MemoryEventFeedInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.instance_id);
+    }
+};
+
 pub const PromptBootstrapKeyPrefix = "__bootstrap.prompt.";
 
 pub const PromptBootstrapDoc = struct {
@@ -421,6 +492,10 @@ pub const Memory = struct {
         list: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry,
         forget: *const fn (ptr: *anyopaque, key: []const u8) anyerror!bool,
         forgetScoped: ?*const fn (ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool = null,
+        listEvents: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, after_sequence: u64, limit: usize) anyerror![]MemoryEvent = null,
+        applyEvent: ?*const fn (ptr: *anyopaque, input: MemoryEventInput) anyerror!void = null,
+        lastEventSequence: ?*const fn (ptr: *anyopaque) anyerror!u64 = null,
+        eventFeedInfo: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!MemoryEventFeedInfo = null,
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         healthCheck: *const fn (ptr: *anyopaque) bool,
         deinit: *const fn (ptr: *anyopaque) void,
@@ -487,6 +562,26 @@ pub const Memory = struct {
             return error.NotSupported;
         }
         return self.vtable.forget(self.ptr, key);
+    }
+
+    pub fn listEvents(self: Memory, allocator: std.mem.Allocator, after_sequence: u64, limit: usize) ![]MemoryEvent {
+        const func = self.vtable.listEvents orelse return error.NotSupported;
+        return func(self.ptr, allocator, after_sequence, limit);
+    }
+
+    pub fn applyEvent(self: Memory, input: MemoryEventInput) !void {
+        const func = self.vtable.applyEvent orelse return error.NotSupported;
+        return func(self.ptr, input);
+    }
+
+    pub fn lastEventSequence(self: Memory) !u64 {
+        const func = self.vtable.lastEventSequence orelse return error.NotSupported;
+        return func(self.ptr);
+    }
+
+    pub fn eventFeedInfo(self: Memory, allocator: std.mem.Allocator) !MemoryEventFeedInfo {
+        const func = self.vtable.eventFeedInfo orelse return error.NotSupported;
+        return func(self.ptr, allocator);
     }
 
     pub fn count(self: Memory) !usize {
@@ -886,7 +981,7 @@ pub fn initRuntime(
     const redis_cfg: ?config_types.MemoryRedisConfig = if (std.mem.eql(u8, config.backend, "redis")) config.redis else null;
     const api_cfg: ?config_types.MemoryApiConfig = if (std.mem.eql(u8, config.backend, "api")) config.api else null;
     const clickhouse_cfg: ?config_types.MemoryClickHouseConfig = if (std.mem.eql(u8, config.backend, "clickhouse")) config.clickhouse else null;
-    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, pg_cfg, redis_cfg, api_cfg, clickhouse_cfg) catch |err| {
+    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, config.instance_id, pg_cfg, redis_cfg, api_cfg, clickhouse_cfg) catch |err| {
         log.warn("memory path resolution failed for backend '{s}': {}", .{ config.backend, err });
         return null;
     };

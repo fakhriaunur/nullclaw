@@ -812,6 +812,21 @@ pub const ApiMemory = struct {
         return parseSingleEntry(alloc, resp.body);
     }
 
+    fn implGetScoped(ptr: *anyopaque, alloc: Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        const url = try self.buildMemoryKeyUrlWithQuery(alloc, key, session_id);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .not_found) return null;
+        if (resp.status != .ok) return error.ApiRequestFailed;
+
+        return parseSingleEntry(alloc, resp.body);
+    }
+
     fn implList(ptr: *anyopaque, alloc: Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
@@ -898,6 +913,7 @@ pub const ApiMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
         .forgetScoped = &implForgetScoped,

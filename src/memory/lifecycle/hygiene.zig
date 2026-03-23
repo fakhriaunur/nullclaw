@@ -414,7 +414,7 @@ test "runIfDue with markdown backend does not append hygiene marker twice inside
 
     _ = runIfDue(std.testing.allocator, cfg, mem, null);
     const after_first = try mem.count();
-    try std.testing.expectEqual(before + 1, after_first);
+    try std.testing.expectEqual(before, after_first);
 
     _ = runIfDue(std.testing.allocator, cfg, mem, null);
     const after_second = try mem.count();

@@ -97,7 +97,7 @@ pub const LanceDbMemory = struct {
         const sql =
             \\CREATE TABLE IF NOT EXISTS lancedb_memories (
             \\  id         TEXT PRIMARY KEY,
-            \\  key        TEXT UNIQUE NOT NULL,
+            \\  key        TEXT NOT NULL,
             \\  text       TEXT NOT NULL,
             \\  embedding  BLOB,
             \\  importance REAL DEFAULT 0.5,
@@ -109,6 +109,7 @@ pub const LanceDbMemory = struct {
             \\CREATE INDEX IF NOT EXISTS idx_lance_category ON lancedb_memories(category);
             \\CREATE INDEX IF NOT EXISTS idx_lance_session ON lancedb_memories(session_id);
             \\CREATE INDEX IF NOT EXISTS idx_lance_key ON lancedb_memories(key);
+            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_lance_key_session ON lancedb_memories(key, COALESCE(session_id, '__global__'));
         ;
         var err_msg: [*c]u8 = null;
         const rc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
@@ -248,7 +249,7 @@ pub const LanceDbMemory = struct {
         const now = try std.fmt.allocPrint(self_.allocator, "{d}", .{std.time.timestamp()});
         defer self_.allocator.free(now);
 
-        const sql = "INSERT INTO lancedb_memories (id, key, text, embedding, importance, category, created_at, updated_at, session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(key) DO UPDATE SET text=?3, embedding=?4, updated_at=?8";
+        const sql = "INSERT INTO lancedb_memories (id, key, text, embedding, importance, category, created_at, updated_at, session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(key, COALESCE(session_id, '__global__')) DO UPDATE SET text=?3, embedding=?4, importance=?5, category=?6, updated_at=?8";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -303,9 +304,9 @@ pub const LanceDbMemory = struct {
 
     fn vectorRecall(self_: *Self, db: *c.sqlite3, allocator: std.mem.Allocator, query_emb: []const f32, limit: usize, session_id: ?[]const u8) ![]MemoryEntry {
         const sql = if (session_id != null)
-            "SELECT key, text, category, created_at, embedding FROM lancedb_memories WHERE embedding IS NOT NULL AND session_id = ?1 ORDER BY created_at DESC LIMIT 1000"
+            "SELECT key, text, category, created_at, embedding, session_id FROM lancedb_memories WHERE embedding IS NOT NULL AND session_id = ?1 ORDER BY created_at DESC LIMIT 1000"
         else
-            "SELECT key, text, category, created_at, embedding FROM lancedb_memories WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 1000";
+            "SELECT key, text, category, created_at, embedding, session_id FROM lancedb_memories WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 1000";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -344,6 +345,7 @@ pub const LanceDbMemory = struct {
             const text_ptr = c.sqlite3_column_text(stmt, 1);
             const cat_ptr = c.sqlite3_column_text(stmt, 2);
             const ts_ptr = c.sqlite3_column_text(stmt, 3);
+            const sid_ptr = c.sqlite3_column_text(stmt, 5);
 
             if (key_ptr == null or text_ptr == null) continue;
 
@@ -356,6 +358,11 @@ pub const LanceDbMemory = struct {
             const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
             errdefer allocator.free(timestamp);
             const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+            const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 5) > 0)
+                try allocator.dupe(u8, std.mem.span(sid_ptr))
+            else
+                null;
+            errdefer if (stored_sid) |sid| allocator.free(sid);
 
             try scored.append(allocator, .{
                 .entry = .{
@@ -364,7 +371,7 @@ pub const LanceDbMemory = struct {
                     .content = content,
                     .category = stringToCategory(cat_str),
                     .timestamp = timestamp,
-                    .session_id = null,
+                    .session_id = stored_sid,
                 },
                 .score = sim,
             });
@@ -400,9 +407,9 @@ pub const LanceDbMemory = struct {
         defer allocator.free(like_pattern);
 
         const sql = if (session_id != null)
-            "SELECT key, text, category, created_at FROM lancedb_memories WHERE (text LIKE ?1 OR key LIKE ?1) AND session_id = ?3 ORDER BY created_at DESC LIMIT ?2"
+            "SELECT key, text, category, created_at, session_id FROM lancedb_memories WHERE (text LIKE ?1 OR key LIKE ?1) AND session_id = ?3 ORDER BY created_at DESC LIMIT ?2"
         else
-            "SELECT key, text, category, created_at FROM lancedb_memories WHERE text LIKE ?1 OR key LIKE ?1 ORDER BY created_at DESC LIMIT ?2";
+            "SELECT key, text, category, created_at, session_id FROM lancedb_memories WHERE text LIKE ?1 OR key LIKE ?1 ORDER BY created_at DESC LIMIT ?2";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -429,6 +436,7 @@ pub const LanceDbMemory = struct {
             const text_ptr = c.sqlite3_column_text(stmt, 1);
             const cat_ptr = c.sqlite3_column_text(stmt, 2);
             const ts_ptr = c.sqlite3_column_text(stmt, 3);
+            const sid_ptr = c.sqlite3_column_text(stmt, 4);
 
             if (key_ptr == null or text_ptr == null) continue;
 
@@ -441,6 +449,11 @@ pub const LanceDbMemory = struct {
             const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
             errdefer allocator.free(timestamp);
             const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+            const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 4) > 0)
+                try allocator.dupe(u8, std.mem.span(sid_ptr))
+            else
+                null;
+            errdefer if (stored_sid) |sid| allocator.free(sid);
 
             try results.append(allocator, .{
                 .id = id,
@@ -448,7 +461,7 @@ pub const LanceDbMemory = struct {
                 .content = content,
                 .category = stringToCategory(cat_str),
                 .timestamp = timestamp,
-                .session_id = null,
+                .session_id = stored_sid,
             });
         }
 
@@ -463,7 +476,7 @@ pub const LanceDbMemory = struct {
         const key_z = try allocator.dupeZ(u8, key);
         defer allocator.free(key_z);
 
-        const sql = "SELECT key, text, category, created_at FROM lancedb_memories WHERE key = ?1";
+        const sql = "SELECT key, text, category, created_at, session_id FROM lancedb_memories WHERE key = ?1 AND session_id IS NULL LIMIT 1";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -475,6 +488,7 @@ pub const LanceDbMemory = struct {
             const text_ptr = c.sqlite3_column_text(stmt, 1);
             const cat_ptr = c.sqlite3_column_text(stmt, 2);
             const ts_ptr = c.sqlite3_column_text(stmt, 3);
+            const sid_ptr = c.sqlite3_column_text(stmt, 4);
 
             if (key_ptr == null or text_ptr == null) return null;
 
@@ -487,6 +501,11 @@ pub const LanceDbMemory = struct {
             const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
             errdefer allocator.free(timestamp);
             const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+            const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 4) > 0)
+                try allocator.dupe(u8, std.mem.span(sid_ptr))
+            else
+                null;
+            errdefer if (stored_sid) |sid| allocator.free(sid);
 
             return .{
                 .id = id,
@@ -494,11 +513,68 @@ pub const LanceDbMemory = struct {
                 .content = content,
                 .category = stringToCategory(cat_str),
                 .timestamp = timestamp,
-                .session_id = null,
+                .session_id = stored_sid,
             };
         }
 
         return null;
+    }
+
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const db = self_.db orelse return error.NotConnected;
+
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+
+        const sql = if (session_id != null)
+            "SELECT key, text, category, created_at, session_id FROM lancedb_memories WHERE key = ?1 AND session_id = ?2 LIMIT 1"
+        else
+            "SELECT key, text, category, created_at, session_id FROM lancedb_memories WHERE key = ?1 AND session_id IS NULL LIMIT 1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key_z.ptr, @intCast(key_z.len), SQLITE_STATIC);
+        var sid_z: ?[:0]u8 = null;
+        defer if (sid_z) |sid| allocator.free(sid);
+        if (session_id) |sid| {
+            sid_z = try allocator.dupeZ(u8, sid);
+            _ = c.sqlite3_bind_text(stmt, 2, sid_z.?.ptr, @intCast(sid_z.?.len), SQLITE_STATIC);
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+
+        const key_ptr = c.sqlite3_column_text(stmt, 0);
+        const text_ptr = c.sqlite3_column_text(stmt, 1);
+        const cat_ptr = c.sqlite3_column_text(stmt, 2);
+        const ts_ptr = c.sqlite3_column_text(stmt, 3);
+        const sid_ptr = c.sqlite3_column_text(stmt, 4);
+        if (key_ptr == null or text_ptr == null) return null;
+
+        const out_key = try allocator.dupe(u8, std.mem.span(key_ptr));
+        errdefer allocator.free(out_key);
+        const content = try allocator.dupe(u8, std.mem.span(text_ptr));
+        errdefer allocator.free(content);
+        const id = try allocator.dupe(u8, out_key);
+        errdefer allocator.free(id);
+        const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
+        errdefer allocator.free(timestamp);
+        const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+        const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 4) > 0)
+            try allocator.dupe(u8, std.mem.span(sid_ptr))
+        else
+            null;
+        errdefer if (stored_sid) |sid| allocator.free(sid);
+
+        return .{
+            .id = id,
+            .key = out_key,
+            .content = content,
+            .category = stringToCategory(cat_str),
+            .timestamp = timestamp,
+            .session_id = stored_sid,
+        };
     }
 
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
@@ -513,13 +589,13 @@ pub const LanceDbMemory = struct {
 
         // Build SQL with optional category and session_id filters
         const sql = if (category != null and session_id != null)
-            "SELECT key, text, category, created_at FROM lancedb_memories WHERE category = ?1 AND session_id = ?2 ORDER BY created_at DESC"
+            "SELECT key, text, category, created_at, session_id FROM lancedb_memories WHERE category = ?1 AND session_id = ?2 ORDER BY created_at DESC"
         else if (category != null)
-            "SELECT key, text, category, created_at FROM lancedb_memories WHERE category = ?1 ORDER BY created_at DESC"
+            "SELECT key, text, category, created_at, session_id FROM lancedb_memories WHERE category = ?1 ORDER BY created_at DESC"
         else if (session_id != null)
-            "SELECT key, text, category, created_at FROM lancedb_memories WHERE session_id = ?1 ORDER BY created_at DESC"
+            "SELECT key, text, category, created_at, session_id FROM lancedb_memories WHERE session_id = ?1 ORDER BY created_at DESC"
         else
-            "SELECT key, text, category, created_at FROM lancedb_memories ORDER BY created_at DESC";
+            "SELECT key, text, category, created_at, session_id FROM lancedb_memories ORDER BY created_at DESC";
 
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
@@ -551,6 +627,7 @@ pub const LanceDbMemory = struct {
             const text_ptr = c.sqlite3_column_text(stmt, 1);
             const cat_ptr = c.sqlite3_column_text(stmt, 2);
             const ts_ptr = c.sqlite3_column_text(stmt, 3);
+            const sid_ptr = c.sqlite3_column_text(stmt, 4);
 
             if (key_ptr == null or text_ptr == null) continue;
 
@@ -563,6 +640,11 @@ pub const LanceDbMemory = struct {
             const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
             errdefer allocator.free(timestamp);
             const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+            const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 4) > 0)
+                try allocator.dupe(u8, std.mem.span(sid_ptr))
+            else
+                null;
+            errdefer if (stored_sid) |sid| allocator.free(sid);
 
             try results.append(allocator, .{
                 .id = id,
@@ -570,7 +652,7 @@ pub const LanceDbMemory = struct {
                 .content = content,
                 .category = stringToCategory(cat_str),
                 .timestamp = timestamp,
-                .session_id = null,
+                .session_id = stored_sid,
             });
         }
 
@@ -590,6 +672,33 @@ pub const LanceDbMemory = struct {
         defer _ = c.sqlite3_finalize(stmt);
 
         _ = c.sqlite3_bind_text(stmt, 1, key_z.ptr, @intCast(key_z.len), SQLITE_STATIC);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
+        return c.sqlite3_changes(db) > 0;
+    }
+
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const db = self_.db orelse return error.NotConnected;
+
+        const key_z = try self_.allocator.dupeZ(u8, key);
+        defer self_.allocator.free(key_z);
+
+        const sql = if (session_id != null)
+            "DELETE FROM lancedb_memories WHERE key = ?1 AND session_id = ?2"
+        else
+            "DELETE FROM lancedb_memories WHERE key = ?1 AND session_id IS NULL";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key_z.ptr, @intCast(key_z.len), SQLITE_STATIC);
+        var sid_z: ?[:0]u8 = null;
+        defer if (sid_z) |sid| self_.allocator.free(sid);
+        if (session_id) |sid| {
+            sid_z = try self_.allocator.dupeZ(u8, sid);
+            _ = c.sqlite3_bind_text(stmt, 2, sid_z.?.ptr, @intCast(sid_z.?.len), SQLITE_STATIC);
+        }
 
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DeleteFailed;
         return c.sqlite3_changes(db) > 0;
@@ -628,8 +737,10 @@ pub const LanceDbMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
