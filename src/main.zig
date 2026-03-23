@@ -43,7 +43,7 @@ const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
-const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|forget";
+const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|put|delete|events|apply|drain-outbox|forget";
 const HISTORY_SUBCOMMANDS = "list|show";
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
 const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
@@ -999,11 +999,22 @@ fn printMemoryUsage() void {
         \\  reindex                       Rebuild vector index from primary memory
         \\  search <query> [--limit N] [--json]
         \\                                Run runtime retrieval (keyword/hybrid)
-        \\  get <key> [--json]            Show a single memory entry by key
-        \\  list [--category C] [--limit N] [--json]
+        \\  get <key> [--session-id ID] [--json]
+        \\                                Show a single memory entry by key
+        \\  list [--category C] [--session-id ID] [--limit N] [--json]
         \\                                List memory entries (default limit: 20)
+        \\  put <key> <content> [--category C] [--session-id ID]
+        \\                                Write/update a memory entry through the event journal
+        \\  delete <key> [--session-id ID]
+        \\                                Delete all entries for a key, or one scoped entry
+        \\  events [--after N] [--limit N] [--json|--ndjson|--status]
+        \\                                Show local event feed or feed status after compaction
+        \\  compact                       Write a checkpoint and truncate the local event journal
+        \\  rebuild                       Rebuild backend projection from checkpoint + journal state
+        \\  apply <ndjson_file>           Apply memory events from an NDJSON file
         \\  drain-outbox                  Drain durable vector outbox queue
-        \\  forget <key>                  Delete entry from primary memory (if backend supports)
+        \\  forget <key> [--session-id ID]
+        \\                                Alias for delete
         \\
     , .{MEMORY_SUBCOMMANDS}), .{});
 }
@@ -1036,6 +1047,10 @@ fn parsePositiveUsize(arg: []const u8) ?usize {
 
 fn parseNonNegativeUsize(arg: []const u8) ?usize {
     return std.fmt.parseInt(usize, arg, 10) catch null;
+}
+
+fn parseNonNegativeU64(arg: []const u8) ?u64 {
+    return std.fmt.parseInt(u64, arg, 10) catch null;
 }
 
 fn hasJsonFlag(args: []const []const u8) bool {
@@ -1131,6 +1146,167 @@ fn writeJsonNullableF32(out: anytype, value: ?f32) !void {
         try out.print("{d}", .{n});
     } else {
         try out.writeAll("null");
+    }
+}
+
+fn writeMemoryEventJson(out: anytype, event: yc.memory.MemoryEvent) !void {
+    try out.writeAll("{\"schema_version\":");
+    try out.print("{d}", .{event.schema_version});
+    try out.writeAll(",\"sequence\":");
+    try out.print("{d}", .{event.sequence});
+    try out.writeAll(",\"timestamp_ms\":");
+    try out.print("{d}", .{event.timestamp_ms});
+    try out.writeAll(",\"origin_instance_id\":");
+    try writeJsonString(out, event.origin_instance_id);
+    try out.writeAll(",\"origin_sequence\":");
+    try out.print("{d}", .{event.origin_sequence});
+    try out.writeAll(",\"operation\":");
+    try writeJsonString(out, event.operation.toString());
+    try out.writeAll(",\"key\":");
+    try writeJsonString(out, event.key);
+    try out.writeAll(",\"content\":");
+    try writeJsonNullableString(out, event.content);
+    try out.writeAll(",\"category\":");
+    if (event.category) |category| {
+        try writeJsonString(out, category.toString());
+    } else {
+        try out.writeAll("null");
+    }
+    try out.writeAll(",\"session_id\":");
+    try writeJsonNullableString(out, event.session_id);
+    try out.writeAll("}");
+}
+
+fn writeMemoryEventFeedInfoJson(out: anytype, info: yc.memory.MemoryEventFeedInfo) !void {
+    try out.writeAll("{\"schema_version\":");
+    try out.print("{d}", .{info.schema_version});
+    try out.writeAll(",\"compacted_through_sequence\":");
+    try out.print("{d}", .{info.compacted_through_sequence});
+    try out.writeAll(",\"latest_sequence\":");
+    try out.print("{d}", .{info.latest_sequence});
+    try out.writeAll(",\"core_backend\":");
+    try writeJsonString(out, info.core_backend);
+    try out.writeAll(",\"projection_backend\":");
+    try writeJsonString(out, info.projection_backend);
+    try out.writeAll(",\"projection_last_applied_sequence\":");
+    try out.print("{d}", .{info.projection_last_applied_sequence});
+    try out.writeAll(",\"projection_lag\":");
+    try out.print("{d}", .{info.projection_lag});
+    try out.writeAll(",\"recall_source\":");
+    try writeJsonString(out, info.recall_source);
+    try out.writeAll("}");
+}
+
+fn writeMemoryEntryJson(out: anytype, entry: yc.memory.MemoryEntry) !void {
+    try out.writeAll("{\"key\":");
+    try writeJsonString(out, entry.key);
+    try out.writeAll(",\"category\":");
+    try writeJsonString(out, entry.category.toString());
+    try out.writeAll(",\"timestamp\":");
+    try writeJsonString(out, entry.timestamp);
+    try out.writeAll(",\"content\":");
+    try writeJsonString(out, entry.content);
+    try out.writeAll(",\"session_id\":");
+    try writeJsonNullableString(out, entry.session_id);
+    try out.writeAll("}");
+}
+
+fn parseJsonRequiredString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    const value = obj.get(key) orelse return error.InvalidEventJson;
+    return switch (value) {
+        .string => |s| s,
+        else => error.InvalidEventJson,
+    };
+}
+
+fn parseJsonOptionalString(obj: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        .string => |s| s,
+        else => error.InvalidEventJson,
+    };
+}
+
+fn parseJsonOptionalI64(obj: std.json.ObjectMap, key: []const u8) !?i64 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |n| n,
+        else => error.InvalidEventJson,
+    };
+}
+
+fn parseJsonOptionalU64(obj: std.json.ObjectMap, key: []const u8) !?u64 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .null => null,
+        .integer => |n| {
+            if (n < 0) return error.InvalidEventJson;
+            return @intCast(n);
+        },
+        else => error.InvalidEventJson,
+    };
+}
+
+fn parseJsonOptionalU16(obj: std.json.ObjectMap, key: []const u8) !?u16 {
+    const value = try parseJsonOptionalU64(obj, key);
+    if (value) |n| {
+        if (n > std.math.maxInt(u16)) return error.InvalidEventJson;
+        return @intCast(n);
+    }
+    return null;
+}
+
+fn parseMemoryEventInputFromJsonObject(obj: std.json.ObjectMap) !yc.memory.MemoryEventInput {
+    const operation_name = try parseJsonRequiredString(obj, "operation");
+    const operation = yc.memory.MemoryEventOp.fromString(operation_name) orelse return error.InvalidEventJson;
+    const category_name = try parseJsonOptionalString(obj, "category");
+
+    return .{
+        .schema_version = try parseJsonOptionalU16(obj, "schema_version"),
+        .operation = operation,
+        .key = try parseJsonRequiredString(obj, "key"),
+        .content = try parseJsonOptionalString(obj, "content"),
+        .category = if (category_name) |name| yc.memory.MemoryCategory.fromString(name) else null,
+        .session_id = try parseJsonOptionalString(obj, "session_id"),
+        .origin_instance_id = try parseJsonOptionalString(obj, "origin_instance_id"),
+        .origin_sequence = try parseJsonOptionalU64(obj, "origin_sequence"),
+        .timestamp_ms = try parseJsonOptionalI64(obj, "timestamp_ms"),
+    };
+}
+
+const MAX_MEMORY_EVENT_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+fn appendVectorDeleteScopes(
+    allocator: std.mem.Allocator,
+    memory: yc.memory.Memory,
+    key: []const u8,
+    scopes: *std.ArrayListUnmanaged(?[]u8),
+) !void {
+    const existing_entries = try memory.list(allocator, null, null);
+    defer yc.memory.freeEntries(allocator, existing_entries);
+
+    var saw_global = false;
+    for (existing_entries) |entry| {
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+        if (entry.session_id) |sid| {
+            var seen = false;
+            for (scopes.items) |existing_sid| {
+                if (existing_sid) |existing| {
+                    if (std.mem.eql(u8, existing, sid)) {
+                        seen = true;
+                        break;
+                    }
+                }
+            }
+            if (!seen) {
+                try scopes.append(allocator, try allocator.dupe(u8, sid));
+            }
+        } else if (!saw_global) {
+            saw_global = true;
+            try scopes.append(allocator, null);
+        }
     }
 }
 
@@ -1255,6 +1431,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const json_mode = hasJsonFlag(sub_args[1..]);
         const r = mem_rt.resolved;
         const report = mem_rt.diagnose();
+        const feed_info = mem_rt.feedStatus() catch yc.memory.MemoryEventFeedInfo{};
         if (json_mode) {
             var buf: [8192]u8 = undefined;
             var bw = std.fs.File.stdout().writer(&buf);
@@ -1273,6 +1450,12 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             writeJsonString(out, r.vector_sync_mode) catch return;
             out.print(",\"sources\":{d},\"fallback\":", .{r.source_count}) catch return;
             writeJsonString(out, r.fallback_policy) catch return;
+            out.writeAll(",\"core_backend\":") catch return;
+            writeJsonString(out, feed_info.core_backend) catch return;
+            out.writeAll(",\"projection_backend\":") catch return;
+            writeJsonString(out, feed_info.projection_backend) catch return;
+            out.print(",\"projection_lag\":{d},\"recall_source\":", .{feed_info.projection_lag}) catch return;
+            writeJsonString(out, feed_info.recall_source) catch return;
             out.print(",\"entries\":{d},", .{report.entry_count}) catch return;
             if (report.vector_entry_count) |n| {
                 out.print("\"vector_entries\":{d},", .{n}) catch return;
@@ -1295,6 +1478,10 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("  sync: {s}\n", .{r.vector_sync_mode});
             std.debug.print("  sources: {d}\n", .{r.source_count});
             std.debug.print("  fallback: {s}\n", .{r.fallback_policy});
+            std.debug.print("  core_backend: {s}\n", .{feed_info.core_backend});
+            std.debug.print("  projection_backend: {s}\n", .{feed_info.projection_backend});
+            std.debug.print("  projection_lag: {d}\n", .{feed_info.projection_lag});
+            std.debug.print("  recall_source: {s}\n", .{feed_info.recall_source});
             std.debug.print("  entries: {d}\n", .{report.entry_count});
             if (report.vector_entry_count) |n| {
                 std.debug.print("  vector_entries: {d}\n", .{n});
@@ -1319,6 +1506,33 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         return;
     }
 
+    if (std.mem.eql(u8, subcmd, "compact")) {
+        var feed = yc.memory.MemoryFeed.init(&mem_rt);
+        const compacted = feed.compact() catch |err| {
+            std.debug.print("memory compact failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        const feed_info = feed.status() catch |err| {
+            std.debug.print("memory feed info failed after compact: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        std.debug.print(
+            "Memory compact complete: checkpointed {d} entry(s), compacted through sequence {d}.\n",
+            .{ compacted, feed_info.compacted_through_sequence },
+        );
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "rebuild")) {
+        var feed = yc.memory.MemoryFeed.init(&mem_rt);
+        feed.rebuild() catch |err| {
+            std.debug.print("memory rebuild failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        std.debug.print("Memory backend projection rebuilt from checkpoint + journal state.\n", .{});
+        return;
+    }
+
     if (std.mem.eql(u8, subcmd, "reindex")) {
         const count = mem_rt.reindex(allocator);
         if (std.mem.eql(u8, mem_rt.resolved.vector_mode, "none")) {
@@ -1335,12 +1549,69 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         return;
     }
 
-    if (std.mem.eql(u8, subcmd, "forget")) {
-        if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw memory forget <key>\n", .{});
+    if (std.mem.eql(u8, subcmd, "put")) {
+        if (sub_args.len < 3) {
+            std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID]\n", .{});
             std.process.exit(1);
         }
         const key = sub_args[1];
+        const content = sub_args[2];
+        var category: yc.memory.MemoryCategory = .core;
+        var session_id: ?[]const u8 = null;
+
+        var i: usize = 3;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--category")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                category = yc.memory.MemoryCategory.fromString(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--session-id")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory put <key> <content> [--category C] [--session-id ID]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
+            } else {
+                std.debug.print("Unknown option for memory put: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        mem_rt.memory.store(key, content, category, session_id) catch |err| {
+            std.debug.print("memory put failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        mem_rt.syncVectorAfterStore(allocator, key, content, session_id);
+        std.debug.print("Stored memory entry: {s}\n", .{key});
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "delete") or std.mem.eql(u8, subcmd, "forget")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw memory {s} <key> [--session-id ID]\n", .{subcmd});
+            std.process.exit(1);
+        }
+        const key = sub_args[1];
+        var session_id: ?[]const u8 = null;
+
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--session-id")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory {s} <key> [--session-id ID]\n", .{subcmd});
+                    std.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
+            } else {
+                std.debug.print("Unknown option for memory {s}: {s}\n", .{ subcmd, sub_args[i] });
+                std.process.exit(1);
+            }
+        }
 
         var vector_delete_scopes: std.ArrayListUnmanaged(?[]u8) = .empty;
         defer {
@@ -1350,83 +1621,93 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             vector_delete_scopes.deinit(allocator);
         }
 
-        const existing_entries = mem_rt.memory.list(allocator, null, null) catch |err| {
-            std.debug.print("memory list failed before delete: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+        const deleted = if (session_id) |sid| blk: {
+            const existing = mem_rt.memory.getScoped(allocator, key, sid) catch |err| {
+                std.debug.print("memory get failed before delete: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            if (existing) |entry| entry.deinit(allocator) else break :blk false;
+            try vector_delete_scopes.append(allocator, try allocator.dupe(u8, sid));
+            break :blk mem_rt.memory.forgetScoped(allocator, key, sid) catch |err| {
+                std.debug.print("memory delete failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+        } else blk: {
+            appendVectorDeleteScopes(allocator, mem_rt.memory, key, &vector_delete_scopes) catch |err| {
+                std.debug.print("memory list failed before delete: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            break :blk mem_rt.memory.forget(key) catch |err| {
+                std.debug.print("memory delete failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
         };
-        defer yc.memory.freeEntries(allocator, existing_entries);
 
-        var saw_global = false;
-        for (existing_entries) |entry| {
-            if (!std.mem.eql(u8, entry.key, key)) continue;
-            if (entry.session_id) |sid| {
-                var seen = false;
-                for (vector_delete_scopes.items) |existing_sid| {
-                    if (existing_sid) |existing| {
-                        if (std.mem.eql(u8, existing, sid)) {
-                            seen = true;
-                            break;
-                        }
-                    }
-                }
-                if (!seen) {
-                    try vector_delete_scopes.append(allocator, try allocator.dupe(u8, sid));
-                }
-            } else if (!saw_global) {
-                saw_global = true;
-                try vector_delete_scopes.append(allocator, null);
-            }
-        }
-
-        const deleted = mem_rt.memory.forget(key) catch |err| {
-            std.debug.print("memory forget failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
-        };
         if (deleted) {
             for (vector_delete_scopes.items) |sid_opt| {
                 mem_rt.deleteFromVectorStore(key, sid_opt);
             }
             std.debug.print("Deleted memory entry: {s}\n", .{key});
         } else {
-            std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});
+            std.debug.print("Entry not deleted: {s}\n", .{key});
         }
         return;
     }
 
     if (std.mem.eql(u8, subcmd, "get")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw memory get <key> [--json]\n", .{});
+            std.debug.print("Usage: nullclaw memory get <key> [--session-id ID] [--json]\n", .{});
             std.process.exit(1);
         }
         const key = sub_args[1];
-        const json_mode = hasJsonFlag(sub_args[2..]);
-        const entry = mem_rt.memory.get(allocator, key) catch |err| {
-            std.debug.print("memory get failed: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
+        var session_id: ?[]const u8 = null;
+        var json_mode = false;
+
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--session-id")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory get <key> [--session-id ID] [--json]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else {
+                std.debug.print("Unknown option for memory get: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        const entry = blk: {
+            if (session_id) |sid| {
+                break :blk mem_rt.memory.getScoped(allocator, key, sid) catch |err| {
+                    std.debug.print("memory get failed: {s}\n", .{@errorName(err)});
+                    std.process.exit(1);
+                };
+            }
+            break :blk mem_rt.memory.get(allocator, key) catch |err| {
+                std.debug.print("memory get failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
         };
+
         if (entry) |e| {
             defer e.deinit(allocator);
             if (json_mode) {
                 var buf: [65536]u8 = undefined;
                 var bw = std.fs.File.stdout().writer(&buf);
                 const out = &bw.interface;
-                out.writeAll("{\"key\":") catch return;
-                writeJsonString(out, e.key) catch return;
-                out.writeAll(",\"category\":") catch return;
-                writeJsonString(out, e.category.toString()) catch return;
-                out.writeAll(",\"timestamp\":") catch return;
-                writeJsonString(out, e.timestamp) catch return;
-                out.writeAll(",\"content\":") catch return;
-                writeJsonString(out, e.content) catch return;
-                out.writeAll(",\"session_id\":") catch return;
-                writeJsonNullableString(out, e.session_id) catch return;
-                out.writeAll("}\n") catch return;
+                writeMemoryEntryJson(out, e) catch return;
+                out.writeAll("\n") catch return;
                 out.flush() catch return;
             } else {
-                std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}\n", .{
+                std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\nsession_id: {s}\ncontent:\n{s}\n", .{
                     e.key,
                     e.category.toString(),
                     e.timestamp,
+                    e.session_id orelse "(global)",
                     e.content,
                 });
             }
@@ -1447,13 +1728,14 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (std.mem.eql(u8, subcmd, "list")) {
         var limit: usize = 20;
         var category_opt: ?yc.memory.MemoryCategory = null;
+        var session_id: ?[]const u8 = null;
         var json_mode = false;
 
         var i: usize = 1;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--limit")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--json]\n", .{});
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--session-id ID] [--limit N] [--json]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
@@ -1463,11 +1745,18 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 };
             } else if (std.mem.eql(u8, sub_args[i], "--category")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--json]\n", .{});
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--session-id ID] [--limit N] [--json]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
                 category_opt = yc.memory.MemoryCategory.fromString(sub_args[i]);
+            } else if (std.mem.eql(u8, sub_args[i], "--session-id")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--session-id ID] [--limit N] [--json]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                session_id = sub_args[i];
             } else if (std.mem.eql(u8, sub_args[i], "--json")) {
                 json_mode = true;
             } else {
@@ -1476,7 +1765,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             }
         }
 
-        const entries = mem_rt.memory.list(allocator, category_opt, null) catch |err| {
+        const entries = mem_rt.memory.list(allocator, category_opt, session_id) catch |err| {
             std.debug.print("memory list failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -1491,17 +1780,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             out.writeAll("[") catch return;
             for (entries[0..shown], 0..) |e, idx| {
                 if (idx > 0) out.writeAll(",") catch return;
-                out.writeAll("{\"key\":") catch return;
-                writeJsonString(out, e.key) catch return;
-                out.writeAll(",\"category\":") catch return;
-                writeJsonString(out, e.category.toString()) catch return;
-                out.writeAll(",\"timestamp\":") catch return;
-                writeJsonString(out, e.timestamp) catch return;
-                out.writeAll(",\"content\":") catch return;
-                writeJsonString(out, e.content) catch return;
-                out.writeAll(",\"session_id\":") catch return;
-                writeJsonNullableString(out, e.session_id) catch return;
-                out.writeAll("}") catch return;
+                writeMemoryEntryJson(out, e) catch return;
             }
             out.writeAll("]\n") catch return;
             out.flush() catch return;
@@ -1510,16 +1789,242 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             for (entries[0..shown], 0..) |e, idx| {
                 const preview_len = @min(@as(usize, 120), e.content.len);
                 const preview = e.content[0..preview_len];
-                std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
+                std.debug.print("  {d}. {s} [{s}] {s} session={s}\n     {s}{s}\n", .{
                     idx + 1,
                     e.key,
                     e.category.toString(),
                     e.timestamp,
+                    e.session_id orelse "(global)",
                     preview,
                     if (e.content.len > preview_len) "..." else "",
                 });
             }
         }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "events")) {
+        var feed = yc.memory.MemoryFeed.init(&mem_rt);
+        var after_sequence: ?u64 = null;
+        var limit: usize = 20;
+        var json_mode = false;
+        var ndjson_mode = false;
+        var status_mode = false;
+
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--after")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory events [--after N] [--limit N] [--json|--ndjson|--status]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                after_sequence = parseNonNegativeU64(sub_args[i]) orelse {
+                    std.debug.print("Invalid --after value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory events [--after N] [--limit N] [--json|--ndjson|--status]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
+                json_mode = true;
+            } else if (std.mem.eql(u8, sub_args[i], "--ndjson")) {
+                ndjson_mode = true;
+            } else if (std.mem.eql(u8, sub_args[i], "--status")) {
+                status_mode = true;
+            } else {
+                std.debug.print("Unknown option for memory events: {s}\n", .{sub_args[i]});
+                std.process.exit(1);
+            }
+        }
+
+        if (json_mode and ndjson_mode) {
+            std.debug.print("Choose either --json or --ndjson for memory events\n", .{});
+            std.process.exit(1);
+        }
+
+        if (status_mode) {
+            const info = feed.status() catch |err| {
+                std.debug.print("memory event feed status failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+
+            if (ndjson_mode) {
+                std.debug.print("--ndjson is not supported with memory events --status\n", .{});
+                std.process.exit(1);
+            }
+
+            if (json_mode) {
+                var status_buf: [1024]u8 = undefined;
+                var status_bw = std.fs.File.stdout().writer(&status_buf);
+                const status_out = &status_bw.interface;
+                writeMemoryEventFeedInfoJson(status_out, info) catch return;
+                status_out.writeAll("\n") catch return;
+                status_out.flush() catch return;
+            } else {
+                std.debug.print(
+                    "Memory event feed: schema={d} compacted_through={d} latest={d} core={s} projection={s} lag={d} recall={s}\n",
+                    .{
+                        info.schema_version,
+                        info.compacted_through_sequence,
+                        info.latest_sequence,
+                        info.core_backend,
+                        info.projection_backend,
+                        info.projection_lag,
+                        info.recall_source,
+                    },
+                );
+            }
+            return;
+        }
+
+        const events = feed.listEvents(allocator, after_sequence, limit) catch |err| {
+            if (err == error.CursorExpired) {
+                const info = feed.status() catch yc.memory.MemoryEventFeedInfo{};
+                std.debug.print(
+                    "memory events cursor expired: compacted through sequence {d}. Rebuild from current state and resume from --after {d}.\n",
+                    .{ info.compacted_through_sequence, info.compacted_through_sequence },
+                );
+                std.process.exit(1);
+            }
+            std.debug.print("memory events failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer yc.memory.freeEvents(allocator, events);
+
+        var buf: [65536]u8 = undefined;
+        var bw = std.fs.File.stdout().writer(&buf);
+        const out = &bw.interface;
+
+        if (json_mode) {
+            out.writeAll("[") catch return;
+            for (events, 0..) |event, idx| {
+                if (idx > 0) out.writeAll(",") catch return;
+                writeMemoryEventJson(out, event) catch return;
+            }
+            out.writeAll("]\n") catch return;
+        } else if (ndjson_mode) {
+            for (events) |event| {
+                writeMemoryEventJson(out, event) catch return;
+                out.writeAll("\n") catch return;
+            }
+        } else {
+            std.debug.print("Memory events: {d}\n", .{events.len});
+            for (events) |event| {
+                std.debug.print("  seq={d} origin={s}#{d} op={s} key={s} session={s}\n", .{
+                    event.sequence,
+                    event.origin_instance_id,
+                    event.origin_sequence,
+                    event.operation.toString(),
+                    event.key,
+                    event.session_id orelse "(global)",
+                });
+            }
+        }
+        out.flush() catch {};
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "apply")) {
+        var feed = yc.memory.MemoryFeed.init(&mem_rt);
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw memory apply <ndjson_file>\n", .{});
+            std.process.exit(1);
+        }
+        const path = sub_args[1];
+        const file = blk: {
+            if (std.fs.path.isAbsolute(path)) {
+                break :blk std.fs.openFileAbsolute(path, .{}) catch |err| {
+                    std.debug.print("memory apply failed to open {s}: {s}\n", .{ path, @errorName(err) });
+                    std.process.exit(1);
+                };
+            }
+            break :blk std.fs.cwd().openFile(path, .{}) catch |err| {
+                std.debug.print("memory apply failed to open {s}: {s}\n", .{ path, @errorName(err) });
+                std.process.exit(1);
+            };
+        };
+        defer file.close();
+
+        var applied: usize = 0;
+        var skipped: usize = 0;
+        var reader = file.deprecatedReader();
+        while (reader.readUntilDelimiterOrEofAlloc(allocator, '\n', MAX_MEMORY_EVENT_LINE_BYTES) catch |err| {
+            std.debug.print("memory apply failed to read {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        }) |raw_line| {
+            defer allocator.free(raw_line);
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err| {
+                std.debug.print("memory apply invalid event JSON: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer parsed.deinit();
+
+            if (parsed.value != .object) {
+                std.debug.print("memory apply expects one JSON object per line\n", .{});
+                std.process.exit(1);
+            }
+            const input = parseMemoryEventInputFromJsonObject(parsed.value.object) catch |err| {
+                std.debug.print("memory apply invalid event fields: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+
+            var vector_delete_scopes: std.ArrayListUnmanaged(?[]u8) = .empty;
+            defer {
+                for (vector_delete_scopes.items) |sid_opt| {
+                    if (sid_opt) |sid| allocator.free(sid);
+                }
+                vector_delete_scopes.deinit(allocator);
+            }
+
+            if (input.operation == .delete_all) {
+                appendVectorDeleteScopes(allocator, mem_rt.memory, input.key, &vector_delete_scopes) catch |err| {
+                    std.debug.print("memory apply failed to inspect delete scopes: {s}\n", .{@errorName(err)});
+                    std.process.exit(1);
+                };
+            }
+
+            const apply_result = feed.apply(input) catch |err| {
+                std.debug.print("memory apply failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            if (!apply_result.accepted) {
+                skipped += 1;
+                continue;
+            }
+
+            if (!apply_result.materialized) {
+                applied += 1;
+                continue;
+            }
+
+            switch (input.operation) {
+                .put => if (input.content) |event_content| {
+                    mem_rt.syncVectorAfterStore(allocator, input.key, event_content, input.session_id);
+                },
+                .delete_all => {
+                    for (vector_delete_scopes.items) |sid_opt| {
+                        mem_rt.deleteFromVectorStore(input.key, sid_opt);
+                    }
+                },
+                .delete_scoped => {
+                    mem_rt.deleteFromVectorStore(input.key, input.session_id);
+                },
+            }
+            applied += 1;
+        }
+
+        std.debug.print("Applied {d} event(s), skipped {d} duplicate(s).\n", .{ applied, skipped });
         return;
     }
 

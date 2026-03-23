@@ -157,6 +157,10 @@ pub fn formatReport(report: DiagnosticReport, allocator: std.mem.Allocator) ![]u
     try std.fmt.format(w, "  session_store:   {}\n", .{report.capabilities.supports_session_store});
     try std.fmt.format(w, "  transactions:    {}\n", .{report.capabilities.supports_transactions});
     try std.fmt.format(w, "  outbox:          {}\n", .{report.capabilities.supports_outbox});
+    try std.fmt.format(w, "  native_recall:   {}\n", .{report.capabilities.supports_native_recall});
+    try std.fmt.format(w, "  scoped_recall:   {}\n", .{report.capabilities.supports_scoped_native_recall});
+    try std.fmt.format(w, "  safe_rebuild:    {}\n", .{report.capabilities.supports_safe_rebuild});
+    try std.fmt.format(w, "  remote_effects:  {}\n", .{report.capabilities.has_remote_side_effects});
 
     // Vector plane
     try w.writeAll("\nVector Plane\n");
@@ -239,6 +243,10 @@ fn makeTestRuntime(allocator: std.mem.Allocator) !struct { rt: root.MemoryRuntim
                 .supports_session_store = false,
                 .supports_transactions = false,
                 .supports_outbox = false,
+                .supports_native_recall = false,
+                .supports_scoped_native_recall = false,
+                .supports_safe_rebuild = false,
+                .has_remote_side_effects = false,
             },
             .resolved = test_resolved,
             ._db_path = null,
@@ -294,6 +302,10 @@ test "diagnose with sqlite backend and entries" {
             .supports_session_store = true,
             .supports_transactions = true,
             .supports_outbox = true,
+            .supports_native_recall = true,
+            .supports_scoped_native_recall = true,
+            .supports_safe_rebuild = true,
+            .has_remote_side_effects = false,
         },
         .resolved = test_resolved,
         ._db_path = null,
@@ -370,6 +382,10 @@ test "diagnose with vector store" {
             .supports_session_store = true,
             .supports_transactions = true,
             .supports_outbox = true,
+            .supports_native_recall = true,
+            .supports_scoped_native_recall = true,
+            .supports_safe_rebuild = true,
+            .has_remote_side_effects = false,
         },
         .resolved = test_resolved,
         ._db_path = null,
@@ -413,6 +429,10 @@ test "diagnose with outbox" {
             .supports_session_store = true,
             .supports_transactions = true,
             .supports_outbox = true,
+            .supports_native_recall = true,
+            .supports_scoped_native_recall = true,
+            .supports_safe_rebuild = true,
+            .has_remote_side_effects = false,
         },
         .resolved = test_resolved,
         ._db_path = null,
@@ -525,6 +545,10 @@ test "formatReport with cache stats" {
             .supports_session_store = true,
             .supports_transactions = true,
             .supports_outbox = true,
+            .supports_native_recall = true,
+            .supports_scoped_native_recall = true,
+            .supports_safe_rebuild = true,
+            .has_remote_side_effects = false,
         },
         .vector_store_active = true,
         .vector_entry_count = 10,
@@ -561,6 +585,10 @@ test "formatReport without optional components" {
             .supports_session_store = false,
             .supports_transactions = false,
             .supports_outbox = false,
+            .supports_native_recall = false,
+            .supports_scoped_native_recall = false,
+            .supports_safe_rebuild = false,
+            .has_remote_side_effects = false,
         },
         .vector_store_active = false,
         .vector_entry_count = null,
