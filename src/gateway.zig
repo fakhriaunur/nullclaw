@@ -485,6 +485,7 @@ pub const GatewayState = struct {
     qq_channels: std.ArrayListUnmanaged(channels.qq.QQChannel) = .empty,
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
+    memory_rt: ?*memory_mod.MemoryRuntime = null,
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
         return initWithVerifyToken(allocator, "");
@@ -2416,6 +2417,27 @@ fn findCronRouteDescriptor(path: []const u8) ?*const CronRouteDescriptor {
     return null;
 }
 
+const MemoryRouteDescriptor = struct {
+    path: []const u8,
+    method: []const u8,
+    handler: *const fn (ctx: *WebhookHandlerContext) void,
+};
+
+const memory_route_descriptors = [_]MemoryRouteDescriptor{
+    .{ .path = "/memory/events", .method = "GET", .handler = handleMemoryEventsRoute },
+    .{ .path = "/memory/status", .method = "GET", .handler = handleMemoryStatusRoute },
+    .{ .path = "/memory/apply", .method = "POST", .handler = handleMemoryApplyRoute },
+    .{ .path = "/memory/compact", .method = "POST", .handler = handleMemoryCompactRoute },
+    .{ .path = "/memory/checkpoint", .method = "GET", .handler = handleMemoryCheckpointRoute },
+};
+
+fn findMemoryRouteDescriptor(path: []const u8) ?*const MemoryRouteDescriptor {
+    for (&memory_route_descriptors) |*desc| {
+        if (std.mem.eql(u8, desc.path, path)) return desc;
+    }
+    return null;
+}
+
 fn cronObjectStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
     if (value == .string and value.string.len > 0) return value.string;
@@ -2939,6 +2961,378 @@ fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
     cron_mod.saveJobs(sched) catch {};
     ctx.response_status = "200 OK";
     ctx.response_body = "{\"status\":\"updated\"}";
+}
+
+fn memoryRouteRuntime(ctx: *WebhookHandlerContext) ?*memory_mod.MemoryRuntime {
+    if (ctx.state.memory_rt) |rt| return rt;
+    if (ctx.session_mgr_opt) |sm| return sm.mem_rt;
+    return null;
+}
+
+fn memoryJsonStringField(val: std.json.Value, key: []const u8) ?[]const u8 {
+    if (val != .object) return null;
+    const field = val.object.get(key) orelse return null;
+    return if (field == .string) field.string else null;
+}
+
+fn memoryJsonNullableStringField(val: std.json.Value, key: []const u8) ?[]const u8 {
+    if (val != .object) return null;
+    const field = val.object.get(key) orelse return null;
+    return switch (field) {
+        .null => null,
+        .string => field.string,
+        else => null,
+    };
+}
+
+fn memoryJsonIntegerField(val: std.json.Value, key: []const u8) ?i64 {
+    if (val != .object) return null;
+    const field = val.object.get(key) orelse return null;
+    return switch (field) {
+        .integer => field.integer,
+        else => null,
+    };
+}
+
+fn parseMemoryEventValue(val: std.json.Value) !memory_mod.MemoryEventInput {
+    const origin_instance_id = memoryJsonStringField(val, "origin_instance_id") orelse return error.InvalidEvent;
+    const origin_sequence_raw = memoryJsonIntegerField(val, "origin_sequence") orelse return error.InvalidEvent;
+    const timestamp_ms = memoryJsonIntegerField(val, "timestamp_ms") orelse return error.InvalidEvent;
+    const operation_str = memoryJsonStringField(val, "operation") orelse return error.InvalidEvent;
+    const key = memoryJsonStringField(val, "key") orelse return error.InvalidEvent;
+    if (origin_sequence_raw < 0) return error.InvalidEvent;
+    return .{
+        .origin_instance_id = origin_instance_id,
+        .origin_sequence = @intCast(origin_sequence_raw),
+        .timestamp_ms = timestamp_ms,
+        .operation = memory_mod.MemoryEventOp.fromString(operation_str) orelse return error.InvalidEvent,
+        .key = key,
+        .session_id = memoryJsonNullableStringField(val, "session_id"),
+        .category = if (memoryJsonNullableStringField(val, "category")) |cat| memory_mod.MemoryCategory.fromString(cat) else null,
+        .value_kind = if (memoryJsonNullableStringField(val, "value_kind")) |kind|
+            memory_mod.MemoryValueKind.fromString(kind) orelse return error.InvalidEvent
+        else
+            null,
+        .content = memoryJsonNullableStringField(val, "content"),
+    };
+}
+
+fn isGatewayCheckpointPayload(allocator: std.mem.Allocator, payload: []const u8) bool {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] != '{') return false;
+
+    const first_line = std.mem.trim(
+        u8,
+        trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len],
+        " \t\r\n",
+    );
+    if (first_line.len == 0) return false;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, first_line, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get("kind") != null;
+}
+
+fn writeMemoryEventJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, event: memory_mod.MemoryEvent) !void {
+    try buf.append(allocator, '{');
+    try buf.appendSlice(allocator, "\"sequence\":");
+    var int_buf: [32]u8 = undefined;
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{event.sequence}) catch "0");
+    try buf.appendSlice(allocator, ",\"schema_version\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{event.schema_version}) catch "1");
+    try buf.appendSlice(allocator, ",\"origin_instance_id\":");
+    try appendJsonStringBuf(buf, allocator, event.origin_instance_id);
+    try buf.appendSlice(allocator, ",\"origin_sequence\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{event.origin_sequence}) catch "0");
+    try buf.appendSlice(allocator, ",\"timestamp_ms\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{event.timestamp_ms}) catch "0");
+    try buf.appendSlice(allocator, ",\"operation\":");
+    try appendJsonStringBuf(buf, allocator, event.operation.toString());
+    try buf.appendSlice(allocator, ",\"key\":");
+    try appendJsonStringBuf(buf, allocator, event.key);
+    try buf.appendSlice(allocator, ",\"session_id\":");
+    if (event.session_id) |sid| try appendJsonStringBuf(buf, allocator, sid) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"category\":");
+    if (event.category) |category| try appendJsonStringBuf(buf, allocator, category.toString()) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"value_kind\":");
+    if (event.value_kind) |kind| try appendJsonStringBuf(buf, allocator, kind.toString()) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"content\":");
+    if (event.content) |content| try appendJsonStringBuf(buf, allocator, content) else try buf.appendSlice(allocator, "null");
+    try buf.append(allocator, '}');
+}
+
+fn collectMemoryKeyScopesForGateway(allocator: std.mem.Allocator, memory: memory_mod.Memory, key: []const u8) ![]?[]u8 {
+    const entries = try memory.list(allocator, null, null);
+    defer memory_mod.freeEntries(allocator, entries);
+
+    var scopes: std.ArrayListUnmanaged(?[]u8) = .empty;
+    errdefer {
+        for (scopes.items) |sid_opt| if (sid_opt) |sid| allocator.free(sid);
+        scopes.deinit(allocator);
+    }
+
+    var saw_global = false;
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+        if (entry.session_id) |sid| {
+            var seen = false;
+            for (scopes.items) |existing| {
+                if (existing) |existing_sid| {
+                    if (std.mem.eql(u8, existing_sid, sid)) {
+                        seen = true;
+                        break;
+                    }
+                }
+            }
+            if (!seen) try scopes.append(allocator, try allocator.dupe(u8, sid));
+        } else if (!saw_global) {
+            saw_global = true;
+            try scopes.append(allocator, null);
+        }
+    }
+
+    return scopes.toOwnedSlice(allocator);
+}
+
+fn memoryScopeListsContain(scopes: []const ?[]u8, session_id: ?[]const u8) bool {
+    for (scopes) |existing| {
+        if (existing == null and session_id == null) return true;
+        if (existing != null and session_id != null and std.mem.eql(u8, existing.?, session_id.?)) return true;
+    }
+    return false;
+}
+
+fn freeGatewayMemoryScopes(allocator: std.mem.Allocator, scopes: []?[]u8) void {
+    for (scopes) |sid_opt| if (sid_opt) |sid| allocator.free(sid);
+    allocator.free(scopes);
+}
+
+fn applyGatewayMemoryEventWithVectorSync(mem_rt: *memory_mod.MemoryRuntime, allocator: std.mem.Allocator, input: memory_mod.MemoryEventInput) !void {
+    var before_entry: ?memory_mod.MemoryEntry = null;
+    defer if (before_entry) |*entry| entry.deinit(allocator);
+    var after_entry: ?memory_mod.MemoryEntry = null;
+    defer if (after_entry) |*entry| entry.deinit(allocator);
+    var before_scopes: []?[]u8 = &.{};
+    defer if (before_scopes.len > 0) freeGatewayMemoryScopes(allocator, before_scopes);
+    var after_scopes: []?[]u8 = &.{};
+    defer if (after_scopes.len > 0) freeGatewayMemoryScopes(allocator, after_scopes);
+
+    switch (input.operation) {
+        .put, .merge_object, .merge_string_set, .delete_scoped => before_entry = try mem_rt.memory.getScoped(allocator, input.key, input.session_id),
+        .delete_all => before_scopes = try collectMemoryKeyScopesForGateway(allocator, mem_rt.memory, input.key),
+    }
+
+    try mem_rt.memory.applyEvent(input);
+
+    switch (input.operation) {
+        .put, .merge_object, .merge_string_set => {
+            after_entry = try mem_rt.memory.getScoped(allocator, input.key, input.session_id);
+            if (after_entry) |after| {
+                const changed = if (before_entry) |before|
+                    !std.mem.eql(u8, before.content, after.content) or !before.category.eql(after.category)
+                else
+                    true;
+                if (changed) mem_rt.syncVectorAfterStore(allocator, input.key, after.content, after.session_id);
+            }
+        },
+        .delete_scoped => {
+            after_entry = try mem_rt.memory.getScoped(allocator, input.key, input.session_id);
+            if (before_entry != null and after_entry == null) {
+                mem_rt.deleteFromVectorStore(input.key, input.session_id);
+            }
+        },
+        .delete_all => {
+            after_scopes = try collectMemoryKeyScopesForGateway(allocator, mem_rt.memory, input.key);
+            for (before_scopes) |sid_opt| {
+                if (!memoryScopeListsContain(after_scopes, sid_opt)) {
+                    mem_rt.deleteFromVectorStore(input.key, sid_opt);
+                }
+            }
+        },
+    }
+}
+
+fn handleMemoryStatusRoute(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "GET")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const mem_rt = memoryRouteRuntime(ctx) orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"memory runtime unavailable\"}";
+        return;
+    };
+
+    var info = mem_rt.memory.eventFeedInfo(ctx.req_allocator) catch {
+        ctx.response_status = "501 Not Implemented";
+        ctx.response_body = "{\"error\":\"memory feed not supported\"}";
+        return;
+    };
+    defer info.deinit(ctx.req_allocator);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(ctx.req_allocator);
+    buf.appendSlice(ctx.req_allocator, "{\"instance_id\":") catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"out of memory\"}";
+        return;
+    };
+    appendJsonStringBuf(&buf, ctx.req_allocator, info.instance_id) catch unreachable;
+    buf.appendSlice(ctx.req_allocator, ",\"last_sequence\":") catch unreachable;
+    buf.writer(ctx.req_allocator).print("{d}", .{info.last_sequence}) catch unreachable;
+    buf.appendSlice(ctx.req_allocator, ",\"next_local_origin_sequence\":") catch unreachable;
+    buf.writer(ctx.req_allocator).print("{d}", .{info.next_local_origin_sequence}) catch unreachable;
+    buf.appendSlice(ctx.req_allocator, ",\"supports_compaction\":") catch unreachable;
+    buf.appendSlice(ctx.req_allocator, if (info.supports_compaction) "true" else "false") catch unreachable;
+    buf.appendSlice(ctx.req_allocator, ",\"storage_kind\":") catch unreachable;
+    appendJsonStringBuf(&buf, ctx.req_allocator, info.storage_kind.toString()) catch unreachable;
+    buf.appendSlice(ctx.req_allocator, ",\"journal_path\":") catch unreachable;
+    if (info.journal_path) |path| appendJsonStringBuf(&buf, ctx.req_allocator, path) catch unreachable else buf.appendSlice(ctx.req_allocator, "null") catch unreachable;
+    buf.appendSlice(ctx.req_allocator, ",\"checkpoint_path\":") catch unreachable;
+    if (info.checkpoint_path) |path| appendJsonStringBuf(&buf, ctx.req_allocator, path) catch unreachable else buf.appendSlice(ctx.req_allocator, "null") catch unreachable;
+    buf.appendSlice(ctx.req_allocator, ",\"compacted_through_sequence\":") catch unreachable;
+    buf.writer(ctx.req_allocator).print("{d}", .{info.compacted_through_sequence}) catch unreachable;
+    buf.appendSlice(ctx.req_allocator, ",\"oldest_available_sequence\":") catch unreachable;
+    buf.writer(ctx.req_allocator).print("{d}", .{info.oldest_available_sequence}) catch unreachable;
+    buf.append(ctx.req_allocator, '}') catch unreachable;
+    ctx.response_body = buf.toOwnedSlice(ctx.req_allocator) catch "{\"error\":\"out of memory\"}";
+}
+
+fn handleMemoryEventsRoute(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "GET")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const mem_rt = memoryRouteRuntime(ctx) orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"memory runtime unavailable\"}";
+        return;
+    };
+
+    const after_sequence = if (parseQueryParam(ctx.target, "after")) |value|
+        std.fmt.parseInt(u64, value, 10) catch 0
+    else
+        0;
+    const limit = if (parseQueryParam(ctx.target, "limit")) |value|
+        std.fmt.parseInt(usize, value, 10) catch 100
+    else
+        100;
+
+    const events = mem_rt.memory.listEvents(ctx.req_allocator, after_sequence, limit) catch |err| {
+        if (err == error.CursorExpired) {
+            ctx.response_status = "410 Gone";
+            ctx.response_body = "{\"error\":\"cursor expired\"}";
+        } else {
+            ctx.response_status = "501 Not Implemented";
+            ctx.response_body = "{\"error\":\"memory feed not supported\"}";
+        }
+        return;
+    };
+    defer memory_mod.freeEvents(ctx.req_allocator, events);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(ctx.req_allocator);
+    buf.appendSlice(ctx.req_allocator, "{\"events\":[") catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"out of memory\"}";
+        return;
+    };
+    for (events, 0..) |event, idx| {
+        if (idx > 0) buf.append(ctx.req_allocator, ',') catch unreachable;
+        writeMemoryEventJson(&buf, ctx.req_allocator, event) catch unreachable;
+    }
+    buf.appendSlice(ctx.req_allocator, "]}") catch unreachable;
+    ctx.response_body = buf.toOwnedSlice(ctx.req_allocator) catch "{\"error\":\"out of memory\"}";
+}
+
+fn handleMemoryApplyRoute(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const mem_rt = memoryRouteRuntime(ctx) orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"memory runtime unavailable\"}";
+        return;
+    };
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"empty body\"}";
+        return;
+    };
+
+    if (isGatewayCheckpointPayload(ctx.req_allocator, body)) {
+        mem_rt.memory.applyCheckpoint(body) catch {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid checkpoint\"}";
+            return;
+        };
+        _ = mem_rt.reindex(ctx.req_allocator);
+        ctx.response_body = "{\"status\":\"applied\",\"kind\":\"checkpoint\"}";
+        return;
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    defer parsed.deinit();
+
+    const input = parseMemoryEventValue(parsed.value) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid event\"}";
+        return;
+    };
+    applyGatewayMemoryEventWithVectorSync(mem_rt, ctx.req_allocator, input) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"apply failed\"}";
+        return;
+    };
+    ctx.response_body = "{\"status\":\"applied\",\"kind\":\"event\"}";
+}
+
+fn handleMemoryCompactRoute(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const mem_rt = memoryRouteRuntime(ctx) orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"memory runtime unavailable\"}";
+        return;
+    };
+    const compacted = mem_rt.memory.compactEvents() catch {
+        ctx.response_status = "501 Not Implemented";
+        ctx.response_body = "{\"error\":\"memory feed compaction not supported\"}";
+        return;
+    };
+    ctx.response_body = std.fmt.allocPrint(ctx.req_allocator, "{{\"compacted_through_sequence\":{d}}}", .{compacted}) catch "{\"error\":\"out of memory\"}";
+}
+
+fn handleMemoryCheckpointRoute(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "GET")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const mem_rt = memoryRouteRuntime(ctx) orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"memory runtime unavailable\"}";
+        return;
+    };
+    const payload = mem_rt.memory.exportCheckpoint(ctx.req_allocator) catch {
+        ctx.response_status = "501 Not Implemented";
+        ctx.response_body = "{\"error\":\"memory checkpoint not supported\"}";
+        return;
+    };
+    ctx.response_content_type = "application/x-ndjson";
+    ctx.response_body = payload;
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
@@ -5001,6 +5395,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             }
         }
 
+        mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+        state.memory_rt = if (mem_rt) |*rt| rt else null;
+        const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
+
         // In daemon mode (`event_bus` is present), inbound processing is delegated to
         // the bus + channel runtime. However, A2A requires a synchronous session manager
         // for request-response JSON-RPC, so also init when A2A is enabled.
@@ -5023,10 +5421,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             if (provider_bundle_opt) |*bundle| {
                 const provider_i: providers.Provider = bundle.provider();
                 const resolved_api_key = bundle.primaryApiKey();
-
-                // Optional memory backend.
-                mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
-                const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
 
                 bootstrap_provider_opt = bootstrap_mod.createProvider(
                     allocator,
@@ -5190,7 +5584,40 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         var response_body: []const u8 = "";
         var pair_response_buf: [256]u8 = undefined;
 
-        if (findCronRouteDescriptor(base_path)) |desc| {
+        if (findMemoryRouteDescriptor(base_path)) |desc| {
+            const auth_header = extractHeader(raw, "Authorization");
+            const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+            const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+            const memory_authorized = if (pairing_guard) |g|
+                if (!g.requirePairing())
+                    true
+                else if (!g.hasPairedTokens())
+                    false
+                else
+                    isWebhookAuthorized(pairing_guard, bearer)
+            else
+                true;
+            if (!memory_authorized) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                _ = desc.method;
+                var memory_ctx = WebhookHandlerContext{
+                    .root_allocator = allocator,
+                    .req_allocator = req_allocator,
+                    .raw_request = raw,
+                    .method = method_str,
+                    .target = target,
+                    .config_opt = config_opt,
+                    .state = &state,
+                    .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+                };
+                desc.handler(&memory_ctx);
+                response_status = memory_ctx.response_status;
+                response_content_type = memory_ctx.response_content_type;
+                response_body = memory_ctx.response_body;
+            }
+        } else if (findCronRouteDescriptor(base_path)) |desc| {
             // Auth check for /cron endpoints:
             // - No pairing guard → allow (pairing not configured)
             // - Pairing disabled → allow
@@ -5832,6 +6259,242 @@ test "handleCronUpdate rejects invalid session_target" {
 
     try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
     try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid session_target") != null);
+}
+
+const GatewayMemoryRouteTestFixture = struct {
+    tmp: @TypeOf(std.testing.tmpDir(.{})),
+    workspace: []u8,
+    rt: memory_mod.MemoryRuntime,
+
+    fn init() !@This() {
+        var tmp = std.testing.tmpDir(.{});
+        const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        errdefer tmp.cleanup();
+        errdefer std.testing.allocator.free(workspace);
+
+        const cfg = config_types.MemoryConfig{ .backend = "memory" };
+        var rt = memory_mod.initRuntime(std.testing.allocator, &cfg, workspace) orelse return error.TestUnexpectedResult;
+        errdefer rt.deinit();
+
+        return .{
+            .tmp = tmp,
+            .workspace = workspace,
+            .rt = rt,
+        };
+    }
+
+    fn deinit(self: *@This()) void {
+        self.rt.deinit();
+        std.testing.allocator.free(self.workspace);
+        self.tmp.cleanup();
+    }
+};
+
+fn initMemoryRouteContext(
+    req_allocator: std.mem.Allocator,
+    state: *GatewayState,
+    raw_request: []const u8,
+    method: []const u8,
+    target: []const u8,
+) WebhookHandlerContext {
+    return .{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw_request,
+        .method = method,
+        .target = target,
+        .config_opt = null,
+        .state = state,
+        .session_mgr_opt = null,
+    };
+}
+
+test "memory gateway routes expose status and events" {
+    var fixture = try GatewayMemoryRouteTestFixture.init();
+    defer fixture.deinit();
+
+    const baseline_sequence = try fixture.rt.memory.lastEventSequence();
+    try fixture.rt.memory.store("prefs/theme", "dark", .core, "sess-a");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.memory_rt = &fixture.rt;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var status_ctx = initMemoryRouteContext(
+        req_allocator,
+        &state,
+        "GET /memory/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET",
+        "/memory/status",
+    );
+    handleMemoryStatusRoute(&status_ctx);
+    try std.testing.expectEqualStrings("200 OK", status_ctx.response_status);
+
+    var parsed_status = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, status_ctx.response_body, .{});
+    defer parsed_status.deinit();
+    try std.testing.expectEqualStrings("default", parsed_status.value.object.get("instance_id").?.string);
+    try std.testing.expect(parsed_status.value.object.get("last_sequence").?.integer >= 1);
+    try std.testing.expectEqualStrings("overlay", parsed_status.value.object.get("storage_kind").?.string);
+
+    var events_ctx = initMemoryRouteContext(
+        req_allocator,
+        &state,
+        try std.fmt.allocPrint(req_allocator, "GET /memory/events?after={d}&limit=10 HTTP/1.1\r\nHost: localhost\r\n\r\n", .{baseline_sequence}),
+        "GET",
+        try std.fmt.allocPrint(req_allocator, "/memory/events?after={d}&limit=10", .{baseline_sequence}),
+    );
+    handleMemoryEventsRoute(&events_ctx);
+    try std.testing.expectEqualStrings("200 OK", events_ctx.response_status);
+
+    var parsed_events = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, events_ctx.response_body, .{});
+    defer parsed_events.deinit();
+    const events = parsed_events.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("prefs/theme", events[0].object.get("key").?.string);
+    try std.testing.expectEqualStrings("sess-a", events[0].object.get("session_id").?.string);
+}
+
+test "memory gateway apply route accepts event payloads" {
+    var source = try GatewayMemoryRouteTestFixture.init();
+    defer source.deinit();
+    var target = try GatewayMemoryRouteTestFixture.init();
+    defer target.deinit();
+
+    const baseline_sequence = try source.rt.memory.lastEventSequence();
+    try source.rt.memory.store("prefs/theme", "solarized", .core, "sess-a");
+    const events = try source.rt.memory.listEvents(std.testing.allocator, baseline_sequence, 10);
+    defer memory_mod.freeEvents(std.testing.allocator, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.memory_rt = &target.rt;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /memory/apply HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"origin_instance_id\":\"{s}\",\"origin_sequence\":{d},\"timestamp_ms\":{d},\"operation\":\"{s}\",\"key\":\"{s}\",\"session_id\":\"{s}\",\"category\":\"{s}\",\"value_kind\":null,\"content\":\"{s}\"}}",
+        .{
+            events[0].origin_instance_id,
+            events[0].origin_sequence,
+            events[0].timestamp_ms,
+            events[0].operation.toString(),
+            events[0].key,
+            events[0].session_id.?,
+            events[0].category.?.toString(),
+            events[0].content.?,
+        },
+    );
+
+    var ctx = initMemoryRouteContext(req_allocator, &state, raw, "POST", "/memory/apply");
+    handleMemoryApplyRoute(&ctx);
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "\"kind\":\"event\"") != null);
+
+    const restored = try target.rt.memory.getScoped(std.testing.allocator, "prefs/theme", "sess-a") orelse
+        return error.TestUnexpectedResult;
+    defer restored.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("solarized", restored.content);
+}
+
+test "memory gateway apply route accepts checkpoint payloads" {
+    var source = try GatewayMemoryRouteTestFixture.init();
+    defer source.deinit();
+    var target = try GatewayMemoryRouteTestFixture.init();
+    defer target.deinit();
+
+    try source.rt.memory.store("prefs/language", "zig", .core, null);
+    try source.rt.memory.store("prefs/editor", "zed", .core, "sess-b");
+    const checkpoint = try source.rt.memory.exportCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(checkpoint);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.memory_rt = &target.rt;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /memory/apply HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-ndjson\r\n\r\n{s}",
+        .{checkpoint},
+    );
+
+    var ctx = initMemoryRouteContext(req_allocator, &state, raw, "POST", "/memory/apply");
+    handleMemoryApplyRoute(&ctx);
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "\"kind\":\"checkpoint\"") != null);
+
+    const global_entry = try target.rt.memory.get(std.testing.allocator, "prefs/language") orelse
+        return error.TestUnexpectedResult;
+    defer global_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("zig", global_entry.content);
+
+    const scoped_entry = try target.rt.memory.getScoped(std.testing.allocator, "prefs/editor", "sess-b") orelse
+        return error.TestUnexpectedResult;
+    defer scoped_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("zed", scoped_entry.content);
+}
+
+test "memory gateway compact and checkpoint routes expose lifecycle controls" {
+    var fixture = try GatewayMemoryRouteTestFixture.init();
+    defer fixture.deinit();
+
+    try fixture.rt.memory.store("prefs/theme", "dark", .core, null);
+    try fixture.rt.memory.store("prefs/editor", "zed", .core, null);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.memory_rt = &fixture.rt;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var checkpoint_ctx = initMemoryRouteContext(
+        req_allocator,
+        &state,
+        "GET /memory/checkpoint HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET",
+        "/memory/checkpoint",
+    );
+    handleMemoryCheckpointRoute(&checkpoint_ctx);
+    try std.testing.expectEqualStrings("200 OK", checkpoint_ctx.response_status);
+    try std.testing.expectEqualStrings("application/x-ndjson", checkpoint_ctx.response_content_type);
+    try std.testing.expect(isGatewayCheckpointPayload(std.testing.allocator, checkpoint_ctx.response_body));
+
+    var compact_ctx = initMemoryRouteContext(
+        req_allocator,
+        &state,
+        "POST /memory/compact HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{}",
+        "POST",
+        "/memory/compact",
+    );
+    handleMemoryCompactRoute(&compact_ctx);
+    try std.testing.expectEqualStrings("200 OK", compact_ctx.response_status);
+
+    var parsed_compact = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, compact_ctx.response_body, .{});
+    defer parsed_compact.deinit();
+    try std.testing.expect(parsed_compact.value.object.get("compacted_through_sequence").?.integer >= 2);
+
+    var events_ctx = initMemoryRouteContext(
+        req_allocator,
+        &state,
+        "GET /memory/events?after=0&limit=10 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET",
+        "/memory/events?after=0&limit=10",
+    );
+    handleMemoryEventsRoute(&events_ctx);
+    try std.testing.expectEqualStrings("410 Gone", events_ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, events_ctx.response_body, "cursor expired") != null);
 }
 
 test "constants are set correctly" {

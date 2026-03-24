@@ -41,6 +41,10 @@ pub const c = struct {
         return SQLITE_OK;
     }
 
+    pub fn sqlite3_busy_timeout(_: ?*sqlite3, _: c_int) c_int {
+        return SQLITE_OK;
+    }
+
     pub fn sqlite3_exec(_: ?*sqlite3, _: [*c]const u8, _: ?*const anyopaque, _: ?*anyopaque, err_msg: ?*[*c]u8) c_int {
         if (err_msg) |p| p.* = null;
         return SQLITE_ERROR;
@@ -55,6 +59,14 @@ pub const c = struct {
 
     pub fn sqlite3_step(_: ?*sqlite3_stmt) c_int {
         return SQLITE_DONE;
+    }
+
+    pub fn sqlite3_reset(_: ?*sqlite3_stmt) c_int {
+        return SQLITE_OK;
+    }
+
+    pub fn sqlite3_clear_bindings(_: ?*sqlite3_stmt) c_int {
+        return SQLITE_OK;
     }
 
     pub fn sqlite3_finalize(_: ?*sqlite3_stmt) c_int {
@@ -115,6 +127,14 @@ pub const c = struct {
 
     pub fn sqlite3_changes(_: ?*sqlite3) c_int {
         return 0;
+    }
+
+    pub fn sqlite3_errmsg(_: ?*sqlite3) [*c]const u8 {
+        return @ptrCast("sqlite disabled");
+    }
+
+    pub fn sqlite3_get_autocommit(_: ?*sqlite3) c_int {
+        return 1;
     }
 };
 

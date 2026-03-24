@@ -436,6 +436,7 @@ pub const MemoryEventFeedStorage = enum {
 pub const MemoryEventFeedInfo = struct {
     instance_id: []const u8,
     last_sequence: u64,
+    next_local_origin_sequence: u64 = 1,
     supports_compaction: bool = false,
     storage_kind: MemoryEventFeedStorage = .native,
     journal_path: ?[]const u8 = null,
@@ -904,6 +905,8 @@ pub const Memory = struct {
         lastEventSequence: ?*const fn (ptr: *anyopaque) anyerror!u64 = null,
         eventFeedInfo: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!MemoryEventFeedInfo = null,
         compactEvents: ?*const fn (ptr: *anyopaque) anyerror!u64 = null,
+        exportCheckpoint: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 = null,
+        applyCheckpoint: ?*const fn (ptr: *anyopaque, payload: []const u8) anyerror!void = null,
         count: *const fn (ptr: *anyopaque) anyerror!usize,
         healthCheck: *const fn (ptr: *anyopaque) bool,
         deinit: *const fn (ptr: *anyopaque) void,
@@ -995,6 +998,16 @@ pub const Memory = struct {
     pub fn compactEvents(self: Memory) !u64 {
         const func = self.vtable.compactEvents orelse return error.NotSupported;
         return func(self.ptr);
+    }
+
+    pub fn exportCheckpoint(self: Memory, allocator: std.mem.Allocator) ![]u8 {
+        const func = self.vtable.exportCheckpoint orelse return error.NotSupported;
+        return func(self.ptr, allocator);
+    }
+
+    pub fn applyCheckpoint(self: Memory, payload: []const u8) !void {
+        const func = self.vtable.applyCheckpoint orelse return error.NotSupported;
+        return func(self.ptr, payload);
     }
 
     pub fn count(self: Memory) !usize {
@@ -2984,6 +2997,76 @@ test "initRuntime memory backend supports deterministic behavioral merge events"
         "{\"persona\":{\"direct\":true,\"warm\":true},\"tone\":\"formal\",\"verbosity\":\"low\"}",
         behavior.content,
     );
+}
+
+test "cross-backend runtimes synchronize via events and checkpoints" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    try requireBackendEnabledForTests("memory");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_dir = try std.fs.path.join(std.testing.allocator, &.{ "source" });
+    defer std.testing.allocator.free(source_dir);
+    const replica_dir = try std.fs.path.join(std.testing.allocator, &.{ "replica" });
+    defer std.testing.allocator.free(replica_dir);
+    const restored_dir = try std.fs.path.join(std.testing.allocator, &.{ "restored" });
+    defer std.testing.allocator.free(restored_dir);
+    try tmp.dir.makePath(source_dir);
+    try tmp.dir.makePath(replica_dir);
+    try tmp.dir.makePath(restored_dir);
+
+    const source_workspace = try tmp.dir.realpathAlloc(std.testing.allocator, source_dir);
+    defer std.testing.allocator.free(source_workspace);
+    const replica_workspace = try tmp.dir.realpathAlloc(std.testing.allocator, replica_dir);
+    defer std.testing.allocator.free(replica_workspace);
+    const restored_workspace = try tmp.dir.realpathAlloc(std.testing.allocator, restored_dir);
+    defer std.testing.allocator.free(restored_workspace);
+
+    const source_cfg = config_types.MemoryConfig{ .backend = "memory" };
+    const replica_cfg = config_types.MemoryConfig{ .backend = "sqlite" };
+
+    var source = initRuntime(std.testing.allocator, &source_cfg, source_workspace) orelse return error.TestUnexpectedResult;
+    defer source.deinit();
+    var replica = initRuntime(std.testing.allocator, &replica_cfg, replica_workspace) orelse return error.TestUnexpectedResult;
+    defer replica.deinit();
+
+    const baseline_sequence = try source.memory.lastEventSequence();
+    try source.memory.store("preferences.theme", "solarized", .core, "sess-a");
+    const events = try source.memory.listEvents(std.testing.allocator, baseline_sequence, 10);
+    defer freeEvents(std.testing.allocator, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+
+    for (events) |event| {
+        try replica.memory.applyEvent(.{
+            .origin_instance_id = event.origin_instance_id,
+            .origin_sequence = event.origin_sequence,
+            .timestamp_ms = event.timestamp_ms,
+            .operation = event.operation,
+            .key = event.key,
+            .session_id = event.session_id,
+            .category = event.category,
+            .value_kind = event.value_kind,
+            .content = event.content,
+        });
+    }
+
+    const replicated = try replica.memory.getScoped(std.testing.allocator, "preferences.theme", "sess-a") orelse
+        return error.TestUnexpectedResult;
+    defer replicated.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("solarized", replicated.content);
+
+    const checkpoint = try source.memory.exportCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(checkpoint);
+
+    var restored = initRuntime(std.testing.allocator, &replica_cfg, restored_workspace) orelse return error.TestUnexpectedResult;
+    defer restored.deinit();
+    try restored.memory.applyCheckpoint(checkpoint);
+
+    const restored_entry = try restored.memory.getScoped(std.testing.allocator, "preferences.theme", "sess-a") orelse
+        return error.TestUnexpectedResult;
+    defer restored_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("solarized", restored_entry.content);
 }
 
 test {

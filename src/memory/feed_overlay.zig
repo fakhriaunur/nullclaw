@@ -279,6 +279,7 @@ pub const EventFeedOverlay = struct {
         return .{
             .instance_id = try allocator.dupe(u8, self_.instance_id),
             .last_sequence = self_.last_sequence,
+            .next_local_origin_sequence = (self_.origin_frontiers.get(self_.instance_id) orelse 0) + 1,
             .supports_compaction = true,
             .storage_kind = .overlay,
             .journal_path = try allocator.dupe(u8, self_.journal_path),
@@ -291,6 +292,19 @@ pub const EventFeedOverlay = struct {
     fn implCompactEvents(ptr: *anyopaque) anyerror!u64 {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         return self_.compactEventsInternal();
+    }
+
+    fn implExportCheckpoint(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        var file = try self_.openJournalShared();
+        defer file.close();
+        try self_.refreshJournalLocked(&file);
+        return self_.serializeCheckpointPayload(allocator);
+    }
+
+    fn implApplyCheckpoint(ptr: *anyopaque, payload: []const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        try self_.applyCheckpointPayload(payload);
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -325,6 +339,8 @@ pub const EventFeedOverlay = struct {
         .lastEventSequence = &implLastEventSequence,
         .eventFeedInfo = &implEventFeedInfo,
         .compactEvents = &implCompactEvents,
+        .exportCheckpoint = &implExportCheckpoint,
+        .applyCheckpoint = &implApplyCheckpoint,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -572,32 +588,84 @@ pub const EventFeedOverlay = struct {
         });
         defer file.close();
 
-        try self.writeCheckpointMetaLine(&file);
+        var buf: [4096]u8 = undefined;
+        var file_writer = file.writer(&buf);
+        const writer = &file_writer.interface;
+        try self.writeCheckpointToWriter(writer);
+        try writer.flush();
+        try file.sync();
+    }
+
+    fn writeCheckpointToWriter(self: *Self, writer: anytype) !void {
+        try self.writeCheckpointMetaLine(writer);
 
         var frontier_it = self.origin_frontiers.iterator();
         while (frontier_it.next()) |kv| {
-            try self.writeCheckpointFrontierLine(&file, kv.key_ptr.*, kv.value_ptr.*);
+            try self.writeCheckpointFrontierLine(writer, kv.key_ptr.*, kv.value_ptr.*);
         }
 
         var state_it = self.state_entries.iterator();
         while (state_it.next()) |kv| {
-            try self.writeCheckpointStateLine(&file, kv.value_ptr.*);
+            try self.writeCheckpointStateLine(writer, kv.value_ptr.*);
         }
 
         var scoped_it = self.scoped_tombstones.iterator();
         while (scoped_it.next()) |kv| {
-            try self.writeCheckpointTombstoneLine(&file, "scoped_tombstone", kv.key_ptr.*, kv.value_ptr.*);
+            try self.writeCheckpointTombstoneLine(writer, "scoped_tombstone", kv.key_ptr.*, kv.value_ptr.*);
         }
 
         var key_it = self.key_tombstones.iterator();
         while (key_it.next()) |kv| {
-            try self.writeCheckpointTombstoneLine(&file, "key_tombstone", kv.key_ptr.*, kv.value_ptr.*);
+            try self.writeCheckpointTombstoneLine(writer, "key_tombstone", kv.key_ptr.*, kv.value_ptr.*);
         }
-
-        try file.sync();
     }
 
-    fn writeCheckpointMetaLine(self: *Self, file: *std.fs.File) !void {
+    fn serializeCheckpointPayload(self: *Self, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        const writer = out.writer(allocator);
+        try self.writeCheckpointToWriter(writer);
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn applyCheckpointPayload(self: *Self, payload: []const u8) !void {
+        var scratch = Self{
+            .allocator = self.allocator,
+            .backend = self.backend,
+            .journal_path = try self.allocator.dupe(u8, ""),
+            .checkpoint_path = try self.allocator.dupe(u8, ""),
+            .instance_id = try self.allocator.dupe(u8, self.instance_id),
+        };
+        defer scratch.deinitMembers();
+
+        var lines = std.mem.splitScalar(u8, payload, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r\n");
+            if (line.len == 0) continue;
+            try scratch.applyCheckpointLine(line);
+        }
+
+        var checkpoint_file = try std.fs.createFileAbsolute(self.checkpoint_path, .{
+            .truncate = true,
+            .read = true,
+        });
+        defer checkpoint_file.close();
+        try checkpoint_file.writeAll(payload);
+        try checkpoint_file.sync();
+
+        var journal_file = try self.openJournalExclusive();
+        defer journal_file.close();
+        try journal_file.setEndPos(0);
+        try journal_file.sync();
+
+        self.clearJournalState();
+        try self.loadCheckpoint();
+        try self.rebuildProjectionFromCanonical();
+        self.loaded_size_bytes = 0;
+        self.projection_offset_bytes = 0;
+    }
+
+    fn writeCheckpointMetaLine(self: *Self, writer: anytype) !void {
         var payload: std.ArrayListUnmanaged(u8) = .empty;
         defer payload.deinit(self.allocator);
 
@@ -615,10 +683,10 @@ pub const EventFeedOverlay = struct {
         try json_util.appendJsonKey(&payload, self.allocator, "compacted_through_sequence");
         try payload.writer(self.allocator).print("{d}", .{self.last_sequence});
         try payload.appendSlice(self.allocator, "}\n");
-        try file.writeAll(payload.items);
+        try writer.writeAll(payload.items);
     }
 
-    fn writeCheckpointFrontierLine(self: *Self, file: *std.fs.File, origin_instance_id: []const u8, origin_sequence: u64) !void {
+    fn writeCheckpointFrontierLine(self: *Self, writer: anytype, origin_instance_id: []const u8, origin_sequence: u64) !void {
         var payload: std.ArrayListUnmanaged(u8) = .empty;
         defer payload.deinit(self.allocator);
 
@@ -630,10 +698,10 @@ pub const EventFeedOverlay = struct {
         try json_util.appendJsonKey(&payload, self.allocator, "origin_sequence");
         try payload.writer(self.allocator).print("{d}", .{origin_sequence});
         try payload.appendSlice(self.allocator, "}\n");
-        try file.writeAll(payload.items);
+        try writer.writeAll(payload.items);
     }
 
-    fn writeCheckpointStateLine(self: *Self, file: *std.fs.File, state: StoredState) !void {
+    fn writeCheckpointStateLine(self: *Self, writer: anytype, state: StoredState) !void {
         var payload: std.ArrayListUnmanaged(u8) = .empty;
         defer payload.deinit(self.allocator);
 
@@ -668,10 +736,10 @@ pub const EventFeedOverlay = struct {
         try json_util.appendJsonKey(&payload, self.allocator, "origin_sequence");
         try payload.writer(self.allocator).print("{d}", .{state.origin_sequence});
         try payload.appendSlice(self.allocator, "}\n");
-        try file.writeAll(payload.items);
+        try writer.writeAll(payload.items);
     }
 
-    fn writeCheckpointTombstoneLine(self: *Self, file: *std.fs.File, kind: []const u8, key: []const u8, meta: EventMeta) !void {
+    fn writeCheckpointTombstoneLine(self: *Self, writer: anytype, kind: []const u8, key: []const u8, meta: EventMeta) !void {
         var payload: std.ArrayListUnmanaged(u8) = .empty;
         defer payload.deinit(self.allocator);
 
@@ -688,7 +756,7 @@ pub const EventFeedOverlay = struct {
         try json_util.appendJsonKey(&payload, self.allocator, "origin_sequence");
         try payload.writer(self.allocator).print("{d}", .{meta.origin_sequence});
         try payload.appendSlice(self.allocator, "}\n");
-        try file.writeAll(payload.items);
+        try writer.writeAll(payload.items);
     }
 
     fn applyCheckpointLine(self: *Self, line: []const u8) !void {
@@ -1836,4 +1904,46 @@ test "feed overlay compaction creates checkpoint, enforces cursor floor, and sur
         try std.testing.expectEqual(@as(usize, 1), tail.len);
         try std.testing.expectEqual(compacted_through + 1, tail[0].sequence);
     }
+}
+
+test "feed overlay checkpoint restores replica and preserves local origin frontier" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var source_backend = FailingProjectionBackend.init(std.testing.allocator);
+    source_backend.fail_writes = false;
+    var source = try EventFeedOverlay.init(std.testing.allocator, source_backend.memory(), workspace, "checkpoint-source", "agent-a");
+    defer source.deinit();
+
+    const source_mem = source.memory();
+    try source_mem.store("preferences.theme", "dark", .core, null);
+    _ = try source_mem.compactEvents();
+
+    const checkpoint = try source_mem.exportCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(checkpoint);
+
+    var replica_backend = FailingProjectionBackend.init(std.testing.allocator);
+    replica_backend.fail_writes = false;
+    var replica = try EventFeedOverlay.init(std.testing.allocator, replica_backend.memory(), workspace, "checkpoint-replica", "agent-a");
+    defer replica.deinit();
+
+    const replica_mem = replica.memory();
+    try replica_mem.applyCheckpoint(checkpoint);
+
+    const entry = (try replica_mem.getScoped(std.testing.allocator, "preferences.theme", null)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("dark", entry.content);
+
+    const info = try replica_mem.eventFeedInfo(std.testing.allocator);
+    defer info.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 2), info.next_local_origin_sequence);
+
+    try replica_mem.store("preferences.locale", "en", .core, null);
+    const tail = try replica_mem.listEvents(std.testing.allocator, info.compacted_through_sequence, 8);
+    defer root.freeEvents(std.testing.allocator, tail);
+    try std.testing.expectEqual(@as(usize, 1), tail.len);
+    try std.testing.expectEqual(@as(u64, 2), tail[0].origin_sequence);
 }

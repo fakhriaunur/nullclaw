@@ -11,7 +11,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const json_util = @import("../../json_util.zig");
 const root = @import("../root.zig");
+const key_codec = @import("../vector/key_codec.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
@@ -658,6 +660,19 @@ pub const SqliteMemory = struct {
         if (rc != c.SQLITE_DONE) return error.StepFailed;
     }
 
+    fn setLocalSequenceFloorTx(self: *Self, sequence: u64) !void {
+        const sql =
+            "INSERT INTO sqlite_sequence (name, seq) VALUES ('memory_events', ?1) " ++
+            "ON CONFLICT(name) DO UPDATE SET seq = MAX(seq, excluded.seq)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(sequence));
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
     fn compareInputToMetadata(input: MemoryEventInput, timestamp_ms: i64, origin_instance_id: []const u8, origin_sequence: u64) i8 {
         if (input.timestamp_ms < timestamp_ms) return -1;
         if (input.timestamp_ms > timestamp_ms) return 1;
@@ -763,6 +778,19 @@ pub const SqliteMemory = struct {
         return 0;
     }
 
+    fn queryMaxI64(self: *Self, sql: [:0]const u8) !i64 {
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+        return 0;
+    }
+
     fn bootstrapEventFeedFromExistingMemories(self: *Self) !void {
         if (try self.getCompactedThroughSequence() > 0) return;
         const event_count = try self.queryCount("SELECT COUNT(*) FROM memory_events");
@@ -848,28 +876,47 @@ pub const SqliteMemory = struct {
         return (try self.getFrontierTx(self.localInstanceId())) + 1;
     }
 
-    fn insertEventTx(self: *Self, input: MemoryEventInput) !bool {
-        const sql =
-            "INSERT INTO memory_events (schema_version, origin_instance_id, origin_sequence, timestamp_ms, operation, key, session_id, category, value_kind, content) " ++
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+    fn nextEventSequenceTx(self: *Self) !u64 {
+        const sql = "SELECT COALESCE(MAX(local_sequence), 0) FROM memory_events";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
+        rc = c.sqlite3_step(stmt);
+        const compacted_through = try self.getCompactedThroughSequence();
+        if (rc == c.SQLITE_ROW) {
+            const value = c.sqlite3_column_int64(stmt, 0);
+            const last_in_events = if (value < 0) 0 else @as(u64, @intCast(value));
+            return @max(last_in_events, compacted_through) + 1;
+        }
+        return compacted_through + 1;
+    }
+
+    fn insertEventTx(self: *Self, input: MemoryEventInput) !bool {
+        const sql =
+            "INSERT INTO memory_events (local_sequence, schema_version, origin_instance_id, origin_sequence, timestamp_ms, operation, key, session_id, category, value_kind, content) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const next_event_sequence = try self.nextEventSequenceTx();
         const category_str = if (input.category) |category| category.toString() else null;
         const value_kind_str = if (input.value_kind) |value_kind| value_kind.toString() else null;
-        _ = c.sqlite3_bind_int64(stmt, 1, 1);
-        _ = c.sqlite3_bind_text(stmt, 2, input.origin_instance_id.ptr, @intCast(input.origin_instance_id.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_int64(stmt, 3, @intCast(input.origin_sequence));
-        _ = c.sqlite3_bind_int64(stmt, 4, input.timestamp_ms);
+        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(next_event_sequence));
+        _ = c.sqlite3_bind_int64(stmt, 2, 1);
+        _ = c.sqlite3_bind_text(stmt, 3, input.origin_instance_id.ptr, @intCast(input.origin_instance_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 4, @intCast(input.origin_sequence));
+        _ = c.sqlite3_bind_int64(stmt, 5, input.timestamp_ms);
         const op_str = input.operation.toString();
-        _ = c.sqlite3_bind_text(stmt, 5, op_str.ptr, @intCast(op_str.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_text(stmt, 6, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
-        bindNullableText(stmt, 7, input.session_id);
-        bindNullableText(stmt, 8, category_str);
-        bindNullableText(stmt, 9, value_kind_str);
-        bindNullableText(stmt, 10, input.content);
+        _ = c.sqlite3_bind_text(stmt, 6, op_str.ptr, @intCast(op_str.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 7, input.key.ptr, @intCast(input.key.len), SQLITE_STATIC);
+        bindNullableText(stmt, 8, input.session_id);
+        bindNullableText(stmt, 9, category_str);
+        bindNullableText(stmt, 10, value_kind_str);
+        bindNullableText(stmt, 11, input.content);
 
         rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) return true;
@@ -1411,6 +1458,7 @@ pub const SqliteMemory = struct {
         return .{
             .instance_id = try allocator.dupe(u8, self_.localInstanceId()),
             .last_sequence = try implLastEventSequence(ptr),
+            .next_local_origin_sequence = try self_.nextLocalOriginSequenceTx(),
             .supports_compaction = true,
             .compacted_through_sequence = compacted_through,
             .oldest_available_sequence = compacted_through + 1,
@@ -1443,6 +1491,417 @@ pub const SqliteMemory = struct {
         if (owns_tx) try self_.commitTxn();
         committed = true;
         return compacted_through;
+    }
+
+    fn implExportCheckpoint(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.exportCheckpointPayload(allocator);
+    }
+
+    fn implApplyCheckpoint(ptr: *anyopaque, payload: []const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        try self_.applyCheckpointPayload(payload);
+    }
+
+    const CheckpointStateRow = struct {
+        key: []u8,
+        session_id: ?[]u8,
+        category: []u8,
+        value_kind: ?[]u8,
+        content: []u8,
+        timestamp_ms: i64,
+        origin_instance_id: []u8,
+        origin_sequence: u64,
+
+        fn deinit(self: *const CheckpointStateRow, allocator: std.mem.Allocator) void {
+            allocator.free(self.key);
+            if (self.session_id) |sid| allocator.free(sid);
+            allocator.free(self.category);
+            if (self.value_kind) |kind| allocator.free(kind);
+            allocator.free(self.content);
+            allocator.free(self.origin_instance_id);
+        }
+    };
+
+    const CheckpointFrontierRow = struct {
+        origin_instance_id: []u8,
+        origin_sequence: u64,
+
+        fn deinit(self: *const CheckpointFrontierRow, allocator: std.mem.Allocator) void {
+            allocator.free(self.origin_instance_id);
+        }
+    };
+
+    const CheckpointTombstoneRow = struct {
+        kind: []const u8,
+        key: []u8,
+        timestamp_ms: i64,
+        origin_instance_id: []u8,
+        origin_sequence: u64,
+
+        fn deinit(self: *const CheckpointTombstoneRow, allocator: std.mem.Allocator) void {
+            allocator.free(self.key);
+            allocator.free(self.origin_instance_id);
+        }
+    };
+
+    fn appendCheckpointMetaLine(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        last_sequence: u64,
+        last_timestamp_ms: i64,
+    ) !void {
+        try out.append(allocator, '{');
+        try json_util.appendJsonKeyValue(out, allocator, "kind", "meta");
+        try out.append(allocator, ',');
+        try json_util.appendJsonInt(out, allocator, "schema_version", 1);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "last_sequence");
+        try out.writer(allocator).print("{d}", .{last_sequence});
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "last_timestamp_ms");
+        try out.writer(allocator).print("{d}", .{last_timestamp_ms});
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "compacted_through_sequence");
+        try out.writer(allocator).print("{d}", .{last_sequence});
+        try out.appendSlice(allocator, "}\n");
+    }
+
+    fn appendCheckpointFrontierLine(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), origin_instance_id: []const u8, origin_sequence: u64) !void {
+        try out.append(allocator, '{');
+        try json_util.appendJsonKeyValue(out, allocator, "kind", "frontier");
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "origin_instance_id", origin_instance_id);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "origin_sequence");
+        try out.writer(allocator).print("{d}", .{origin_sequence});
+        try out.appendSlice(allocator, "}\n");
+    }
+
+    fn appendCheckpointStateLine(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), row: CheckpointStateRow) !void {
+        try out.append(allocator, '{');
+        try json_util.appendJsonKeyValue(out, allocator, "kind", "state");
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "key", row.key);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "session_id");
+        if (row.session_id) |sid| {
+            try json_util.appendJsonString(out, allocator, sid);
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "category", row.category);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "value_kind");
+        if (row.value_kind) |kind| {
+            try json_util.appendJsonString(out, allocator, kind);
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "content", row.content);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "timestamp_ms");
+        try out.writer(allocator).print("{d}", .{row.timestamp_ms});
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "origin_instance_id", row.origin_instance_id);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "origin_sequence");
+        try out.writer(allocator).print("{d}", .{row.origin_sequence});
+        try out.appendSlice(allocator, "}\n");
+    }
+
+    fn appendCheckpointTombstoneLine(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), row: CheckpointTombstoneRow) !void {
+        try out.append(allocator, '{');
+        try json_util.appendJsonKeyValue(out, allocator, "kind", row.kind);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "key", row.key);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "timestamp_ms");
+        try out.writer(allocator).print("{d}", .{row.timestamp_ms});
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "origin_instance_id", row.origin_instance_id);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "origin_sequence");
+        try out.writer(allocator).print("{d}", .{row.origin_sequence});
+        try out.appendSlice(allocator, "}\n");
+    }
+
+    fn exportCheckpointPayload(self: *Self, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        const last_sequence = try self.memory().lastEventSequence();
+        const last_timestamp_ms = @max(
+            try self.queryMaxI64("SELECT COALESCE(MAX(event_timestamp_ms), 0) FROM memories"),
+            try self.queryMaxI64("SELECT COALESCE(MAX(timestamp_ms), 0) FROM memory_tombstones"),
+        );
+        try appendCheckpointMetaLine(allocator, &out, last_sequence, last_timestamp_ms);
+
+        {
+            const sql = "SELECT origin_instance_id, last_origin_sequence FROM memory_event_frontiers ORDER BY origin_instance_id ASC";
+            var stmt: ?*c.sqlite3_stmt = null;
+            var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            while (true) {
+                rc = c.sqlite3_step(stmt);
+                if (rc != c.SQLITE_ROW) break;
+                const origin_instance_id = try dupeColumnText(stmt.?, 0, allocator);
+                defer allocator.free(origin_instance_id);
+                const origin_sequence: u64 = @intCast(@max(c.sqlite3_column_int64(stmt, 1), 0));
+                try appendCheckpointFrontierLine(allocator, &out, origin_instance_id, origin_sequence);
+            }
+        }
+
+        {
+            const sql =
+                "SELECT key, session_id, category, value_kind, content, event_timestamp_ms, event_origin_instance_id, event_origin_sequence " ++
+                "FROM memories ORDER BY key ASC, COALESCE(session_id, '') ASC";
+            var stmt: ?*c.sqlite3_stmt = null;
+            var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            while (true) {
+                rc = c.sqlite3_step(stmt);
+                if (rc != c.SQLITE_ROW) break;
+                const row = CheckpointStateRow{
+                    .key = try dupeColumnText(stmt.?, 0, allocator),
+                    .session_id = try dupeColumnTextNullable(stmt.?, 1, allocator),
+                    .category = try dupeColumnText(stmt.?, 2, allocator),
+                    .value_kind = try dupeColumnTextNullable(stmt.?, 3, allocator),
+                    .content = try dupeColumnText(stmt.?, 4, allocator),
+                    .timestamp_ms = c.sqlite3_column_int64(stmt, 5),
+                    .origin_instance_id = try dupeColumnText(stmt.?, 6, allocator),
+                    .origin_sequence = @intCast(@max(c.sqlite3_column_int64(stmt, 7), 0)),
+                };
+                defer row.deinit(allocator);
+                try appendCheckpointStateLine(allocator, &out, row);
+            }
+        }
+
+        {
+            const sql =
+                "SELECT key, scope, session_id, timestamp_ms, origin_instance_id, origin_sequence " ++
+                "FROM memory_tombstones ORDER BY key ASC, scope ASC, COALESCE(session_id, '') ASC";
+            var stmt: ?*c.sqlite3_stmt = null;
+            var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            while (true) {
+                rc = c.sqlite3_step(stmt);
+                if (rc != c.SQLITE_ROW) break;
+                const scope = try dupeColumnText(stmt.?, 1, allocator);
+                defer allocator.free(scope);
+                const logical_key = try dupeColumnText(stmt.?, 0, allocator);
+                defer allocator.free(logical_key);
+                const session_id = try dupeColumnTextNullable(stmt.?, 2, allocator);
+                defer if (session_id) |sid| allocator.free(sid);
+                const encoded_key = if (std.mem.eql(u8, scope, "all"))
+                    try allocator.dupe(u8, logical_key)
+                else
+                    try key_codec.encode(allocator, logical_key, session_id);
+                defer allocator.free(encoded_key);
+                const row = CheckpointTombstoneRow{
+                    .kind = if (std.mem.eql(u8, scope, "all")) "key_tombstone" else "scoped_tombstone",
+                    .key = try allocator.dupe(u8, encoded_key),
+                    .timestamp_ms = c.sqlite3_column_int64(stmt, 3),
+                    .origin_instance_id = try dupeColumnText(stmt.?, 4, allocator),
+                    .origin_sequence = @intCast(@max(c.sqlite3_column_int64(stmt, 5), 0)),
+                };
+                defer row.deinit(allocator);
+                try appendCheckpointTombstoneLine(allocator, &out, row);
+            }
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn applyCheckpointPayload(self: *Self, payload: []const u8) !void {
+        var owns_tx = c.sqlite3_get_autocommit(self.db) != 0;
+        if (owns_tx) owns_tx = try self.beginImmediate();
+        var committed = false;
+        errdefer if (owns_tx and !committed) self.rollbackTxn();
+
+        try self.execSql("checkpoint import", "DELETE FROM memory_events;");
+        try self.execSql("checkpoint import", "DELETE FROM memory_tombstones;");
+        try self.execSql("checkpoint import", "DELETE FROM memory_event_frontiers;");
+        try self.execSql("checkpoint import", "DELETE FROM memories;");
+        try self.execSql("checkpoint import", "DELETE FROM memory_feed_meta;");
+
+        var last_sequence: u64 = 0;
+        var compacted_through: u64 = 0;
+        var saw_meta = false;
+
+        var lines = std.mem.splitScalar(u8, payload, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r\n");
+            if (line.len == 0) continue;
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, line, .{});
+            defer parsed.deinit();
+
+            const kind = checkpointJsonStringField(parsed.value, "kind") orelse return error.InvalidEvent;
+            if (std.mem.eql(u8, kind, "meta")) {
+                saw_meta = true;
+                last_sequence = checkpointJsonUnsignedField(parsed.value, "last_sequence") orelse 0;
+                compacted_through = checkpointJsonUnsignedField(parsed.value, "compacted_through_sequence") orelse last_sequence;
+                continue;
+            }
+            if (std.mem.eql(u8, kind, "frontier")) {
+                const origin_instance_id = checkpointJsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
+                const origin_sequence = checkpointJsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
+                try self.insertCheckpointFrontier(origin_instance_id, origin_sequence);
+                continue;
+            }
+            if (std.mem.eql(u8, kind, "state")) {
+                const key = checkpointJsonStringField(parsed.value, "key") orelse return error.InvalidEvent;
+                const content = checkpointJsonStringField(parsed.value, "content") orelse return error.InvalidEvent;
+                const category = checkpointJsonStringField(parsed.value, "category") orelse return error.InvalidEvent;
+                const value_kind = checkpointJsonNullableStringField(parsed.value, "value_kind");
+                const timestamp_ms = checkpointJsonIntegerField(parsed.value, "timestamp_ms") orelse return error.InvalidEvent;
+                const origin_instance_id = checkpointJsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
+                const origin_sequence = checkpointJsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
+                try self.insertCheckpointState(
+                    key,
+                    checkpointJsonNullableStringField(parsed.value, "session_id"),
+                    category,
+                    value_kind,
+                    content,
+                    timestamp_ms,
+                    origin_instance_id,
+                    origin_sequence,
+                );
+                continue;
+            }
+            if (std.mem.eql(u8, kind, "scoped_tombstone") or std.mem.eql(u8, kind, "key_tombstone")) {
+                const key = checkpointJsonStringField(parsed.value, "key") orelse return error.InvalidEvent;
+                const timestamp_ms = checkpointJsonIntegerField(parsed.value, "timestamp_ms") orelse return error.InvalidEvent;
+                const origin_instance_id = checkpointJsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
+                const origin_sequence = checkpointJsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
+                try self.insertCheckpointTombstone(kind, key, timestamp_ms, origin_instance_id, origin_sequence);
+                continue;
+            }
+            return error.InvalidEvent;
+        }
+
+        if (!saw_meta) return error.InvalidEvent;
+        try self.setCompactedThroughSequenceTx(compacted_through);
+        if (owns_tx) try self.commitTxn();
+        committed = true;
+    }
+
+    fn insertCheckpointFrontier(self: *Self, origin_instance_id: []const u8, origin_sequence: u64) !void {
+        const sql = "INSERT INTO memory_event_frontiers (origin_instance_id, last_origin_sequence) VALUES (?1, ?2)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, origin_instance_id.ptr, @intCast(origin_instance_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(origin_sequence));
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn insertCheckpointState(
+        self: *Self,
+        key: []const u8,
+        session_id: ?[]const u8,
+        category: []const u8,
+        value_kind: ?[]const u8,
+        content: []const u8,
+        timestamp_ms: i64,
+        origin_instance_id: []const u8,
+        origin_sequence: u64,
+    ) !void {
+        const now = try std.fmt.allocPrint(self.allocator, "{d}", .{@divTrunc(timestamp_ms, 1000)});
+        defer self.allocator.free(now);
+        const id = try generateId(self.allocator);
+        defer self.allocator.free(id);
+
+        const sql =
+            "INSERT INTO memories (id, key, content, category, value_kind, session_id, event_timestamp_ms, event_origin_instance_id, event_origin_sequence, created_at, updated_at) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 4, category.ptr, @intCast(category.len), SQLITE_STATIC);
+        bindNullableText(stmt, 5, value_kind);
+        bindNullableText(stmt, 6, session_id);
+        _ = c.sqlite3_bind_int64(stmt, 7, timestamp_ms);
+        _ = c.sqlite3_bind_text(stmt, 8, origin_instance_id.ptr, @intCast(origin_instance_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 9, @intCast(origin_sequence));
+        _ = c.sqlite3_bind_text(stmt, 10, now.ptr, @intCast(now.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 11, now.ptr, @intCast(now.len), SQLITE_STATIC);
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn insertCheckpointTombstone(
+        self: *Self,
+        kind: []const u8,
+        key: []const u8,
+        timestamp_ms: i64,
+        origin_instance_id: []const u8,
+        origin_sequence: u64,
+    ) !void {
+        const scope = if (std.mem.eql(u8, kind, "key_tombstone")) "all" else "scoped";
+        const decoded = if (std.mem.eql(u8, kind, "key_tombstone"))
+            key_codec.DecodedVectorKey{ .logical_key = key, .session_id = null, .is_legacy = false }
+        else
+            key_codec.decode(key);
+        if (std.mem.eql(u8, kind, "scoped_tombstone") and decoded.is_legacy) return error.InvalidEvent;
+        const session_key = if (std.mem.eql(u8, kind, "key_tombstone")) "*" else sessionKeyFor(decoded.session_id);
+        const session_id: ?[]const u8 = decoded.session_id;
+        const sql =
+            "INSERT INTO memory_tombstones (key, scope, session_key, session_id, timestamp_ms, origin_instance_id, origin_sequence) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, decoded.logical_key.ptr, @intCast(decoded.logical_key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, scope.ptr, @intCast(scope.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 3, session_key.ptr, @intCast(session_key.len), SQLITE_STATIC);
+        bindNullableText(stmt, 4, session_id);
+        _ = c.sqlite3_bind_int64(stmt, 5, timestamp_ms);
+        _ = c.sqlite3_bind_text(stmt, 6, origin_instance_id.ptr, @intCast(origin_instance_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 7, @intCast(origin_sequence));
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    fn checkpointJsonStringField(val: std.json.Value, key: []const u8) ?[]const u8 {
+        if (val != .object) return null;
+        const field = val.object.get(key) orelse return null;
+        return if (field == .string) field.string else null;
+    }
+
+    fn checkpointJsonNullableStringField(val: std.json.Value, key: []const u8) ?[]const u8 {
+        if (val != .object) return null;
+        const field = val.object.get(key) orelse return null;
+        if (field == .null) return null;
+        return if (field == .string) field.string else null;
+    }
+
+    fn checkpointJsonIntegerField(val: std.json.Value, key: []const u8) ?i64 {
+        if (val != .object) return null;
+        const field = val.object.get(key) orelse return null;
+        return switch (field) {
+            .integer => field.integer,
+            else => null,
+        };
+    }
+
+    fn checkpointJsonUnsignedField(val: std.json.Value, key: []const u8) ?u64 {
+        const value = checkpointJsonIntegerField(val, key) orelse return null;
+        if (value < 0) return null;
+        return @intCast(value);
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -1492,6 +1951,8 @@ pub const SqliteMemory = struct {
         .lastEventSequence = &implLastEventSequence,
         .eventFeedInfo = &implEventFeedInfo,
         .compactEvents = &implCompactEvents,
+        .exportCheckpoint = &implExportCheckpoint,
+        .applyCheckpoint = &implApplyCheckpoint,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -3538,6 +3999,47 @@ test "sqlite event feed compaction enforces cursor floor and preserves state acr
         try std.testing.expectEqual(@as(usize, 1), tail.len);
         try std.testing.expectEqual(compacted_through + 1, tail[0].sequence);
     }
+}
+
+test "sqlite checkpoint restores replica and preserves local origin frontier" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ws_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    const source_path = try std.fs.path.joinZ(std.testing.allocator, &.{ ws_path, "checkpoint-source.db" });
+    defer std.testing.allocator.free(source_path);
+    const replica_path = try std.fs.path.joinZ(std.testing.allocator, &.{ ws_path, "checkpoint-replica.db" });
+    defer std.testing.allocator.free(replica_path);
+
+    var source = try SqliteMemory.initWithInstanceId(std.testing.allocator, source_path, "agent-a");
+    defer source.deinit();
+    const source_mem = source.memory();
+    try source_mem.store("preferences.theme", "dark", .core, null);
+    _ = try source_mem.compactEvents();
+
+    const checkpoint = try source_mem.exportCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(checkpoint);
+
+    var replica = try SqliteMemory.initWithInstanceId(std.testing.allocator, replica_path, "agent-a");
+    defer replica.deinit();
+    const replica_mem = replica.memory();
+    try replica_mem.applyCheckpoint(checkpoint);
+
+    const entry = (try replica_mem.getScoped(std.testing.allocator, "preferences.theme", null)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("dark", entry.content);
+
+    const info = try replica_mem.eventFeedInfo(std.testing.allocator);
+    defer info.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 2), info.next_local_origin_sequence);
+
+    try replica_mem.store("preferences.locale", "en", .core, null);
+    const tail = try replica_mem.listEvents(std.testing.allocator, info.compacted_through_sequence, 8);
+    defer root.freeEvents(std.testing.allocator, tail);
+    try std.testing.expectEqual(@as(usize, 1), tail.len);
+    try std.testing.expectEqual(@as(u64, 2), tail[0].origin_sequence);
 }
 
 test "sqlite tombstones block older cross-origin put replay" {

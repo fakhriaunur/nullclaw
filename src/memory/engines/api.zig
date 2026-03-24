@@ -9,8 +9,12 @@ const Allocator = std.mem.Allocator;
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 const root = @import("../root.zig");
 const Memory = root.Memory;
+const MemoryEvent = root.MemoryEvent;
+const MemoryEventFeedInfo = root.MemoryEventFeedInfo;
+const MemoryEventInput = root.MemoryEventInput;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
+const MemoryValueKind = root.MemoryValueKind;
 const MessageEntry = root.MessageEntry;
 const SessionInfo = root.SessionInfo;
 const SessionStore = root.SessionStore;
@@ -279,6 +283,26 @@ pub const ApiMemory = struct {
         return std.fmt.allocPrint(alloc, "{s}/memories/count", .{self.base_url});
     }
 
+    fn buildFeedEventsUrl(self: *const Self, alloc: Allocator, after_sequence: u64, limit: usize) ![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}/memory/events?after={d}&limit={d}", .{ self.base_url, after_sequence, limit });
+    }
+
+    fn buildFeedStatusUrl(self: *const Self, alloc: Allocator) ![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}/memory/status", .{self.base_url});
+    }
+
+    fn buildFeedApplyUrl(self: *const Self, alloc: Allocator) ![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}/memory/apply", .{self.base_url});
+    }
+
+    fn buildFeedCompactUrl(self: *const Self, alloc: Allocator) ![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}/memory/compact", .{self.base_url});
+    }
+
+    fn buildFeedCheckpointUrl(self: *const Self, alloc: Allocator) ![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}/memory/checkpoint", .{self.base_url});
+    }
+
     fn buildHealthUrl(self: *const Self, alloc: Allocator) ![]u8 {
         return std.fmt.allocPrint(alloc, "{s}/health", .{self.base_url});
     }
@@ -381,6 +405,58 @@ pub const ApiMemory = struct {
         var total_buf: [32]u8 = undefined;
         const total_str = std.fmt.bufPrint(&total_buf, "{d}", .{total_tokens}) catch unreachable;
         try buf.appendSlice(alloc, total_str);
+        try buf.append(alloc, '}');
+        return buf.toOwnedSlice(alloc);
+    }
+
+    fn buildMemoryEventPayload(alloc: Allocator, input: MemoryEventInput) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(alloc);
+
+        try buf.append(alloc, '{');
+        try buf.appendSlice(alloc, "\"origin_instance_id\":\"");
+        try appendJsonEscaped(&buf, alloc, input.origin_instance_id);
+        try buf.appendSlice(alloc, "\",\"origin_sequence\":");
+        var int_buf: [32]u8 = undefined;
+        try buf.appendSlice(alloc, std.fmt.bufPrint(&int_buf, "{d}", .{input.origin_sequence}) catch unreachable);
+        try buf.appendSlice(alloc, ",\"timestamp_ms\":");
+        try buf.appendSlice(alloc, std.fmt.bufPrint(&int_buf, "{d}", .{input.timestamp_ms}) catch unreachable);
+        try buf.appendSlice(alloc, ",\"operation\":\"");
+        try appendJsonEscaped(&buf, alloc, input.operation.toString());
+        try buf.appendSlice(alloc, "\",\"key\":\"");
+        try appendJsonEscaped(&buf, alloc, input.key);
+        try buf.appendSlice(alloc, "\",\"session_id\":");
+        if (input.session_id) |sid| {
+            try buf.append(alloc, '"');
+            try appendJsonEscaped(&buf, alloc, sid);
+            try buf.append(alloc, '"');
+        } else {
+            try buf.appendSlice(alloc, "null");
+        }
+        try buf.appendSlice(alloc, ",\"category\":");
+        if (input.category) |category| {
+            try buf.append(alloc, '"');
+            try appendJsonEscaped(&buf, alloc, category.toString());
+            try buf.append(alloc, '"');
+        } else {
+            try buf.appendSlice(alloc, "null");
+        }
+        try buf.appendSlice(alloc, ",\"value_kind\":");
+        if (input.value_kind) |kind| {
+            try buf.append(alloc, '"');
+            try appendJsonEscaped(&buf, alloc, kind.toString());
+            try buf.append(alloc, '"');
+        } else {
+            try buf.appendSlice(alloc, "null");
+        }
+        try buf.appendSlice(alloc, ",\"content\":");
+        if (input.content) |content| {
+            try buf.append(alloc, '"');
+            try appendJsonEscaped(&buf, alloc, content);
+            try buf.append(alloc, '"');
+        } else {
+            try buf.appendSlice(alloc, "null");
+        }
         try buf.append(alloc, '}');
         return buf.toOwnedSlice(alloc);
     }
@@ -600,6 +676,130 @@ pub const ApiMemory = struct {
             .integer => |n| if (n >= 0) @intCast(n) else return error.ApiInvalidResponse,
             else => return error.ApiInvalidResponse,
         };
+    }
+
+    fn jsonStringField(val: std.json.Value, key: []const u8) ?[]const u8 {
+        if (val != .object) return null;
+        const field = val.object.get(key) orelse return null;
+        return if (field == .string) field.string else null;
+    }
+
+    fn jsonNullableStringField(val: std.json.Value, key: []const u8) ?[]const u8 {
+        if (val != .object) return null;
+        const field = val.object.get(key) orelse return null;
+        return switch (field) {
+            .null => null,
+            .string => field.string,
+            else => null,
+        };
+    }
+
+    fn jsonIntegerField(val: std.json.Value, key: []const u8) ?i64 {
+        if (val != .object) return null;
+        const field = val.object.get(key) orelse return null;
+        return switch (field) {
+            .integer => field.integer,
+            else => null,
+        };
+    }
+
+    fn parseMemoryEventFromValue(alloc: Allocator, val: std.json.Value) !MemoryEvent {
+        const origin_instance_id = jsonStringField(val, "origin_instance_id") orelse return error.ApiInvalidResponse;
+        const origin_sequence_raw = jsonIntegerField(val, "origin_sequence") orelse return error.ApiInvalidResponse;
+        const timestamp_ms = jsonIntegerField(val, "timestamp_ms") orelse return error.ApiInvalidResponse;
+        const operation_str = jsonStringField(val, "operation") orelse return error.ApiInvalidResponse;
+        const key = jsonStringField(val, "key") orelse return error.ApiInvalidResponse;
+        const sequence_raw = jsonIntegerField(val, "sequence") orelse return error.ApiInvalidResponse;
+        const category_str = jsonNullableStringField(val, "category");
+        const value_kind_str = jsonNullableStringField(val, "value_kind");
+        const content = jsonNullableStringField(val, "content");
+        const session_id = jsonNullableStringField(val, "session_id");
+
+        const origin_sequence: u64 = @intCast(origin_sequence_raw);
+        const sequence: u64 = @intCast(sequence_raw);
+        return .{
+            .schema_version = @intCast(jsonIntegerField(val, "schema_version") orelse 1),
+            .sequence = sequence,
+            .origin_instance_id = try alloc.dupe(u8, origin_instance_id),
+            .origin_sequence = origin_sequence,
+            .timestamp_ms = timestamp_ms,
+            .operation = root.MemoryEventOp.fromString(operation_str) orelse return error.ApiInvalidResponse,
+            .key = try alloc.dupe(u8, key),
+            .session_id = if (session_id) |sid| try alloc.dupe(u8, sid) else null,
+            .category = if (category_str) |cat| try root.cloneMemoryCategory(alloc, MemoryCategory.fromString(cat)) else null,
+            .value_kind = if (value_kind_str) |kind| MemoryValueKind.fromString(kind) orelse return error.ApiInvalidResponse else null,
+            .content = if (content) |text| try alloc.dupe(u8, text) else null,
+        };
+    }
+
+    fn parseMemoryEvents(alloc: Allocator, body: []const u8) ![]MemoryEvent {
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.ApiInvalidResponse;
+        defer parsed.deinit();
+
+        const events_arr = switch (parsed.value) {
+            .object => |obj| blk: {
+                const value = obj.get("events") orelse return error.ApiInvalidResponse;
+                break :blk switch (value) {
+                    .array => |a| a,
+                    else => return error.ApiInvalidResponse,
+                };
+            },
+            else => return error.ApiInvalidResponse,
+        };
+
+        var events: std.ArrayListUnmanaged(MemoryEvent) = .empty;
+        errdefer {
+            for (events.items) |*event| event.deinit(alloc);
+            events.deinit(alloc);
+        }
+
+        for (events_arr.items) |item| {
+            try events.append(alloc, try parseMemoryEventFromValue(alloc, item));
+        }
+
+        return events.toOwnedSlice(alloc);
+    }
+
+    fn parseFeedInfo(alloc: Allocator, body: []const u8) !MemoryEventFeedInfo {
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.ApiInvalidResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.ApiInvalidResponse;
+
+        const instance_id = jsonStringField(parsed.value, "instance_id") orelse return error.ApiInvalidResponse;
+        const last_sequence = jsonIntegerField(parsed.value, "last_sequence") orelse return error.ApiInvalidResponse;
+        const next_local_origin_sequence = jsonIntegerField(parsed.value, "next_local_origin_sequence") orelse 1;
+        const supports_compaction = if (parsed.value.object.get("supports_compaction")) |value|
+            switch (value) {
+                .bool => value.bool,
+                else => false,
+            }
+        else
+            false;
+        const storage_kind = if (jsonStringField(parsed.value, "storage_kind")) |value|
+            if (std.mem.eql(u8, value, "overlay")) root.MemoryEventFeedStorage.overlay else root.MemoryEventFeedStorage.native
+        else
+            root.MemoryEventFeedStorage.native;
+
+        return .{
+            .instance_id = try alloc.dupe(u8, instance_id),
+            .last_sequence = @intCast(last_sequence),
+            .next_local_origin_sequence = @intCast(next_local_origin_sequence),
+            .supports_compaction = supports_compaction,
+            .storage_kind = storage_kind,
+            .journal_path = if (jsonNullableStringField(parsed.value, "journal_path")) |value| try alloc.dupe(u8, value) else null,
+            .checkpoint_path = if (jsonNullableStringField(parsed.value, "checkpoint_path")) |value| try alloc.dupe(u8, value) else null,
+            .compacted_through_sequence = @intCast(jsonIntegerField(parsed.value, "compacted_through_sequence") orelse 0),
+            .oldest_available_sequence = @intCast(jsonIntegerField(parsed.value, "oldest_available_sequence") orelse 1),
+        };
+    }
+
+    fn parseCompactResponse(alloc: Allocator, body: []const u8) !u64 {
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.ApiInvalidResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.ApiInvalidResponse;
+        const compacted = jsonIntegerField(parsed.value, "compacted_through_sequence") orelse return error.ApiInvalidResponse;
+        if (compacted < 0) return error.ApiInvalidResponse;
+        return @intCast(compacted);
     }
 
     fn parseJsonU64(value: std.json.Value) !u64 {
@@ -875,6 +1075,86 @@ pub const ApiMemory = struct {
         return error.ApiRequestFailed;
     }
 
+    fn implListEvents(ptr: *anyopaque, alloc: Allocator, after_sequence: u64, limit: usize) anyerror![]MemoryEvent {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const url = try self.buildFeedEventsUrl(alloc, after_sequence, limit);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+
+        if (resp.status == .gone) return error.CursorExpired;
+        if (resp.status != .ok) return error.ApiRequestFailed;
+        return parseMemoryEvents(alloc, resp.body);
+    }
+
+    fn implApplyEvent(ptr: *anyopaque, input: MemoryEventInput) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+        const url = try self.buildFeedApplyUrl(alloc);
+        defer alloc.free(url);
+        const payload = try buildMemoryEventPayload(alloc, input);
+        defer alloc.free(payload);
+
+        const resp = try self.doRequest(alloc, url, .POST, payload);
+        defer alloc.free(resp.body);
+        if (resp.status != .ok) return error.ApiRequestFailed;
+    }
+
+    fn implLastEventSequence(ptr: *anyopaque) anyerror!u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        var info = try implEventFeedInfo(ptr, self.allocator);
+        defer info.deinit(self.allocator);
+        return info.last_sequence;
+    }
+
+    fn implEventFeedInfo(ptr: *anyopaque, alloc: Allocator) anyerror!MemoryEventFeedInfo {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const url = try self.buildFeedStatusUrl(alloc);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        defer alloc.free(resp.body);
+        if (resp.status != .ok) return error.ApiRequestFailed;
+        return parseFeedInfo(alloc, resp.body);
+    }
+
+    fn implCompactEvents(ptr: *anyopaque) anyerror!u64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+        const url = try self.buildFeedCompactUrl(alloc);
+        defer alloc.free(url);
+        const resp = try self.doRequest(alloc, url, .POST, "{}");
+        defer alloc.free(resp.body);
+        if (resp.status != .ok) return error.ApiRequestFailed;
+        return parseCompactResponse(alloc, resp.body);
+    }
+
+    fn implExportCheckpoint(ptr: *anyopaque, alloc: Allocator) anyerror![]u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const url = try self.buildFeedCheckpointUrl(alloc);
+        defer alloc.free(url);
+
+        const resp = try self.doRequest(alloc, url, .GET, null);
+        if (resp.status != .ok) {
+            alloc.free(resp.body);
+            return error.ApiRequestFailed;
+        }
+        return resp.body;
+    }
+
+    fn implApplyCheckpoint(ptr: *anyopaque, payload: []const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const alloc = self.allocator;
+        const url = try self.buildFeedApplyUrl(alloc);
+        defer alloc.free(url);
+        const body = try alloc.dupe(u8, payload);
+        defer alloc.free(body);
+        const resp = try self.doRequest(alloc, url, .POST, body);
+        defer alloc.free(resp.body);
+        if (resp.status != .ok) return error.ApiRequestFailed;
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const alloc = self.allocator;
@@ -917,6 +1197,13 @@ pub const ApiMemory = struct {
         .list = &implList,
         .forget = &implForget,
         .forgetScoped = &implForgetScoped,
+        .listEvents = &implListEvents,
+        .applyEvent = &implApplyEvent,
+        .lastEventSequence = &implLastEventSequence,
+        .eventFeedInfo = &implEventFeedInfo,
+        .compactEvents = &implCompactEvents,
+        .exportCheckpoint = &implExportCheckpoint,
+        .applyCheckpoint = &implApplyCheckpoint,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -1786,4 +2073,77 @@ test "api parse count rejects negative" {
     ;
     const result = ApiMemory.parseCount(alloc, json);
     try std.testing.expectError(error.ApiInvalidResponse, result);
+}
+
+test "api feed url building" {
+    const alloc = std.testing.allocator;
+    var mem = try ApiMemory.init(alloc, .{
+        .url = "http://127.0.0.1:8080",
+        .namespace = "/v1",
+    });
+    defer mem.deinit();
+
+    const events_url = try mem.buildFeedEventsUrl(alloc, 12, 50);
+    defer alloc.free(events_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1/memory/events?after=12&limit=50", events_url);
+
+    const status_url = try mem.buildFeedStatusUrl(alloc);
+    defer alloc.free(status_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1/memory/status", status_url);
+
+    const apply_url = try mem.buildFeedApplyUrl(alloc);
+    defer alloc.free(apply_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1/memory/apply", apply_url);
+
+    const compact_url = try mem.buildFeedCompactUrl(alloc);
+    defer alloc.free(compact_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1/memory/compact", compact_url);
+
+    const checkpoint_url = try mem.buildFeedCheckpointUrl(alloc);
+    defer alloc.free(checkpoint_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/v1/memory/checkpoint", checkpoint_url);
+}
+
+test "api parse memory events response" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"events":[{"sequence":3,"schema_version":1,"origin_instance_id":"agent-a","origin_sequence":7,"timestamp_ms":1234,"operation":"merge_string_set","key":"traits.tags","session_id":"sess-a","category":"core","value_kind":"string_set","content":"[\"concise\",\"friendly\"]"}]}
+    ;
+
+    const events = try ApiMemory.parseMemoryEvents(alloc, json);
+    defer root.freeEvents(alloc, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqual(@as(u64, 3), events[0].sequence);
+    try std.testing.expectEqual(root.MemoryEventOp.merge_string_set, events[0].operation);
+    try std.testing.expectEqualStrings("agent-a", events[0].origin_instance_id);
+    try std.testing.expectEqualStrings("traits.tags", events[0].key);
+    try std.testing.expectEqualStrings("sess-a", events[0].session_id.?);
+    try std.testing.expectEqual(root.MemoryValueKind.string_set, events[0].value_kind.?);
+}
+
+test "api parse feed info with overlay lifecycle fields" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"instance_id":"default","last_sequence":42,"next_local_origin_sequence":9,"supports_compaction":true,"storage_kind":"overlay","journal_path":"/tmp/journal","checkpoint_path":"/tmp/checkpoint","compacted_through_sequence":41,"oldest_available_sequence":42}
+    ;
+
+    var info = try ApiMemory.parseFeedInfo(alloc, json);
+    defer info.deinit(alloc);
+
+    try std.testing.expectEqualStrings("default", info.instance_id);
+    try std.testing.expectEqual(@as(u64, 42), info.last_sequence);
+    try std.testing.expectEqual(@as(u64, 9), info.next_local_origin_sequence);
+    try std.testing.expect(info.supports_compaction);
+    try std.testing.expectEqual(root.MemoryEventFeedStorage.overlay, info.storage_kind);
+    try std.testing.expectEqualStrings("/tmp/journal", info.journal_path.?);
+    try std.testing.expectEqualStrings("/tmp/checkpoint", info.checkpoint_path.?);
+    try std.testing.expectEqual(@as(u64, 41), info.compacted_through_sequence);
+    try std.testing.expectEqual(@as(u64, 42), info.oldest_available_sequence);
+}
+
+test "api parse compact response" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(u64, 18), try ApiMemory.parseCompactResponse(alloc, "{\"compacted_through_sequence\":18}"));
+    try std.testing.expectError(error.ApiInvalidResponse, ApiMemory.parseCompactResponse(alloc, "{\"compacted_through_sequence\":-1}"));
 }

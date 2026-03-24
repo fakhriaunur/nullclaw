@@ -3514,6 +3514,8 @@ test "scaffoldWorkspace handles trailing native separator on Windows paths" {
 }
 
 test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace files" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3560,6 +3562,8 @@ test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace 
 }
 
 test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touching workspace markdown files" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3610,6 +3614,8 @@ test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touch
 }
 
 test "bootstrap lifecycle stays equivalent across markdown hybrid and sqlite backends" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     const backends = [_][]const u8{ "markdown", "hybrid", "sqlite" };
     var expected_agents: ?[]u8 = null;
     defer if (expected_agents) |value| std.testing.allocator.free(value);

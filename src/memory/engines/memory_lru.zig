@@ -701,6 +701,7 @@ pub const InMemoryLruMemory = struct {
         return .{
             .instance_id = try allocator.dupe(u8, self_.localInstanceId()),
             .last_sequence = self_.next_event_sequence,
+            .next_local_origin_sequence = self_.nextLocalOriginSequence(),
             .supports_compaction = true,
             .compacted_through_sequence = self_.compacted_through_sequence,
             .oldest_available_sequence = self_.compacted_through_sequence + 1,

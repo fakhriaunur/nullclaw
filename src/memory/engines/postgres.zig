@@ -5,10 +5,18 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const json_util = @import("../../json_util.zig");
 const root = @import("../root.zig");
+const key_codec = @import("../vector/key_codec.zig");
 const Memory = root.Memory;
+const MemoryEvent = root.MemoryEvent;
+const MemoryEventFeedInfo = root.MemoryEventFeedInfo;
+const MemoryEventOp = root.MemoryEventOp;
+const MemoryEventInput = root.MemoryEventInput;
+const MemoryValueKind = root.MemoryValueKind;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
+const ResolvedMemoryState = root.ResolvedMemoryState;
 const SessionStore = root.SessionStore;
 
 const c = if (build_options.enable_postgres) @cImport({
@@ -328,16 +336,65 @@ const PostgresMemoryImpl = struct {
             \\    category TEXT NOT NULL DEFAULT 'core',
             \\    session_id TEXT,
             \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    value_kind TEXT,
+            \\    event_timestamp_ms BIGINT NOT NULL DEFAULT 0,
+            \\    event_origin_instance_id TEXT NOT NULL DEFAULT 'default',
+            \\    event_origin_sequence BIGINT NOT NULL DEFAULT 0,
             \\    created_at TEXT NOT NULL,
             \\    updated_at TEXT NOT NULL
             \\);
             \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
+            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS value_kind TEXT;
+            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_timestamp_ms BIGINT NOT NULL DEFAULT 0;
+            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_origin_instance_id TEXT NOT NULL DEFAULT 'default';
+            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_origin_sequence BIGINT NOT NULL DEFAULT 0;
             \\DROP INDEX IF EXISTS {s}.idx_{s}_key;
             \\DROP INDEX IF EXISTS {s}.idx_{s}_key_instance;
             \\CREATE UNIQUE INDEX IF NOT EXISTS idx_{s}_key_instance_session ON {s}.{s}(key, instance_id, COALESCE(session_id, '__global__'));
             \\CREATE INDEX IF NOT EXISTS idx_{s}_category ON {s}.{s}(category);
             \\CREATE INDEX IF NOT EXISTS idx_{s}_session ON {s}.{s}(session_id);
             \\CREATE INDEX IF NOT EXISTS idx_{s}_instance ON {s}.{s}(instance_id);
+            \\CREATE INDEX IF NOT EXISTS idx_{s}_event_order ON {s}.{s}(instance_id, event_timestamp_ms, event_origin_instance_id, event_origin_sequence);
+            \\CREATE TABLE IF NOT EXISTS {s}.memory_events (
+            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    local_sequence BIGINT NOT NULL,
+            \\    schema_version INTEGER NOT NULL DEFAULT 1,
+            \\    origin_instance_id TEXT NOT NULL,
+            \\    origin_sequence BIGINT NOT NULL,
+            \\    timestamp_ms BIGINT NOT NULL,
+            \\    operation TEXT NOT NULL,
+            \\    key TEXT NOT NULL,
+            \\    session_id TEXT,
+            \\    category TEXT,
+            \\    value_kind TEXT,
+            \\    content TEXT,
+            \\    PRIMARY KEY(instance_id, local_sequence)
+            \\);
+            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_origin ON {s}.memory_events(instance_id, origin_instance_id, origin_sequence);
+            \\CREATE TABLE IF NOT EXISTS {s}.memory_event_frontiers (
+            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    origin_instance_id TEXT NOT NULL,
+            \\    last_origin_sequence BIGINT NOT NULL,
+            \\    PRIMARY KEY(instance_id, origin_instance_id)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS {s}.memory_tombstones (
+            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    key TEXT NOT NULL,
+            \\    scope TEXT NOT NULL,
+            \\    session_key TEXT NOT NULL,
+            \\    session_id TEXT,
+            \\    timestamp_ms BIGINT NOT NULL,
+            \\    origin_instance_id TEXT NOT NULL,
+            \\    origin_sequence BIGINT NOT NULL,
+            \\    PRIMARY KEY(instance_id, key, scope, session_key)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_memory_tombstones_key ON {s}.memory_tombstones(instance_id, key);
+            \\CREATE TABLE IF NOT EXISTS {s}.memory_feed_meta (
+            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    key TEXT NOT NULL,
+            \\    value TEXT NOT NULL,
+            \\    PRIMARY KEY(instance_id, key)
+            \\);
             \\CREATE TABLE IF NOT EXISTS {s}.messages (
             \\    id SERIAL PRIMARY KEY,
             \\    session_id TEXT NOT NULL,
@@ -377,6 +434,12 @@ const PostgresMemoryImpl = struct {
             self.schema_q,
             self.table_q,
             self.schema_q,
+            self.table_q,
+            self.schema_q,
+            self.table_q,
+            self.schema_q,
+            self.table_q,
+            self.schema_q,
             raw_table,
             raw_table,
             self.schema_q,
@@ -388,6 +451,13 @@ const PostgresMemoryImpl = struct {
             self.schema_q,
             self.table_q,
             raw_table,
+            raw_table,
+            self.schema_q,
+            self.table_q,
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
             self.schema_q,
             self.table_q,
             self.schema_q,
@@ -409,6 +479,106 @@ const PostgresMemoryImpl = struct {
         if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
             return error.MigrationFailed;
         }
+
+        if (std.mem.eql(u8, self.localInstanceId(), "default")) {
+            try self.promoteLegacyDefaultInstanceIds();
+        }
+        try self.backfillFeedFromExistingState();
+    }
+
+    fn promoteLegacyDefaultInstanceIds(self: *Self) !void {
+        const updates = [_][]const u8{
+            "UPDATE {schema}.{table} SET instance_id = 'default' WHERE instance_id = ''",
+            "UPDATE {schema}.memory_events SET instance_id = 'default' WHERE instance_id = ''",
+            "UPDATE {schema}.memory_event_frontiers SET instance_id = 'default' WHERE instance_id = ''",
+            "UPDATE {schema}.memory_tombstones SET instance_id = 'default' WHERE instance_id = ''",
+            "UPDATE {schema}.memory_feed_meta SET instance_id = 'default' WHERE instance_id = ''",
+            "UPDATE {schema}.messages SET instance_id = 'default' WHERE instance_id = ''",
+            "UPDATE {schema}.session_usage SET instance_id = 'default' WHERE instance_id = ''",
+        };
+        inline for (updates) |template| {
+            const sql = try buildQuery(self.allocator, template, self.schema_q, self.table_q);
+            defer self.allocator.free(sql);
+            try self.execSql(sql);
+        }
+    }
+
+    fn querySingleU64(self: *Self, _: std.mem.Allocator, query: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !u64 {
+        const result = try self.execParams(query, params, lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0 or c.PQgetisnull(result, 0, 0) != 0) return 0;
+        const value = c.PQgetvalue(result, 0, 0);
+        const len: usize = @intCast(c.PQgetlength(result, 0, 0));
+        return std.fmt.parseInt(u64, value[0..len], 10) catch 0;
+    }
+
+    fn backfillFeedFromExistingState(self: *Self) !void {
+        const local_instance_id = self.localInstanceId();
+        const iid_z = try self.allocator.dupeZ(u8, local_instance_id);
+        defer self.allocator.free(iid_z);
+        const params = [_]?[*:0]const u8{iid_z};
+        const lengths = [_]c_int{@intCast(local_instance_id.len)};
+
+        const state_count_sql = try buildQuery(
+            self.allocator,
+            "SELECT COUNT(*) FROM {schema}.{table} WHERE instance_id = $1",
+            self.schema_q,
+            self.table_q,
+        );
+        defer self.allocator.free(state_count_sql);
+        const state_count = try self.querySingleU64(self.allocator, state_count_sql, &params, &lengths);
+        if (state_count == 0) return;
+
+        const event_count_sql = try buildQuery(
+            self.allocator,
+            "SELECT COUNT(*) FROM {schema}.memory_events WHERE instance_id = $1",
+            self.schema_q,
+            self.table_q,
+        );
+        defer self.allocator.free(event_count_sql);
+        const event_count = try self.querySingleU64(self.allocator, event_count_sql, &params, &lengths);
+        if (event_count != 0) return;
+
+        try self.begin();
+        var committed = false;
+        errdefer if (!committed) self.rollback();
+
+        const insert_events_sql = try buildQuery(
+            self.allocator,
+            "WITH ordered AS (" ++
+                "SELECT key, session_id, category, value_kind, content, event_timestamp_ms, event_origin_instance_id, event_origin_sequence, " ++
+                "ROW_NUMBER() OVER (ORDER BY event_timestamp_ms ASC, event_origin_instance_id ASC, event_origin_sequence ASC, key ASC, COALESCE(session_id, '')) AS seq " ++
+                "FROM {schema}.{table} WHERE instance_id = $1" ++
+            ") " ++
+            "INSERT INTO {schema}.memory_events (instance_id, local_sequence, schema_version, origin_instance_id, origin_sequence, timestamp_ms, operation, key, session_id, category, value_kind, content) " ++
+            "SELECT $1, seq, 1, event_origin_instance_id, event_origin_sequence, event_timestamp_ms, 'put', key, session_id, category, value_kind, content FROM ordered",
+            self.schema_q,
+            self.table_q,
+        );
+        defer self.allocator.free(insert_events_sql);
+        {
+            const result_insert_events = try self.execParams(insert_events_sql, &params, &lengths);
+            c.PQclear(result_insert_events);
+        }
+
+        const insert_frontiers_sql = try buildQuery(
+            self.allocator,
+            "INSERT INTO {schema}.memory_event_frontiers (instance_id, origin_instance_id, last_origin_sequence) " ++
+                "SELECT $1, event_origin_instance_id, MAX(event_origin_sequence) " ++
+                "FROM {schema}.{table} WHERE instance_id = $1 GROUP BY event_origin_instance_id " ++
+                "ON CONFLICT (instance_id, origin_instance_id) DO UPDATE SET last_origin_sequence = EXCLUDED.last_origin_sequence",
+            self.schema_q,
+            self.table_q,
+        );
+        defer self.allocator.free(insert_frontiers_sql);
+        {
+            const result_insert_frontiers = try self.execParams(insert_frontiers_sql, &params, &lengths);
+            c.PQclear(result_insert_frontiers);
+        }
+
+        try self.setLastSequenceTx(self.allocator, state_count);
+        try self.commit();
+        committed = true;
     }
 
     fn execParams(self: *Self, query: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !*c.PGresult {
@@ -430,6 +600,167 @@ const PostgresMemoryImpl = struct {
             return error.ExecFailed;
         }
         return result;
+    }
+
+    fn execSql(self: *Self, sql: []const u8) !void {
+        const result = c.PQexec(self.conn, sql.ptr) orelse return error.ExecFailed;
+        defer c.PQclear(result);
+        const status = c.PQresultStatus(result);
+        if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) return error.ExecFailed;
+    }
+
+    fn begin(self: *Self) !void {
+        try self.execSql("BEGIN");
+    }
+
+    fn commit(self: *Self) !void {
+        try self.execSql("COMMIT");
+    }
+
+    fn rollback(self: *Self) void {
+        const result = c.PQexec(self.conn, "ROLLBACK");
+        if (result) |r| c.PQclear(r);
+    }
+
+    fn localInstanceId(self: *Self) []const u8 {
+        return if (self.instance_id.len > 0) self.instance_id else "default";
+    }
+
+    fn compareInputToMetadata(input: MemoryEventInput, timestamp_ms: i64, origin_instance_id: []const u8, origin_sequence: u64) i8 {
+        if (input.timestamp_ms < timestamp_ms) return -1;
+        if (input.timestamp_ms > timestamp_ms) return 1;
+
+        const order = std.mem.order(u8, input.origin_instance_id, origin_instance_id);
+        if (order == .lt) return -1;
+        if (order == .gt) return 1;
+
+        if (input.origin_sequence < origin_sequence) return -1;
+        if (input.origin_sequence > origin_sequence) return 1;
+        return 0;
+    }
+
+    fn sessionKeyFor(session_id: ?[]const u8) []const u8 {
+        return if (session_id) |sid| sid else "__global__";
+    }
+
+    fn schemaQuery(self: *Self, allocator: std.mem.Allocator, comptime fmt: []const u8) ![:0]u8 {
+        return std.fmt.allocPrintZ(allocator, fmt, .{self.schema_q});
+    }
+
+    fn schemaTableQuery(self: *Self, allocator: std.mem.Allocator, comptime fmt: []const u8) ![:0]u8 {
+        return std.fmt.allocPrintZ(allocator, fmt, .{ self.schema_q, self.table_q });
+    }
+
+    fn getMetaValueTx(self: *Self, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        const sql = try self.schemaQuery(allocator,
+            "SELECT value FROM {s}.memory_feed_meta WHERE instance_id = $1 AND key = $2 LIMIT 1",
+        );
+        defer allocator.free(sql);
+
+        const iid_z = try allocator.dupeZ(u8, self.localInstanceId());
+        defer allocator.free(iid_z);
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+
+        const params = [_]?[*:0]const u8{ iid_z, key_z };
+        const lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(key.len) };
+        const result = try self.execParams(sql, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return null;
+        return try dupeResultValueOpt(allocator, result, 0, 0);
+    }
+
+    fn setMetaValueTx(self: *Self, allocator: std.mem.Allocator, key: []const u8, value: u64) !void {
+        const sql = try self.schemaQuery(allocator,
+            "INSERT INTO {s}.memory_feed_meta (instance_id, key, value) VALUES ($1, $2, $3) " ++
+                "ON CONFLICT (instance_id, key) DO UPDATE SET value = EXCLUDED.value",
+        );
+        defer allocator.free(sql);
+
+        const iid_z = try allocator.dupeZ(u8, self.localInstanceId());
+        defer allocator.free(iid_z);
+        const key_z = try allocator.dupeZ(u8, key);
+        defer allocator.free(key_z);
+        const value_str = try std.fmt.allocPrintZ(allocator, "{d}", .{value});
+        defer allocator.free(value_str);
+
+        const params = [_]?[*:0]const u8{ iid_z, key_z, value_str };
+        const lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(key.len), @intCast(value_str.len - 1) };
+        const result = try self.execParams(sql, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    fn getCompactedThroughSequence(self: *Self, allocator: std.mem.Allocator) !u64 {
+        const value = try self.getMetaValueTx(allocator, "compacted_through_sequence") orelse return 0;
+        defer allocator.free(value);
+        return std.fmt.parseInt(u64, value, 10) catch 0;
+    }
+
+    fn setCompactedThroughSequenceTx(self: *Self, allocator: std.mem.Allocator, sequence: u64) !void {
+        try self.setMetaValueTx(allocator, "compacted_through_sequence", sequence);
+    }
+
+    fn getLastSequenceTx(self: *Self, allocator: std.mem.Allocator) !u64 {
+        const value = try self.getMetaValueTx(allocator, "last_sequence") orelse return try self.getCompactedThroughSequence(allocator);
+        defer allocator.free(value);
+        return std.fmt.parseInt(u64, value, 10) catch 0;
+    }
+
+    fn setLastSequenceTx(self: *Self, allocator: std.mem.Allocator, sequence: u64) !void {
+        try self.setMetaValueTx(allocator, "last_sequence", sequence);
+    }
+
+    fn getFrontierTx(self: *Self, allocator: std.mem.Allocator, origin_instance_id: []const u8) !u64 {
+        const sql = try self.schemaQuery(allocator,
+            "SELECT last_origin_sequence FROM {s}.memory_event_frontiers WHERE instance_id = $1 AND origin_instance_id = $2 LIMIT 1",
+        );
+        defer allocator.free(sql);
+
+        const iid_z = try allocator.dupeZ(u8, self.localInstanceId());
+        defer allocator.free(iid_z);
+        const origin_z = try allocator.dupeZ(u8, origin_instance_id);
+        defer allocator.free(origin_z);
+
+        const params = [_]?[*:0]const u8{ iid_z, origin_z };
+        const lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(origin_instance_id.len) };
+        const result = try self.execParams(sql, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return 0;
+        const raw = c.PQgetvalue(result, 0, 0);
+        const len: usize = @intCast(c.PQgetlength(result, 0, 0));
+        return std.fmt.parseInt(u64, raw[0..len], 10) catch 0;
+    }
+
+    fn setFrontierTx(self: *Self, allocator: std.mem.Allocator, origin_instance_id: []const u8, origin_sequence: u64) !void {
+        const sql = try self.schemaQuery(allocator,
+            "INSERT INTO {s}.memory_event_frontiers (instance_id, origin_instance_id, last_origin_sequence) VALUES ($1, $2, $3) " ++
+                "ON CONFLICT (instance_id, origin_instance_id) DO UPDATE SET last_origin_sequence = GREATEST(memory_event_frontiers.last_origin_sequence, EXCLUDED.last_origin_sequence)",
+        );
+        defer allocator.free(sql);
+
+        const iid_z = try allocator.dupeZ(u8, self.localInstanceId());
+        defer allocator.free(iid_z);
+        const origin_z = try allocator.dupeZ(u8, origin_instance_id);
+        defer allocator.free(origin_z);
+        const seq_z = try std.fmt.allocPrintZ(allocator, "{d}", .{origin_sequence});
+        defer allocator.free(seq_z);
+
+        const params = [_]?[*:0]const u8{ iid_z, origin_z, seq_z };
+        const lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(origin_instance_id.len), @intCast(seq_z.len - 1) };
+        const result = try self.execParams(sql, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    fn nextLocalOriginSequenceTx(self: *Self, allocator: std.mem.Allocator) !u64 {
+        return (try self.getFrontierTx(allocator, self.localInstanceId())) + 1;
+    }
+
+    fn nextEventSequenceTx(self: *Self, allocator: std.mem.Allocator) !u64 {
+        const compacted_through = try self.getCompactedThroughSequence(allocator);
+        const last_sequence = try self.getLastSequenceTx(allocator);
+        return @max(last_sequence, compacted_through) + 1;
     }
 
     fn dupeResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) ![]u8 {
@@ -483,6 +814,535 @@ const PostgresMemoryImpl = struct {
         };
     }
 
+    fn readEventFromResult(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int) !MemoryEvent {
+        const sequence_raw = c.PQgetvalue(result, row, 0);
+        const sequence_len: usize = @intCast(c.PQgetlength(result, row, 0));
+        const sequence = std.fmt.parseInt(u64, sequence_raw[0..sequence_len], 10) catch return error.InvalidEvent;
+
+        const schema_raw = c.PQgetvalue(result, row, 1);
+        const schema_len: usize = @intCast(c.PQgetlength(result, row, 1));
+        const schema_version = std.fmt.parseInt(u32, schema_raw[0..schema_len], 10) catch 1;
+
+        const origin_instance_id = try dupeResultValue(allocator, result, row, 2);
+        errdefer allocator.free(origin_instance_id);
+
+        const origin_seq_raw = c.PQgetvalue(result, row, 3);
+        const origin_seq_len: usize = @intCast(c.PQgetlength(result, row, 3));
+        const origin_sequence = std.fmt.parseInt(u64, origin_seq_raw[0..origin_seq_len], 10) catch return error.InvalidEvent;
+
+        const timestamp_raw = c.PQgetvalue(result, row, 4);
+        const timestamp_len: usize = @intCast(c.PQgetlength(result, row, 4));
+        const timestamp_ms = std.fmt.parseInt(i64, timestamp_raw[0..timestamp_len], 10) catch return error.InvalidEvent;
+
+        const op_text = try dupeResultValue(allocator, result, row, 5);
+        defer allocator.free(op_text);
+        const operation = MemoryEventOp.fromString(op_text) orelse return error.InvalidEvent;
+
+        const key = try dupeResultValue(allocator, result, row, 6);
+        errdefer allocator.free(key);
+        const session_id = try dupeResultValueOpt(allocator, result, row, 7);
+        errdefer if (session_id) |sid| allocator.free(sid);
+
+        const category_text = try dupeResultValueOpt(allocator, result, row, 8);
+        defer if (category_text) |text| allocator.free(text);
+        const category = if (category_text) |text| try parseCategoryOwned(allocator, text) else null;
+        errdefer if (category) |cat| switch (cat) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        };
+
+        const value_kind_text = try dupeResultValueOpt(allocator, result, row, 9);
+        defer if (value_kind_text) |text| allocator.free(text);
+        const value_kind = if (value_kind_text) |text|
+            MemoryValueKind.fromString(text) orelse return error.InvalidEvent
+        else
+            null;
+
+        const content = try dupeResultValueOpt(allocator, result, row, 10);
+
+        return .{
+            .schema_version = schema_version,
+            .sequence = sequence,
+            .origin_instance_id = origin_instance_id,
+            .origin_sequence = origin_sequence,
+            .timestamp_ms = timestamp_ms,
+            .operation = operation,
+            .key = key,
+            .session_id = session_id,
+            .category = category,
+            .value_kind = value_kind,
+            .content = content,
+        };
+    }
+
+    fn parseCategoryOwned(allocator: std.mem.Allocator, text: []const u8) !MemoryCategory {
+        const category = MemoryCategory.fromString(text);
+        return switch (category) {
+            .custom => .{ .custom = try allocator.dupe(u8, text) },
+            else => category,
+        };
+    }
+
+    fn insertEventTx(self: *Self, input: MemoryEventInput) !bool {
+        const sql = try self.schemaQuery(self.allocator,
+            "INSERT INTO {s}.memory_events (instance_id, local_sequence, schema_version, origin_instance_id, origin_sequence, timestamp_ms, operation, key, session_id, category, value_kind, content) " ++
+                "VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11) " ++
+                "ON CONFLICT (instance_id, origin_instance_id, origin_sequence) DO NOTHING " ++
+                "RETURNING local_sequence",
+        );
+        defer self.allocator.free(sql);
+
+        const next_event_sequence = try self.nextEventSequenceTx(self.allocator);
+        const category_str = if (input.category) |category| category.toString() else null;
+        const value_kind_str = if (input.value_kind) |kind| kind.toString() else null;
+
+        const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
+        defer self.allocator.free(iid_z);
+        const seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{next_event_sequence});
+        defer self.allocator.free(seq_z);
+        const origin_z = try self.allocator.dupeZ(u8, input.origin_instance_id);
+        defer self.allocator.free(origin_z);
+        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.origin_sequence});
+        defer self.allocator.free(origin_seq_z);
+        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.timestamp_ms});
+        defer self.allocator.free(timestamp_z);
+        const op_z = try self.allocator.dupeZ(u8, input.operation.toString());
+        defer self.allocator.free(op_z);
+        const key_z = try self.allocator.dupeZ(u8, input.key);
+        defer self.allocator.free(key_z);
+        const sid_z: ?[*:0]u8 = if (input.session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        defer if (sid_z) |sid| self.allocator.free(sid);
+        const cat_z: ?[*:0]u8 = if (category_str) |cat| try self.allocator.dupeZ(u8, cat) else null;
+        defer if (cat_z) |cat| self.allocator.free(cat);
+        const kind_z: ?[*:0]u8 = if (value_kind_str) |kind| try self.allocator.dupeZ(u8, kind) else null;
+        defer if (kind_z) |kind| self.allocator.free(kind);
+        const content_z: ?[*:0]u8 = if (input.content) |content| try self.allocator.dupeZ(u8, content) else null;
+        defer if (content_z) |content| self.allocator.free(content);
+
+        const params = [_]?[*:0]const u8{
+            iid_z,
+            seq_z,
+            origin_z,
+            origin_seq_z,
+            timestamp_z,
+            op_z,
+            key_z,
+            sid_z,
+            cat_z,
+            kind_z,
+            content_z,
+        };
+        const lengths = [_]c_int{
+            @intCast(self.localInstanceId().len),
+            @intCast(seq_z.len - 1),
+            @intCast(input.origin_instance_id.len),
+            @intCast(origin_seq_z.len - 1),
+            @intCast(timestamp_z.len - 1),
+            @intCast(input.operation.toString().len),
+            @intCast(input.key.len),
+            if (input.session_id) |sid| @intCast(sid.len) else 0,
+            if (category_str) |cat| @intCast(cat.len) else 0,
+            if (value_kind_str) |kind| @intCast(kind.len) else 0,
+            if (input.content) |content| @intCast(content.len) else 0,
+        };
+        const result = try self.execParams(sql, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return false;
+        try self.setLastSequenceTx(self.allocator, next_event_sequence);
+        return true;
+    }
+
+    fn tombstoneBlocksPutTx(self: *Self, input: MemoryEventInput) !bool {
+        const sql = try self.schemaQuery(self.allocator,
+            "SELECT timestamp_ms, origin_instance_id, origin_sequence FROM {s}.memory_tombstones " ++
+                "WHERE instance_id = $1 AND key = $2 AND ((scope = 'scoped' AND session_key = $3) OR (scope = 'all' AND session_key = '*'))",
+        );
+        defer self.allocator.free(sql);
+
+        const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
+        defer self.allocator.free(iid_z);
+        const key_z = try self.allocator.dupeZ(u8, input.key);
+        defer self.allocator.free(key_z);
+        const session_key = sessionKeyFor(input.session_id);
+        const session_key_z = try self.allocator.dupeZ(u8, session_key);
+        defer self.allocator.free(session_key_z);
+
+        const params = [_]?[*:0]const u8{ iid_z, key_z, session_key_z };
+        const lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(input.key.len), @intCast(session_key.len) };
+        const result = try self.execParams(sql, &params, &lengths);
+        defer c.PQclear(result);
+
+        var row: c_int = 0;
+        while (row < c.PQntuples(result)) : (row += 1) {
+            const ts_raw = c.PQgetvalue(result, row, 0);
+            const ts_len: usize = @intCast(c.PQgetlength(result, row, 0));
+            const timestamp_ms = std.fmt.parseInt(i64, ts_raw[0..ts_len], 10) catch 0;
+            const origin = try dupeResultValue(self.allocator, result, row, 1);
+            defer self.allocator.free(origin);
+            const seq_raw = c.PQgetvalue(result, row, 2);
+            const seq_len: usize = @intCast(c.PQgetlength(result, row, 2));
+            const origin_sequence = std.fmt.parseInt(u64, seq_raw[0..seq_len], 10) catch 0;
+            if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) <= 0) return true;
+        }
+
+        return false;
+    }
+
+    fn putStateTx(self: *Self, input: MemoryEventInput) !void {
+        if (try self.tombstoneBlocksPutTx(input)) return;
+
+        const select_sql = try self.schemaTableQuery(self.allocator,
+            "SELECT content, category, value_kind, event_timestamp_ms, event_origin_instance_id, event_origin_sequence " ++
+                "FROM {s}.{s} WHERE instance_id = $1 AND key = $2 AND ((session_id IS NULL AND $3 IS NULL) OR session_id = $3) LIMIT 1",
+        );
+        defer self.allocator.free(select_sql);
+
+        const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
+        defer self.allocator.free(iid_z);
+        const key_z = try self.allocator.dupeZ(u8, input.key);
+        defer self.allocator.free(key_z);
+        const sid_z: ?[*:0]u8 = if (input.session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        defer if (sid_z) |sid| self.allocator.free(sid);
+
+        const select_params = [_]?[*:0]const u8{ iid_z, key_z, sid_z };
+        const select_lengths = [_]c_int{
+            @intCast(self.localInstanceId().len),
+            @intCast(input.key.len),
+            if (input.session_id) |sid| @intCast(sid.len) else 0,
+        };
+        const result = try self.execParams(select_sql, &select_params, &select_lengths);
+        defer c.PQclear(result);
+
+        var existing_content: ?[]u8 = null;
+        defer if (existing_content) |value| self.allocator.free(value);
+        var existing_category: ?MemoryCategory = null;
+        defer if (existing_category) |category| switch (category) {
+            .custom => |name| self.allocator.free(name),
+            else => {},
+        };
+        var existing_value_kind: ?MemoryValueKind = null;
+
+        if (c.PQntuples(result) > 0) {
+            existing_content = try dupeResultValue(self.allocator, result, 0, 0);
+            const category_text = try dupeResultValue(self.allocator, result, 0, 1);
+            defer self.allocator.free(category_text);
+            existing_category = try parseCategoryOwned(self.allocator, category_text);
+            const value_kind_text = try dupeResultValueOpt(self.allocator, result, 0, 2);
+            defer if (value_kind_text) |value| self.allocator.free(value);
+            if (value_kind_text) |value| {
+                existing_value_kind = MemoryValueKind.fromString(value) orelse return error.InvalidEvent;
+            }
+            const ts_raw = c.PQgetvalue(result, 0, 3);
+            const ts_len: usize = @intCast(c.PQgetlength(result, 0, 3));
+            const timestamp_ms = std.fmt.parseInt(i64, ts_raw[0..ts_len], 10) catch 0;
+            const origin = try dupeResultValue(self.allocator, result, 0, 4);
+            defer self.allocator.free(origin);
+            const seq_raw = c.PQgetvalue(result, 0, 5);
+            const seq_len: usize = @intCast(c.PQgetlength(result, 0, 5));
+            const origin_sequence = std.fmt.parseInt(u64, seq_raw[0..seq_len], 10) catch 0;
+            if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) <= 0) return;
+        }
+
+        const resolved_state = try root.resolveMemoryEventState(
+            self.allocator,
+            existing_content,
+            existing_category,
+            existing_value_kind,
+            input,
+        ) orelse return error.InvalidEvent;
+        defer resolved_state.deinit(self.allocator);
+
+        const delete_sql = try self.schemaTableQuery(self.allocator,
+            "DELETE FROM {s}.{s} WHERE instance_id = $1 AND key = $2 AND ((session_id IS NULL AND $3 IS NULL) OR session_id = $3)",
+        );
+        defer self.allocator.free(delete_sql);
+        {
+            const delete_result = try self.execParams(delete_sql, &select_params, &select_lengths);
+            c.PQclear(delete_result);
+        }
+
+        const insert_sql = try self.schemaTableQuery(self.allocator,
+            "INSERT INTO {s}.{s} (id, key, content, category, session_id, instance_id, value_kind, event_timestamp_ms, event_origin_instance_id, event_origin_sequence, created_at, updated_at) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        );
+        defer self.allocator.free(insert_sql);
+
+        const id = try generateId(self.allocator);
+        defer self.allocator.free(id);
+        const id_z = try self.allocator.dupeZ(u8, id);
+        defer self.allocator.free(id_z);
+        const content_z = try self.allocator.dupeZ(u8, resolved_state.content);
+        defer self.allocator.free(content_z);
+        const cat_str = resolved_state.category.toString();
+        const cat_z = try self.allocator.dupeZ(u8, cat_str);
+        defer self.allocator.free(cat_z);
+        const value_kind_str = if (resolved_state.value_kind) |kind| kind.toString() else null;
+        const kind_z: ?[*:0]u8 = if (value_kind_str) |kind| try self.allocator.dupeZ(u8, kind) else null;
+        defer if (kind_z) |kind| self.allocator.free(kind);
+        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.timestamp_ms});
+        defer self.allocator.free(timestamp_z);
+        const origin_z = try self.allocator.dupeZ(u8, input.origin_instance_id);
+        defer self.allocator.free(origin_z);
+        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.origin_sequence});
+        defer self.allocator.free(origin_seq_z);
+        const now = try std.fmt.allocPrintZ(self.allocator, "{d}", .{@divTrunc(input.timestamp_ms, 1000)});
+        defer self.allocator.free(now);
+
+        const insert_params = [_]?[*:0]const u8{
+            id_z,
+            key_z,
+            content_z,
+            cat_z,
+            sid_z,
+            iid_z,
+            kind_z,
+            timestamp_z,
+            origin_z,
+            origin_seq_z,
+            now,
+            now,
+        };
+        const insert_lengths = [_]c_int{
+            @intCast(id.len),
+            @intCast(input.key.len),
+            @intCast(resolved_state.content.len),
+            @intCast(cat_str.len),
+            if (input.session_id) |sid| @intCast(sid.len) else 0,
+            @intCast(self.localInstanceId().len),
+            if (value_kind_str) |kind| @intCast(kind.len) else 0,
+            @intCast(timestamp_z.len - 1),
+            @intCast(input.origin_instance_id.len),
+            @intCast(origin_seq_z.len - 1),
+            @intCast(now.len - 1),
+            @intCast(now.len - 1),
+        };
+        const insert_result = try self.execParams(insert_sql, &insert_params, &insert_lengths);
+        c.PQclear(insert_result);
+    }
+
+    fn deleteScopedStateTx(self: *Self, input: MemoryEventInput) !void {
+        const select_sql = try self.schemaTableQuery(self.allocator,
+            "SELECT event_timestamp_ms, event_origin_instance_id, event_origin_sequence FROM {s}.{s} " ++
+                "WHERE instance_id = $1 AND key = $2 AND ((session_id IS NULL AND $3 IS NULL) OR session_id = $3) LIMIT 1",
+        );
+        defer self.allocator.free(select_sql);
+
+        const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
+        defer self.allocator.free(iid_z);
+        const key_z = try self.allocator.dupeZ(u8, input.key);
+        defer self.allocator.free(key_z);
+        const sid_z: ?[*:0]u8 = if (input.session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        defer if (sid_z) |sid| self.allocator.free(sid);
+
+        const params = [_]?[*:0]const u8{ iid_z, key_z, sid_z };
+        const lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(input.key.len), if (input.session_id) |sid| @intCast(sid.len) else 0 };
+        const result = try self.execParams(select_sql, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return;
+
+        const ts_raw = c.PQgetvalue(result, 0, 0);
+        const ts_len: usize = @intCast(c.PQgetlength(result, 0, 0));
+        const timestamp_ms = std.fmt.parseInt(i64, ts_raw[0..ts_len], 10) catch 0;
+        const origin = try dupeResultValue(self.allocator, result, 0, 1);
+        defer self.allocator.free(origin);
+        const seq_raw = c.PQgetvalue(result, 0, 2);
+        const seq_len: usize = @intCast(c.PQgetlength(result, 0, 2));
+        const origin_sequence = std.fmt.parseInt(u64, seq_raw[0..seq_len], 10) catch 0;
+        if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) < 0) return;
+
+        const delete_sql = try self.schemaTableQuery(self.allocator,
+            "DELETE FROM {s}.{s} WHERE instance_id = $1 AND key = $2 AND ((session_id IS NULL AND $3 IS NULL) OR session_id = $3)",
+        );
+        defer self.allocator.free(delete_sql);
+        const delete_result = try self.execParams(delete_sql, &params, &lengths);
+        c.PQclear(delete_result);
+    }
+
+    fn deleteAllStateTx(self: *Self, input: MemoryEventInput) !void {
+        const select_sql = try self.schemaTableQuery(self.allocator,
+            "SELECT session_id, event_timestamp_ms, event_origin_instance_id, event_origin_sequence FROM {s}.{s} WHERE instance_id = $1 AND key = $2",
+        );
+        defer self.allocator.free(select_sql);
+
+        const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
+        defer self.allocator.free(iid_z);
+        const key_z = try self.allocator.dupeZ(u8, input.key);
+        defer self.allocator.free(key_z);
+
+        const params = [_]?[*:0]const u8{ iid_z, key_z };
+        const lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(input.key.len) };
+        const result = try self.execParams(select_sql, &params, &lengths);
+        defer c.PQclear(result);
+
+        var sessions_to_delete: std.ArrayListUnmanaged(?[]u8) = .empty;
+        defer {
+            for (sessions_to_delete.items) |sid_opt| if (sid_opt) |sid| self.allocator.free(sid);
+            sessions_to_delete.deinit(self.allocator);
+        }
+
+        var row: c_int = 0;
+        while (row < c.PQntuples(result)) : (row += 1) {
+            const sid = try dupeResultValueOpt(self.allocator, result, row, 0);
+            errdefer if (sid) |value| self.allocator.free(value);
+            const ts_raw = c.PQgetvalue(result, row, 1);
+            const ts_len: usize = @intCast(c.PQgetlength(result, row, 1));
+            const timestamp_ms = std.fmt.parseInt(i64, ts_raw[0..ts_len], 10) catch 0;
+            const origin = try dupeResultValue(self.allocator, result, row, 2);
+            defer self.allocator.free(origin);
+            const seq_raw = c.PQgetvalue(result, row, 3);
+            const seq_len: usize = @intCast(c.PQgetlength(result, row, 3));
+            const origin_sequence = std.fmt.parseInt(u64, seq_raw[0..seq_len], 10) catch 0;
+            if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) >= 0) {
+                try sessions_to_delete.append(self.allocator, sid);
+            } else if (sid) |value| {
+                self.allocator.free(value);
+            }
+        }
+
+        const delete_sql = try self.schemaTableQuery(self.allocator,
+            "DELETE FROM {s}.{s} WHERE instance_id = $1 AND key = $2 AND ((session_id IS NULL AND $3 IS NULL) OR session_id = $3)",
+        );
+        defer self.allocator.free(delete_sql);
+
+        for (sessions_to_delete.items) |sid_opt| {
+            const sid_z: ?[*:0]u8 = if (sid_opt) |sid| try self.allocator.dupeZ(u8, sid) else null;
+            defer if (sid_z) |sid| self.allocator.free(sid);
+            const delete_params = [_]?[*:0]const u8{ iid_z, key_z, sid_z };
+            const delete_lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(input.key.len), if (sid_opt) |sid| @intCast(sid.len) else 0 };
+            const delete_result = try self.execParams(delete_sql, &delete_params, &delete_lengths);
+            c.PQclear(delete_result);
+        }
+    }
+
+    fn upsertTombstoneTx(self: *Self, input: MemoryEventInput, scope: []const u8, session_key: []const u8, session_id: ?[]const u8) !void {
+        const select_sql = try self.schemaQuery(self.allocator,
+            "SELECT timestamp_ms, origin_instance_id, origin_sequence FROM {s}.memory_tombstones " ++
+                "WHERE instance_id = $1 AND key = $2 AND scope = $3 AND session_key = $4 LIMIT 1",
+        );
+        defer self.allocator.free(select_sql);
+
+        const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
+        defer self.allocator.free(iid_z);
+        const key_z = try self.allocator.dupeZ(u8, input.key);
+        defer self.allocator.free(key_z);
+        const scope_z = try self.allocator.dupeZ(u8, scope);
+        defer self.allocator.free(scope_z);
+        const session_key_z = try self.allocator.dupeZ(u8, session_key);
+        defer self.allocator.free(session_key_z);
+
+        const select_params = [_]?[*:0]const u8{ iid_z, key_z, scope_z, session_key_z };
+        const select_lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(input.key.len), @intCast(scope.len), @intCast(session_key.len) };
+        const existing = try self.execParams(select_sql, &select_params, &select_lengths);
+        defer c.PQclear(existing);
+
+        if (c.PQntuples(existing) > 0) {
+            const ts_raw = c.PQgetvalue(existing, 0, 0);
+            const ts_len: usize = @intCast(c.PQgetlength(existing, 0, 0));
+            const timestamp_ms = std.fmt.parseInt(i64, ts_raw[0..ts_len], 10) catch 0;
+            const origin = try dupeResultValue(self.allocator, existing, 0, 1);
+            defer self.allocator.free(origin);
+            const seq_raw = c.PQgetvalue(existing, 0, 2);
+            const seq_len: usize = @intCast(c.PQgetlength(existing, 0, 2));
+            const origin_sequence = std.fmt.parseInt(u64, seq_raw[0..seq_len], 10) catch 0;
+            if (compareInputToMetadata(input, timestamp_ms, origin, origin_sequence) <= 0) return;
+        }
+
+        const upsert_sql = try self.schemaQuery(self.allocator,
+            "INSERT INTO {s}.memory_tombstones (instance_id, key, scope, session_key, session_id, timestamp_ms, origin_instance_id, origin_sequence) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) " ++
+                "ON CONFLICT (instance_id, key, scope, session_key) DO UPDATE SET " ++
+                "session_id = EXCLUDED.session_id, timestamp_ms = EXCLUDED.timestamp_ms, origin_instance_id = EXCLUDED.origin_instance_id, origin_sequence = EXCLUDED.origin_sequence",
+        );
+        defer self.allocator.free(upsert_sql);
+
+        const sid_z: ?[*:0]u8 = if (session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        defer if (sid_z) |sid| self.allocator.free(sid);
+        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.timestamp_ms});
+        defer self.allocator.free(timestamp_z);
+        const origin_z = try self.allocator.dupeZ(u8, input.origin_instance_id);
+        defer self.allocator.free(origin_z);
+        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.origin_sequence});
+        defer self.allocator.free(origin_seq_z);
+
+        const upsert_params = [_]?[*:0]const u8{
+            iid_z,
+            key_z,
+            scope_z,
+            session_key_z,
+            sid_z,
+            timestamp_z,
+            origin_z,
+            origin_seq_z,
+        };
+        const upsert_lengths = [_]c_int{
+            @intCast(self.localInstanceId().len),
+            @intCast(input.key.len),
+            @intCast(scope.len),
+            @intCast(session_key.len),
+            if (session_id) |sid| @intCast(sid.len) else 0,
+            @intCast(timestamp_z.len - 1),
+            @intCast(input.origin_instance_id.len),
+            @intCast(origin_seq_z.len - 1),
+        };
+        const upsert_result = try self.execParams(upsert_sql, &upsert_params, &upsert_lengths);
+        c.PQclear(upsert_result);
+    }
+
+    fn applyEventTx(self: *Self, input: MemoryEventInput) !void {
+        const frontier = try self.getFrontierTx(self.allocator, input.origin_instance_id);
+        if (input.origin_sequence <= frontier) return;
+
+        const inserted = try self.insertEventTx(input);
+        if (!inserted) {
+            try self.setFrontierTx(self.allocator, input.origin_instance_id, input.origin_sequence);
+            return;
+        }
+
+        switch (input.operation) {
+            .put, .merge_object, .merge_string_set => try self.putStateTx(input),
+            .delete_scoped => {
+                try self.deleteScopedStateTx(input);
+                try self.upsertTombstoneTx(input, "scoped", sessionKeyFor(input.session_id), input.session_id);
+            },
+            .delete_all => {
+                try self.deleteAllStateTx(input);
+                try self.upsertTombstoneTx(input, "all", "*", null);
+            },
+        }
+
+        try self.setFrontierTx(self.allocator, input.origin_instance_id, input.origin_sequence);
+    }
+
+    fn applyEventInternal(self: *Self, input: MemoryEventInput) !void {
+        try self.begin();
+        var committed = false;
+        errdefer if (!committed) self.rollback();
+        try self.applyEventTx(input);
+        try self.commit();
+        committed = true;
+    }
+
+    fn emitLocalEvent(self: *Self, operation: MemoryEventOp, key: []const u8, session_id: ?[]const u8, category: ?MemoryCategory, value_kind: ?MemoryValueKind, content: ?[]const u8) !void {
+        const now_ms = std.time.milliTimestamp();
+        try self.begin();
+        var committed = false;
+        errdefer if (!committed) self.rollback();
+        try self.applyEventTx(.{
+            .origin_instance_id = self.localInstanceId(),
+            .origin_sequence = try self.nextLocalOriginSequenceTx(self.allocator),
+            .timestamp_ms = now_ms,
+            .operation = operation,
+            .key = key,
+            .session_id = session_id,
+            .category = category,
+            .value_kind = value_kind,
+            .content = content,
+        });
+        try self.commit();
+        committed = true;
+    }
+
     // ── Memory vtable implementation ──────────────────────────────
 
     fn implName(_: *anyopaque) []const u8 {
@@ -491,58 +1351,12 @@ const PostgresMemoryImpl = struct {
 
     fn implStore(ptr: *anyopaque, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-
-        const now = getNowTimestamp(self_.allocator) catch return error.StepFailed;
-        defer self_.allocator.free(now);
-        const now_z = try self_.allocator.dupeZ(u8, now);
-        defer self_.allocator.free(now_z);
-
-        const id = generateId(self_.allocator) catch return error.StepFailed;
-        defer self_.allocator.free(id);
-        const id_z = try self_.allocator.dupeZ(u8, id);
-        defer self_.allocator.free(id_z);
-
-        const cat_str = category.toString();
-        const key_z = try self_.allocator.dupeZ(u8, key);
-        defer self_.allocator.free(key_z);
-        const content_z = try self_.allocator.dupeZ(u8, content);
-        defer self_.allocator.free(content_z);
-        const cat_z = try self_.allocator.dupeZ(u8, cat_str);
-        defer self_.allocator.free(cat_z);
-
-        const sid_z: ?[*:0]u8 = if (session_id) |sid| try self_.allocator.dupeZ(u8, sid) else null;
-        defer if (sid_z) |s| self_.allocator.free(std.mem.span(s));
-
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
-        defer self_.allocator.free(iid_z);
-
-        const params = [_]?[*:0]const u8{
-            id_z,
-            key_z,
-            content_z,
-            cat_z,
-            sid_z,
-            iid_z,
-            now_z,
-            now_z,
-        };
-        const lengths = [_]c_int{
-            @intCast(id.len),
-            @intCast(key.len),
-            @intCast(content.len),
-            @intCast(cat_str.len),
-            if (session_id) |sid| @as(c_int, @intCast(sid.len)) else 0,
-            @intCast(self_.instance_id.len),
-            @intCast(now.len),
-            @intCast(now.len),
-        };
-
-        const result = try self_.execParams(self_.q_store, &params, &lengths);
-        c.PQclear(result);
+        try self_.emitLocalEvent(.put, key, session_id, category, null, content);
     }
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const trimmed = std.mem.trim(u8, query, " \t\n\r");
         if (trimmed.len == 0) return allocator.alloc(MemoryEntry, 0);
@@ -554,7 +1368,7 @@ const PostgresMemoryImpl = struct {
         var limit_buf: [20]u8 = undefined;
         const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
 
-        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try allocator.dupeZ(u8, local_instance_id);
         defer allocator.free(iid_z);
 
         var result: *c.PGresult = undefined;
@@ -562,11 +1376,11 @@ const PostgresMemoryImpl = struct {
             const sid_z = try allocator.dupeZ(u8, sid);
             defer allocator.free(sid_z);
             const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr, sid_z, iid_z };
-            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(sid.len), @intCast(self_.instance_id.len) };
+            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(sid.len), @intCast(local_instance_id.len) };
             result = try self_.execParams(self_.q_recall_sid, &params, &lengths);
         } else {
             const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr, iid_z };
-            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(self_.instance_id.len) };
+            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(local_instance_id.len) };
             result = try self_.execParams(self_.q_recall, &params, &lengths);
         }
         defer c.PQclear(result);
@@ -595,14 +1409,15 @@ const PostgresMemoryImpl = struct {
 
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const key_z = try allocator.dupeZ(u8, key);
         defer allocator.free(key_z);
-        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try allocator.dupeZ(u8, local_instance_id);
         defer allocator.free(iid_z);
 
         const params = [_]?[*:0]const u8{ key_z, iid_z };
-        const lengths = [_]c_int{ @intCast(key.len), @intCast(self_.instance_id.len) };
+        const lengths = [_]c_int{ @intCast(key.len), @intCast(local_instance_id.len) };
 
         const result = try self_.execParams(self_.q_get, &params, &lengths);
         defer c.PQclear(result);
@@ -613,19 +1428,20 @@ const PostgresMemoryImpl = struct {
 
     fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const key_z = try allocator.dupeZ(u8, key);
         defer allocator.free(key_z);
         const sid_z: ?[*:0]u8 = if (session_id) |sid| try allocator.dupeZ(u8, sid) else null;
         defer if (sid_z) |sid| allocator.free(sid);
-        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try allocator.dupeZ(u8, local_instance_id);
         defer allocator.free(iid_z);
 
         const params = [_]?[*:0]const u8{ key_z, sid_z, iid_z };
         const lengths = [_]c_int{
             @intCast(key.len),
             if (session_id) |sid| @intCast(sid.len) else 0,
-            @intCast(self_.instance_id.len),
+            @intCast(local_instance_id.len),
         };
 
         const result = try self_.execParams(self_.q_get_scoped, &params, &lengths);
@@ -637,8 +1453,9 @@ const PostgresMemoryImpl = struct {
 
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
-        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try allocator.dupeZ(u8, local_instance_id);
         defer allocator.free(iid_z);
 
         var result: *c.PGresult = undefined;
@@ -650,22 +1467,22 @@ const PostgresMemoryImpl = struct {
                 const sid_z = try allocator.dupeZ(u8, sid);
                 defer allocator.free(sid_z);
                 const params = [_]?[*:0]const u8{ cat_z, sid_z, iid_z };
-                const lengths = [_]c_int{ @intCast(cat_str.len), @intCast(sid.len), @intCast(self_.instance_id.len) };
+                const lengths = [_]c_int{ @intCast(cat_str.len), @intCast(sid.len), @intCast(local_instance_id.len) };
                 result = try self_.execParams(self_.q_list_cat_sid, &params, &lengths);
             } else {
                 const params = [_]?[*:0]const u8{ cat_z, iid_z };
-                const lengths = [_]c_int{ @intCast(cat_str.len), @intCast(self_.instance_id.len) };
+                const lengths = [_]c_int{ @intCast(cat_str.len), @intCast(local_instance_id.len) };
                 result = try self_.execParams(self_.q_list_cat, &params, &lengths);
             }
         } else if (session_id) |sid| {
             const sid_z = try allocator.dupeZ(u8, sid);
             defer allocator.free(sid_z);
             const params = [_]?[*:0]const u8{ sid_z, iid_z };
-            const lengths = [_]c_int{ @intCast(sid.len), @intCast(self_.instance_id.len) };
+            const lengths = [_]c_int{ @intCast(sid.len), @intCast(local_instance_id.len) };
             result = try self_.execParams(self_.q_list_sid, &params, &lengths);
         } else {
             const params = [_]?[*:0]const u8{iid_z};
-            const lengths = [_]c_int{@intCast(self_.instance_id.len)};
+            const lengths = [_]c_int{@intCast(local_instance_id.len)};
             result = try self_.execParams(self_.q_list_all, &params, &lengths);
         }
         defer c.PQclear(result);
@@ -688,57 +1505,630 @@ const PostgresMemoryImpl = struct {
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-
-        const key_z = try self_.allocator.dupeZ(u8, key);
-        defer self_.allocator.free(key_z);
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
-        defer self_.allocator.free(iid_z);
-
-        const params = [_]?[*:0]const u8{ key_z, iid_z };
-        const lengths = [_]c_int{ @intCast(key.len), @intCast(self_.instance_id.len) };
-
-        const result = try self_.execParams(self_.q_forget, &params, &lengths);
-        defer c.PQclear(result);
-
-        const affected = c.PQcmdTuples(result);
-        if (affected == null) return false;
-        const affected_str: []const u8 = std.mem.span(affected);
-        return !std.mem.eql(u8, affected_str, "0");
+        const existing = try implGet(ptr, self_.allocator, key);
+        if (existing == null) return false;
+        existing.?.deinit(self_.allocator);
+        try self_.emitLocalEvent(.delete_all, key, null, null, null, null);
+        return true;
     }
 
     fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const existing = try implGetScoped(ptr, self_.allocator, key, session_id);
+        if (existing == null) return false;
+        existing.?.deinit(self_.allocator);
+        try self_.emitLocalEvent(.delete_scoped, key, session_id, null, null, null);
+        return true;
+    }
 
-        const key_z = try self_.allocator.dupeZ(u8, key);
-        defer self_.allocator.free(key_z);
-        const sid_z: ?[*:0]u8 = if (session_id) |sid| try self_.allocator.dupeZ(u8, sid) else null;
-        defer if (sid_z) |sid| self_.allocator.free(sid);
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
-        defer self_.allocator.free(iid_z);
+    fn implListEvents(ptr: *anyopaque, allocator: std.mem.Allocator, after_sequence: u64, limit: usize) anyerror![]MemoryEvent {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const compacted_through = try self_.getCompactedThroughSequence(allocator);
+        if (after_sequence < compacted_through) return error.CursorExpired;
 
-        const params = [_]?[*:0]const u8{ key_z, sid_z, iid_z };
-        const lengths = [_]c_int{
-            @intCast(key.len),
-            if (session_id) |sid| @intCast(sid.len) else 0,
-            @intCast(self_.instance_id.len),
-        };
+        const sql = try self_.schemaQuery(allocator,
+            "SELECT local_sequence, schema_version, origin_instance_id, origin_sequence, timestamp_ms, operation, key, session_id, category, value_kind, content " ++
+                "FROM {s}.memory_events WHERE instance_id = $1 AND local_sequence > $2 ORDER BY local_sequence ASC LIMIT $3",
+        );
+        defer allocator.free(sql);
 
-        const result = try self_.execParams(self_.q_forget_scoped, &params, &lengths);
+        const iid_z = try allocator.dupeZ(u8, self_.localInstanceId());
+        defer allocator.free(iid_z);
+        const after_z = try std.fmt.allocPrintZ(allocator, "{d}", .{after_sequence});
+        defer allocator.free(after_z);
+        const limit_z = try std.fmt.allocPrintZ(allocator, "{d}", .{limit});
+        defer allocator.free(limit_z);
+
+        const params = [_]?[*:0]const u8{ iid_z, after_z, limit_z };
+        const lengths = [_]c_int{ @intCast(self_.localInstanceId().len), @intCast(after_z.len - 1), @intCast(limit_z.len - 1) };
+        const result = try self_.execParams(sql, &params, &lengths);
         defer c.PQclear(result);
 
-        const affected = c.PQcmdTuples(result);
-        if (affected == null) return false;
-        const affected_str: []const u8 = std.mem.span(affected);
-        return !std.mem.eql(u8, affected_str, "0");
+        var events: std.ArrayListUnmanaged(MemoryEvent) = .empty;
+        errdefer {
+            for (events.items) |*event| event.deinit(allocator);
+            events.deinit(allocator);
+        }
+
+        var row: c_int = 0;
+        while (row < c.PQntuples(result)) : (row += 1) {
+            try events.append(allocator, try readEventFromResult(allocator, result, row));
+        }
+        return events.toOwnedSlice(allocator);
+    }
+
+    fn implApplyEvent(ptr: *anyopaque, input: MemoryEventInput) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        try self_.applyEventInternal(input);
+    }
+
+    fn implLastEventSequence(ptr: *anyopaque) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return try self_.getLastSequenceTx(self_.allocator);
+    }
+
+    fn implEventFeedInfo(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!MemoryEventFeedInfo {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const compacted_through = try self_.getCompactedThroughSequence(allocator);
+        return .{
+            .instance_id = try allocator.dupe(u8, self_.localInstanceId()),
+            .last_sequence = try self_.getLastSequenceTx(allocator),
+            .next_local_origin_sequence = try self_.nextLocalOriginSequenceTx(allocator),
+            .supports_compaction = true,
+            .storage_kind = .native,
+            .compacted_through_sequence = compacted_through,
+            .oldest_available_sequence = compacted_through + 1,
+        };
+    }
+
+    fn implCompactEvents(ptr: *anyopaque) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        const compacted_through = try self_.getLastSequenceTx(self_.allocator);
+        try self_.begin();
+        var committed = false;
+        errdefer if (!committed) self_.rollback();
+
+        const sql = try self_.schemaQuery(self_.allocator,
+            "DELETE FROM {s}.memory_events WHERE instance_id = $1 AND local_sequence <= $2",
+        );
+        defer self_.allocator.free(sql);
+        const iid_z = try self_.allocator.dupeZ(u8, self_.localInstanceId());
+        defer self_.allocator.free(iid_z);
+        const seq_z = try std.fmt.allocPrintZ(self_.allocator, "{d}", .{compacted_through});
+        defer self_.allocator.free(seq_z);
+        const params = [_]?[*:0]const u8{ iid_z, seq_z };
+        const lengths = [_]c_int{ @intCast(self_.localInstanceId().len), @intCast(seq_z.len - 1) };
+        const result = try self_.execParams(sql, &params, &lengths);
+        c.PQclear(result);
+
+        try self_.setCompactedThroughSequenceTx(self_.allocator, compacted_through);
+        try self_.commit();
+        committed = true;
+        return compacted_through;
+    }
+
+    fn implExportCheckpoint(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.exportCheckpointPayload(allocator);
+    }
+
+    fn implApplyCheckpoint(ptr: *anyopaque, payload: []const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        try self_.applyCheckpointPayload(payload);
+    }
+
+    fn appendCheckpointMetaLine(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        last_sequence: u64,
+        last_timestamp_ms: i64,
+        compacted_through: u64,
+    ) !void {
+        try out.append(allocator, '{');
+        try json_util.appendJsonKeyValue(out, allocator, "kind", "meta");
+        try out.append(allocator, ',');
+        try json_util.appendJsonInt(out, allocator, "schema_version", 1);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "last_sequence");
+        try out.writer(allocator).print("{d}", .{last_sequence});
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "last_timestamp_ms");
+        try out.writer(allocator).print("{d}", .{last_timestamp_ms});
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "compacted_through_sequence");
+        try out.writer(allocator).print("{d}", .{compacted_through});
+        try out.appendSlice(allocator, "}\n");
+    }
+
+    fn appendCheckpointFrontierLine(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), origin_instance_id: []const u8, origin_sequence: u64) !void {
+        try out.append(allocator, '{');
+        try json_util.appendJsonKeyValue(out, allocator, "kind", "frontier");
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "origin_instance_id", origin_instance_id);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "origin_sequence");
+        try out.writer(allocator).print("{d}", .{origin_sequence});
+        try out.appendSlice(allocator, "}\n");
+    }
+
+    fn appendCheckpointStateLine(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        key: []const u8,
+        session_id: ?[]const u8,
+        category: []const u8,
+        value_kind: ?[]const u8,
+        content: []const u8,
+        timestamp_ms: i64,
+        origin_instance_id: []const u8,
+        origin_sequence: u64,
+    ) !void {
+        try out.append(allocator, '{');
+        try json_util.appendJsonKeyValue(out, allocator, "kind", "state");
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "key", key);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "session_id");
+        if (session_id) |sid| {
+            try json_util.appendJsonString(out, allocator, sid);
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "category", category);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "value_kind");
+        if (value_kind) |kind| {
+            try json_util.appendJsonString(out, allocator, kind);
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "content", content);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "timestamp_ms");
+        try out.writer(allocator).print("{d}", .{timestamp_ms});
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "origin_instance_id", origin_instance_id);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "origin_sequence");
+        try out.writer(allocator).print("{d}", .{origin_sequence});
+        try out.appendSlice(allocator, "}\n");
+    }
+
+    fn appendCheckpointTombstoneLine(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        kind: []const u8,
+        key: []const u8,
+        timestamp_ms: i64,
+        origin_instance_id: []const u8,
+        origin_sequence: u64,
+    ) !void {
+        try out.append(allocator, '{');
+        try json_util.appendJsonKeyValue(out, allocator, "kind", kind);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "key", key);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "timestamp_ms");
+        try out.writer(allocator).print("{d}", .{timestamp_ms});
+        try out.append(allocator, ',');
+        try json_util.appendJsonKeyValue(out, allocator, "origin_instance_id", origin_instance_id);
+        try out.append(allocator, ',');
+        try json_util.appendJsonKey(out, allocator, "origin_sequence");
+        try out.writer(allocator).print("{d}", .{origin_sequence});
+        try out.appendSlice(allocator, "}\n");
+    }
+
+    fn querySingleI64(self: *Self, _: std.mem.Allocator, query: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !i64 {
+        const result = try self.execParams(query, params, lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0 or c.PQgetisnull(result, 0, 0) != 0) return 0;
+        const value = c.PQgetvalue(result, 0, 0);
+        const len: usize = @intCast(c.PQgetlength(result, 0, 0));
+        return std.fmt.parseInt(i64, value[0..len], 10) catch 0;
+    }
+
+    fn exportCheckpointPayload(self: *Self, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        const local_instance_id = self.localInstanceId();
+        const iid_z = try allocator.dupeZ(u8, local_instance_id);
+        defer allocator.free(iid_z);
+        const params = [_]?[*:0]const u8{iid_z};
+        const lengths = [_]c_int{@intCast(local_instance_id.len)};
+
+        const last_sequence = try self.getLastSequenceTx(allocator);
+
+        const state_ts_sql = try buildQuery(
+            allocator,
+            "SELECT COALESCE(MAX(event_timestamp_ms), 0) FROM {schema}.{table} WHERE instance_id = $1",
+            self.schema_q,
+            self.table_q,
+        );
+        defer allocator.free(state_ts_sql);
+        const state_max_ts = try self.querySingleI64(allocator, state_ts_sql, &params, &lengths);
+
+        const tomb_ts_sql = try buildQuery(
+            allocator,
+            "SELECT COALESCE(MAX(timestamp_ms), 0) FROM {schema}.memory_tombstones WHERE instance_id = $1",
+            self.schema_q,
+            self.table_q,
+        );
+        defer allocator.free(tomb_ts_sql);
+        const tombstone_max_ts = try self.querySingleI64(allocator, tomb_ts_sql, &params, &lengths);
+
+        try appendCheckpointMetaLine(allocator, &out, last_sequence, @max(state_max_ts, tombstone_max_ts), last_sequence);
+
+        const frontiers_sql = try self.schemaQuery(allocator,
+            "SELECT origin_instance_id, last_origin_sequence FROM {s}.memory_event_frontiers WHERE instance_id = $1 ORDER BY origin_instance_id ASC",
+        );
+        defer allocator.free(frontiers_sql);
+        {
+            const result = try self.execParams(frontiers_sql, &params, &lengths);
+            defer c.PQclear(result);
+            var row: c_int = 0;
+            while (row < c.PQntuples(result)) : (row += 1) {
+                const origin_instance_id = try dupeResultValue(allocator, result, row, 0);
+                defer allocator.free(origin_instance_id);
+                const seq_raw = c.PQgetvalue(result, row, 1);
+                const seq_len: usize = @intCast(c.PQgetlength(result, row, 1));
+                const origin_sequence = std.fmt.parseInt(u64, seq_raw[0..seq_len], 10) catch 0;
+                try appendCheckpointFrontierLine(allocator, &out, origin_instance_id, origin_sequence);
+            }
+        }
+
+        const state_sql = try buildQuery(
+            allocator,
+            "SELECT key, session_id, category, value_kind, content, event_timestamp_ms, event_origin_instance_id, event_origin_sequence " ++
+                "FROM {schema}.{table} WHERE instance_id = $1 ORDER BY key ASC, COALESCE(session_id, '') ASC",
+            self.schema_q,
+            self.table_q,
+        );
+        defer allocator.free(state_sql);
+        {
+            const result = try self.execParams(state_sql, &params, &lengths);
+            defer c.PQclear(result);
+            var row: c_int = 0;
+            while (row < c.PQntuples(result)) : (row += 1) {
+                const key = try dupeResultValue(allocator, result, row, 0);
+                defer allocator.free(key);
+                const session_id = try dupeResultValueOpt(allocator, result, row, 1);
+                defer if (session_id) |sid| allocator.free(sid);
+                const category = try dupeResultValue(allocator, result, row, 2);
+                defer allocator.free(category);
+                const value_kind = try dupeResultValueOpt(allocator, result, row, 3);
+                defer if (value_kind) |kind| allocator.free(kind);
+                const content = try dupeResultValue(allocator, result, row, 4);
+                defer allocator.free(content);
+                const ts_raw = c.PQgetvalue(result, row, 5);
+                const ts_len: usize = @intCast(c.PQgetlength(result, row, 5));
+                const timestamp_ms = std.fmt.parseInt(i64, ts_raw[0..ts_len], 10) catch 0;
+                const origin_instance_id = try dupeResultValue(allocator, result, row, 6);
+                defer allocator.free(origin_instance_id);
+                const seq_raw = c.PQgetvalue(result, row, 7);
+                const seq_len: usize = @intCast(c.PQgetlength(result, row, 7));
+                const origin_sequence = std.fmt.parseInt(u64, seq_raw[0..seq_len], 10) catch 0;
+                try appendCheckpointStateLine(allocator, &out, key, session_id, category, value_kind, content, timestamp_ms, origin_instance_id, origin_sequence);
+            }
+        }
+
+        const tombstones_sql = try self.schemaQuery(allocator,
+            "SELECT key, scope, session_id, timestamp_ms, origin_instance_id, origin_sequence FROM {s}.memory_tombstones " ++
+                "WHERE instance_id = $1 ORDER BY key ASC, scope ASC, session_key ASC",
+        );
+        defer allocator.free(tombstones_sql);
+        {
+            const result = try self.execParams(tombstones_sql, &params, &lengths);
+            defer c.PQclear(result);
+            var row: c_int = 0;
+            while (row < c.PQntuples(result)) : (row += 1) {
+                const logical_key = try dupeResultValue(allocator, result, row, 0);
+                defer allocator.free(logical_key);
+                const scope = try dupeResultValue(allocator, result, row, 1);
+                defer allocator.free(scope);
+                const session_id = try dupeResultValueOpt(allocator, result, row, 2);
+                defer if (session_id) |sid| allocator.free(sid);
+                const ts_raw = c.PQgetvalue(result, row, 3);
+                const ts_len: usize = @intCast(c.PQgetlength(result, row, 3));
+                const timestamp_ms = std.fmt.parseInt(i64, ts_raw[0..ts_len], 10) catch 0;
+                const origin_instance_id = try dupeResultValue(allocator, result, row, 4);
+                defer allocator.free(origin_instance_id);
+                const seq_raw = c.PQgetvalue(result, row, 5);
+                const seq_len: usize = @intCast(c.PQgetlength(result, row, 5));
+                const origin_sequence = std.fmt.parseInt(u64, seq_raw[0..seq_len], 10) catch 0;
+
+                const encoded_key = if (std.mem.eql(u8, scope, "all"))
+                    try allocator.dupe(u8, logical_key)
+                else
+                    try key_codec.encode(allocator, logical_key, session_id);
+                defer allocator.free(encoded_key);
+
+                try appendCheckpointTombstoneLine(
+                    allocator,
+                    &out,
+                    if (std.mem.eql(u8, scope, "all")) "key_tombstone" else "scoped_tombstone",
+                    encoded_key,
+                    timestamp_ms,
+                    origin_instance_id,
+                    origin_sequence,
+                );
+            }
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn applyCheckpointPayload(self: *Self, payload: []const u8) !void {
+        const local_instance_id = self.localInstanceId();
+        const iid_z = try self.allocator.dupeZ(u8, local_instance_id);
+        defer self.allocator.free(iid_z);
+        const instance_params = [_]?[*:0]const u8{iid_z};
+        const instance_lengths = [_]c_int{@intCast(local_instance_id.len)};
+
+        try self.begin();
+        var committed = false;
+        errdefer if (!committed) self.rollback();
+
+        const clear_queries = [_][]const u8{
+            "DELETE FROM {schema}.memory_events WHERE instance_id = $1",
+            "DELETE FROM {schema}.memory_tombstones WHERE instance_id = $1",
+            "DELETE FROM {schema}.memory_event_frontiers WHERE instance_id = $1",
+            "DELETE FROM {schema}.{table} WHERE instance_id = $1",
+            "DELETE FROM {schema}.memory_feed_meta WHERE instance_id = $1",
+        };
+        inline for (clear_queries) |template| {
+            const sql = try buildQuery(self.allocator, template, self.schema_q, self.table_q);
+            defer self.allocator.free(sql);
+            const result = try self.execParams(sql, &instance_params, &instance_lengths);
+            c.PQclear(result);
+        }
+
+        var last_sequence: u64 = 0;
+        var compacted_through: u64 = 0;
+        var saw_meta = false;
+
+        var lines = std.mem.splitScalar(u8, payload, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r\n");
+            if (line.len == 0) continue;
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, line, .{});
+            defer parsed.deinit();
+
+            const kind = checkpointJsonStringField(parsed.value, "kind") orelse return error.InvalidEvent;
+            if (std.mem.eql(u8, kind, "meta")) {
+                saw_meta = true;
+                last_sequence = checkpointJsonUnsignedField(parsed.value, "last_sequence") orelse 0;
+                compacted_through = checkpointJsonUnsignedField(parsed.value, "compacted_through_sequence") orelse last_sequence;
+                continue;
+            }
+            if (std.mem.eql(u8, kind, "frontier")) {
+                const origin_instance_id = checkpointJsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
+                const origin_sequence = checkpointJsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
+                try self.insertCheckpointFrontier(origin_instance_id, origin_sequence);
+                continue;
+            }
+            if (std.mem.eql(u8, kind, "state")) {
+                try self.insertCheckpointState(
+                    checkpointJsonStringField(parsed.value, "key") orelse return error.InvalidEvent,
+                    checkpointJsonNullableStringField(parsed.value, "session_id"),
+                    checkpointJsonStringField(parsed.value, "category") orelse return error.InvalidEvent,
+                    checkpointJsonNullableStringField(parsed.value, "value_kind"),
+                    checkpointJsonStringField(parsed.value, "content") orelse return error.InvalidEvent,
+                    checkpointJsonIntegerField(parsed.value, "timestamp_ms") orelse return error.InvalidEvent,
+                    checkpointJsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent,
+                    checkpointJsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent,
+                );
+                continue;
+            }
+            if (std.mem.eql(u8, kind, "scoped_tombstone") or std.mem.eql(u8, kind, "key_tombstone")) {
+                try self.insertCheckpointTombstone(
+                    kind,
+                    checkpointJsonStringField(parsed.value, "key") orelse return error.InvalidEvent,
+                    checkpointJsonIntegerField(parsed.value, "timestamp_ms") orelse return error.InvalidEvent,
+                    checkpointJsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent,
+                    checkpointJsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent,
+                );
+                continue;
+            }
+            return error.InvalidEvent;
+        }
+
+        if (!saw_meta) return error.InvalidEvent;
+        try self.setLastSequenceTx(self.allocator, last_sequence);
+        try self.setCompactedThroughSequenceTx(self.allocator, compacted_through);
+        try self.commit();
+        committed = true;
+    }
+
+    fn insertCheckpointFrontier(self: *Self, origin_instance_id: []const u8, origin_sequence: u64) !void {
+        try self.setFrontierTx(self.allocator, origin_instance_id, origin_sequence);
+    }
+
+    fn insertCheckpointState(
+        self: *Self,
+        key: []const u8,
+        session_id: ?[]const u8,
+        category: []const u8,
+        value_kind: ?[]const u8,
+        content: []const u8,
+        timestamp_ms: i64,
+        origin_instance_id: []const u8,
+        origin_sequence: u64,
+    ) !void {
+        const sql = try buildQuery(
+            self.allocator,
+            "INSERT INTO {schema}.{table} (id, key, content, category, session_id, instance_id, value_kind, event_timestamp_ms, event_origin_instance_id, event_origin_sequence, created_at, updated_at) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            self.schema_q,
+            self.table_q,
+        );
+        defer self.allocator.free(sql);
+
+        const id = try generateId(self.allocator);
+        defer self.allocator.free(id);
+        const id_z = try self.allocator.dupeZ(u8, id);
+        defer self.allocator.free(id_z);
+        const key_z = try self.allocator.dupeZ(u8, key);
+        defer self.allocator.free(key_z);
+        const content_z = try self.allocator.dupeZ(u8, content);
+        defer self.allocator.free(content_z);
+        const category_z = try self.allocator.dupeZ(u8, category);
+        defer self.allocator.free(category_z);
+        const sid_z: ?[*:0]u8 = if (session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        defer if (sid_z) |sid| self.allocator.free(sid);
+        const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
+        defer self.allocator.free(iid_z);
+        const kind_z: ?[*:0]u8 = if (value_kind) |kind| try self.allocator.dupeZ(u8, kind) else null;
+        defer if (kind_z) |kind| self.allocator.free(kind);
+        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{timestamp_ms});
+        defer self.allocator.free(timestamp_z);
+        const origin_z = try self.allocator.dupeZ(u8, origin_instance_id);
+        defer self.allocator.free(origin_z);
+        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{origin_sequence});
+        defer self.allocator.free(origin_seq_z);
+        const now = try std.fmt.allocPrintZ(self.allocator, "{d}", .{@divTrunc(timestamp_ms, 1000)});
+        defer self.allocator.free(now);
+
+        const params = [_]?[*:0]const u8{
+            id_z,
+            key_z,
+            content_z,
+            category_z,
+            sid_z,
+            iid_z,
+            kind_z,
+            timestamp_z,
+            origin_z,
+            origin_seq_z,
+            now,
+            now,
+        };
+        const lengths = [_]c_int{
+            @intCast(id.len),
+            @intCast(key.len),
+            @intCast(content.len),
+            @intCast(category.len),
+            if (session_id) |sid| @intCast(sid.len) else 0,
+            @intCast(self.localInstanceId().len),
+            if (value_kind) |kind| @intCast(kind.len) else 0,
+            @intCast(timestamp_z.len - 1),
+            @intCast(origin_instance_id.len),
+            @intCast(origin_seq_z.len - 1),
+            @intCast(now.len - 1),
+            @intCast(now.len - 1),
+        };
+        const result = try self.execParams(sql, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    fn insertCheckpointTombstone(
+        self: *Self,
+        kind: []const u8,
+        encoded_key: []const u8,
+        timestamp_ms: i64,
+        origin_instance_id: []const u8,
+        origin_sequence: u64,
+    ) !void {
+        const scope = if (std.mem.eql(u8, kind, "key_tombstone")) "all" else "scoped";
+        const logical_key: []const u8, const session_id: ?[]const u8, const session_key: []const u8 = blk: {
+            if (std.mem.eql(u8, scope, "all")) break :blk .{ encoded_key, null, "*" };
+            const decoded = key_codec.decode(encoded_key);
+            if (decoded.is_legacy) return error.InvalidEvent;
+            break :blk .{ decoded.logical_key, decoded.session_id, sessionKeyFor(decoded.session_id) };
+        };
+
+        const sql = try self.schemaQuery(self.allocator,
+            "INSERT INTO {s}.memory_tombstones (instance_id, key, scope, session_key, session_id, timestamp_ms, origin_instance_id, origin_sequence) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        );
+        defer self.allocator.free(sql);
+
+        const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
+        defer self.allocator.free(iid_z);
+        const key_z = try self.allocator.dupeZ(u8, logical_key);
+        defer self.allocator.free(key_z);
+        const scope_z = try self.allocator.dupeZ(u8, scope);
+        defer self.allocator.free(scope_z);
+        const session_key_z = try self.allocator.dupeZ(u8, session_key);
+        defer self.allocator.free(session_key_z);
+        const sid_z: ?[*:0]u8 = if (session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        defer if (sid_z) |sid| self.allocator.free(sid);
+        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{timestamp_ms});
+        defer self.allocator.free(timestamp_z);
+        const origin_z = try self.allocator.dupeZ(u8, origin_instance_id);
+        defer self.allocator.free(origin_z);
+        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{origin_sequence});
+        defer self.allocator.free(origin_seq_z);
+
+        const params = [_]?[*:0]const u8{
+            iid_z,
+            key_z,
+            scope_z,
+            session_key_z,
+            sid_z,
+            timestamp_z,
+            origin_z,
+            origin_seq_z,
+        };
+        const lengths = [_]c_int{
+            @intCast(self.localInstanceId().len),
+            @intCast(logical_key.len),
+            @intCast(scope.len),
+            @intCast(session_key.len),
+            if (session_id) |sid| @intCast(sid.len) else 0,
+            @intCast(timestamp_z.len - 1),
+            @intCast(origin_instance_id.len),
+            @intCast(origin_seq_z.len - 1),
+        };
+        const result = try self.execParams(sql, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    fn checkpointJsonStringField(val: std.json.Value, key: []const u8) ?[]const u8 {
+        if (val != .object) return null;
+        const field = val.object.get(key) orelse return null;
+        return switch (field) {
+            .string => |text| text,
+            else => null,
+        };
+    }
+
+    fn checkpointJsonNullableStringField(val: std.json.Value, key: []const u8) ?[]const u8 {
+        if (val != .object) return null;
+        const field = val.object.get(key) orelse return null;
+        return switch (field) {
+            .null => null,
+            .string => |text| text,
+            else => null,
+        };
+    }
+
+    fn checkpointJsonIntegerField(val: std.json.Value, key: []const u8) ?i64 {
+        if (val != .object) return null;
+        const field = val.object.get(key) orelse return null;
+        return switch (field) {
+            .integer => |num| num,
+            else => null,
+        };
+    }
+
+    fn checkpointJsonUnsignedField(val: std.json.Value, key: []const u8) ?u64 {
+        const value = checkpointJsonIntegerField(val, key) orelse return null;
+        if (value < 0) return null;
+        return @intCast(value);
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try self_.allocator.dupeZ(u8, local_instance_id);
         defer self_.allocator.free(iid_z);
         const params = [_]?[*:0]const u8{iid_z};
-        const lengths = [_]c_int{@intCast(self_.instance_id.len)};
+        const lengths = [_]c_int{@intCast(local_instance_id.len)};
 
         const result = try self_.execParams(self_.q_count, &params, &lengths);
         defer c.PQclear(result);
@@ -774,6 +2164,13 @@ const PostgresMemoryImpl = struct {
         .list = &implList,
         .forget = &implForget,
         .forgetScoped = &implForgetScoped,
+        .listEvents = &implListEvents,
+        .applyEvent = &implApplyEvent,
+        .lastEventSequence = &implLastEventSequence,
+        .eventFeedInfo = &implEventFeedInfo,
+        .compactEvents = &implCompactEvents,
+        .exportCheckpoint = &implExportCheckpoint,
+        .applyCheckpoint = &implApplyCheckpoint,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -1079,6 +2476,69 @@ const PostgresMemoryImpl = struct {
 
 // Pure logic tests (no PG server needed)
 
+const PostgresIntegrationTest = if (build_options.enable_postgres) struct {
+    allocator: std.mem.Allocator,
+    url_z: [:0]u8,
+    schema: []u8,
+
+    const Self = @This();
+
+    fn init(allocator: std.mem.Allocator) !Self {
+        const raw_url = std.process.getEnvVarOwned(allocator, "NULLCLAW_TEST_POSTGRES_URL") catch return error.SkipZigTest;
+        defer allocator.free(raw_url);
+
+        const url_z = try allocator.dupeZ(u8, raw_url);
+        errdefer allocator.free(url_z);
+        const schema = try makeSchemaName(allocator);
+        errdefer allocator.free(schema);
+
+        var self = Self{
+            .allocator = allocator,
+            .url_z = url_z,
+            .schema = schema,
+        };
+        try self.execAdminSqlFmt("CREATE SCHEMA IF NOT EXISTS \"{s}\"", .{schema});
+        return self;
+    }
+
+    fn deinit(self: *Self) void {
+        self.execAdminSqlFmt("DROP SCHEMA IF EXISTS \"{s}\" CASCADE", .{self.schema}) catch {};
+        self.allocator.free(self.schema);
+        self.allocator.free(self.url_z);
+    }
+
+    fn initMemory(self: *Self, instance_id: []const u8) !PostgresMemory {
+        return try PostgresMemory.init(self.allocator, self.url_z.ptr, self.schema, "memories", instance_id);
+    }
+
+    fn execAdminSqlFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        const sql = try std.fmt.allocPrint(self.allocator, fmt, args);
+        defer self.allocator.free(sql);
+        try self.execAdminSql(sql);
+    }
+
+    fn execAdminSql(self: *Self, sql: []const u8) !void {
+        const conn = c.PQconnectdb(self.url_z.ptr) orelse return error.ConnectionFailed;
+        defer c.PQfinish(conn);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) return error.ConnectionFailed;
+
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        const result = c.PQexec(conn, sql_z.ptr) orelse return error.ExecFailed;
+        defer c.PQclear(result);
+        const status = c.PQresultStatus(result);
+        if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) return error.ExecFailed;
+    }
+
+    fn makeSchemaName(allocator: std.mem.Allocator) ![]u8 {
+        var rand: [4]u8 = undefined;
+        std.crypto.random.bytes(&rand);
+        const suffix = std.fmt.fmtSliceHexLower(&rand);
+        return std.fmt.allocPrint(allocator, "nullclaw_feed_{d}_{any}", .{ std.time.nanoTimestamp(), suffix });
+    }
+} else struct {};
+
 test "validateIdentifier accepts valid names" {
     try validateIdentifier("public");
     try validateIdentifier("my_schema");
@@ -1170,4 +2630,151 @@ test "buildQuery returns null-terminated string" {
     // Verify null sentinel at position result.len
     try std.testing.expectEqual(@as(u8, 0), result[result.len]);
     try std.testing.expectEqualStrings("SELECT * FROM \"public\".\"memories\"", result);
+}
+
+test "integration: postgres native feed roundtrip" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+
+    var fixture = try PostgresIntegrationTest.init(std.testing.allocator);
+    defer fixture.deinit();
+
+    var first = try fixture.initMemory("agent-a");
+    defer first.deinit();
+    var second = try fixture.initMemory("agent-b");
+    defer second.deinit();
+
+    const first_mem = first.memory();
+    const second_mem = second.memory();
+
+    try first_mem.store("prefs/theme", "solarized", .core, "sess-a");
+
+    var info = try first_mem.eventFeedInfo(std.testing.allocator);
+    defer info.deinit(std.testing.allocator);
+    try std.testing.expectEqual(root.MemoryEventFeedStorage.native, info.storage_kind);
+    try std.testing.expectEqual(@as(u64, 1), info.last_sequence);
+
+    const events = try first_mem.listEvents(std.testing.allocator, 0, 10);
+    defer root.freeEvents(std.testing.allocator, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqual(root.MemoryEventOp.put, events[0].operation);
+
+    try second_mem.applyEvent(.{
+        .origin_instance_id = events[0].origin_instance_id,
+        .origin_sequence = events[0].origin_sequence,
+        .timestamp_ms = events[0].timestamp_ms,
+        .operation = events[0].operation,
+        .key = events[0].key,
+        .session_id = events[0].session_id,
+        .category = events[0].category,
+        .value_kind = events[0].value_kind,
+        .content = events[0].content,
+    });
+
+    const restored = try second_mem.getScoped(std.testing.allocator, "prefs/theme", "sess-a") orelse
+        return error.TestUnexpectedResult;
+    defer restored.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("solarized", restored.content);
+}
+
+test "integration: postgres feed compact and checkpoint restore" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+
+    var fixture = try PostgresIntegrationTest.init(std.testing.allocator);
+    defer fixture.deinit();
+
+    var source = try fixture.initMemory("agent-a");
+    defer source.deinit();
+
+    const source_mem = source.memory();
+    try source_mem.store("prefs/language", "zig", .core, null);
+    try source_mem.store("prefs/editor", "zed", .core, "sess-b");
+
+    const checkpoint = try source_mem.exportCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(checkpoint);
+
+    const compacted = try source_mem.compactEvents();
+    try std.testing.expect(compacted >= 2);
+    try std.testing.expectError(error.CursorExpired, source_mem.listEvents(std.testing.allocator, 0, 10));
+
+    var restored = try fixture.initMemory("agent-b");
+    defer restored.deinit();
+
+    const restored_mem = restored.memory();
+    try restored_mem.applyCheckpoint(checkpoint);
+
+    const global_entry = try restored_mem.get(std.testing.allocator, "prefs/language") orelse
+        return error.TestUnexpectedResult;
+    defer global_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("zig", global_entry.content);
+
+    const scoped_entry = try restored_mem.getScoped(std.testing.allocator, "prefs/editor", "sess-b") orelse
+        return error.TestUnexpectedResult;
+    defer scoped_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("zed", scoped_entry.content);
+
+    var restored_info = try restored_mem.eventFeedInfo(std.testing.allocator);
+    defer restored_info.deinit(std.testing.allocator);
+    try std.testing.expect(restored_info.next_local_origin_sequence >= 2);
+    try std.testing.expect(restored_info.last_sequence >= 2);
+}
+
+test "integration: postgres migration backfills existing state and promotes default instance ids" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+
+    var fixture = try PostgresIntegrationTest.init(std.testing.allocator);
+    defer fixture.deinit();
+
+    try fixture.execAdminSqlFmt(
+        \\CREATE TABLE IF NOT EXISTS "{s}"."memories" (
+        \\    id TEXT PRIMARY KEY,
+        \\    key TEXT NOT NULL,
+        \\    content TEXT NOT NULL,
+        \\    category TEXT NOT NULL DEFAULT 'core',
+        \\    session_id TEXT,
+        \\    instance_id TEXT NOT NULL DEFAULT '',
+        \\    created_at TEXT NOT NULL,
+        \\    updated_at TEXT NOT NULL
+        \\)
+    , .{fixture.schema});
+    try fixture.execAdminSqlFmt(
+        \\INSERT INTO "{s}"."memories" (id, key, content, category, session_id, instance_id, created_at, updated_at)
+        \\VALUES ('legacy-1', 'prefs/theme', 'amber', 'core', NULL, '', '0', '0')
+    , .{fixture.schema});
+
+    var mem = try fixture.initMemory("");
+    defer mem.deinit();
+
+    const memory = mem.memory();
+    const entry = try memory.get(std.testing.allocator, "prefs/theme") orelse return error.TestUnexpectedResult;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("amber", entry.content);
+
+    var info = try memory.eventFeedInfo(std.testing.allocator);
+    defer info.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1), info.last_sequence);
+
+    const events = try memory.listEvents(std.testing.allocator, 0, 10);
+    defer root.freeEvents(std.testing.allocator, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("prefs/theme", events[0].key);
+
+    const default_sql = try buildQuery(
+        std.testing.allocator,
+        "SELECT COUNT(*) FROM {schema}.{table} WHERE instance_id = 'default' AND key = 'prefs/theme'",
+        mem.schema_q,
+        mem.table_q,
+    );
+    defer std.testing.allocator.free(default_sql);
+    const legacy_sql = try buildQuery(
+        std.testing.allocator,
+        "SELECT COUNT(*) FROM {schema}.{table} WHERE instance_id = '' AND key = 'prefs/theme'",
+        mem.schema_q,
+        mem.table_q,
+    );
+    defer std.testing.allocator.free(legacy_sql);
+
+    const no_params = [_]?[*:0]const u8{};
+    const no_lengths = [_]c_int{};
+    try std.testing.expectEqual(@as(u64, 1), try mem.querySingleU64(std.testing.allocator, default_sql, &no_params, &no_lengths));
+    try std.testing.expectEqual(@as(u64, 0), try mem.querySingleU64(std.testing.allocator, legacy_sql, &no_params, &no_lengths));
 }

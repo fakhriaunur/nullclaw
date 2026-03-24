@@ -43,7 +43,7 @@ const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
-const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|put|merge-object|merge-set|delete|events|apply|compact|drain-outbox|forget";
+const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|put|merge-object|merge-set|delete|events|checkpoint|apply|compact|drain-outbox|forget";
 const HISTORY_SUBCOMMANDS = "list|show";
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
 const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
@@ -1013,6 +1013,7 @@ fn printMemoryUsage() void {
         \\                                Delete a memory entry (scoped if session id is given)
         \\  events [--after N] [--limit N] [--json|--ndjson|--status]
         \\                                Inspect deterministic memory event feed
+        \\  checkpoint                    Export the current memory checkpoint as NDJSON
         \\  apply <path|->                Apply JSON array or NDJSON event feed from file/stdin
         \\  compact                       Checkpoint current state and compact event feed history
         \\  drain-outbox                  Drain durable vector outbox queue
@@ -1246,6 +1247,23 @@ fn parseMemoryEventValue(val: std.json.Value) !yc.memory.MemoryEventInput {
     };
 }
 
+fn isCheckpointPayload(allocator: std.mem.Allocator, payload: []const u8) bool {
+    const trimmed = std.mem.trim(u8, payload, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] != '{') return false;
+
+    const first_line = std.mem.trim(
+        u8,
+        trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len],
+        " \t\r\n",
+    );
+    if (first_line.len == 0) return false;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, first_line, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get("kind") != null;
+}
+
 fn collectMemoryKeyScopes(allocator: std.mem.Allocator, memory: yc.memory.Memory, key: []const u8) ![]?[]u8 {
     const entries = try memory.list(allocator, null, null);
     defer yc.memory.freeEntries(allocator, entries);
@@ -1348,33 +1366,12 @@ const LocalMemoryEventOrigin = struct {
 
 fn nextLocalMemoryEventOrigin(allocator: std.mem.Allocator, memory: yc.memory.Memory) !LocalMemoryEventOrigin {
     var info = try memory.eventFeedInfo(allocator);
-    errdefer info.deinit(allocator);
-
-    var after_sequence: u64 = info.compacted_through_sequence;
-    var max_origin_sequence: u64 = 0;
-    while (true) {
-        const events = memory.listEvents(allocator, after_sequence, 256) catch |err| switch (err) {
-            error.CursorExpired => blk: {
-                after_sequence = info.compacted_through_sequence;
-                break :blk try memory.listEvents(allocator, after_sequence, 256);
-            },
-            else => return err,
-        };
-        defer yc.memory.freeEvents(allocator, events);
-        if (events.len == 0) break;
-
-        for (events) |event| {
-            if (std.mem.eql(u8, event.origin_instance_id, info.instance_id)) {
-                max_origin_sequence = @max(max_origin_sequence, event.origin_sequence);
-            }
-        }
-        after_sequence = events[events.len - 1].sequence;
-        if (events.len < 256) break;
-    }
-
+    const instance_id = info.instance_id;
+    info.instance_id = "";
+    defer info.deinit(allocator);
     return .{
-        .instance_id = info.instance_id,
-        .next_origin_sequence = max_origin_sequence + 1,
+        .instance_id = instance_id,
+        .next_origin_sequence = info.next_local_origin_sequence,
     };
 }
 
@@ -1867,6 +1864,20 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         return;
     }
 
+    if (std.mem.eql(u8, subcmd, "checkpoint")) {
+        const payload = mem_rt.memory.exportCheckpoint(allocator) catch |err| {
+            if (err == error.NotSupported) {
+                std.debug.print("memory checkpoint is not supported for backend: {s}\n", .{cfg.memory.backend});
+                std.process.exit(1);
+            }
+            std.debug.print("memory checkpoint failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer allocator.free(payload);
+        std.debug.print("{s}", .{payload});
+        return;
+    }
+
     if (std.mem.eql(u8, subcmd, "apply")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw memory apply <path|->\n", .{});
@@ -1881,6 +1892,20 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const trimmed = std.mem.trim(u8, payload, " \t\r\n");
         if (trimmed.len == 0) {
             std.debug.print("Applied 0 event(s).\n", .{});
+            return;
+        }
+
+        if (isCheckpointPayload(allocator, trimmed)) {
+            mem_rt.memory.applyCheckpoint(trimmed) catch |err| {
+                if (err == error.NotSupported) {
+                    std.debug.print("memory checkpoint apply is not supported for backend: {s}\n", .{cfg.memory.backend});
+                    std.process.exit(1);
+                }
+                std.debug.print("memory checkpoint apply failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            _ = mem_rt.reindex(allocator);
+            std.debug.print("Applied memory checkpoint.\n", .{});
             return;
         }
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const config_types = @import("../config_types.zig");
 const fs_compat = @import("../fs_compat.zig");
 const identity_mod = @import("../identity.zig");
@@ -1416,6 +1417,8 @@ test "buildSystemPrompt injects BOOTSTRAP.md when present" {
 }
 
 test "buildSystemPrompt reads bootstrap docs from sqlite provider when workspace files are absent" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1455,6 +1458,8 @@ test "buildSystemPrompt reads bootstrap docs from sqlite provider when workspace
 }
 
 test "buildSystemPrompt project context stays equivalent across markdown hybrid and sqlite backends" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     const backends = [_][]const u8{ "markdown", "hybrid", "sqlite" };
     var expected_fingerprint: ?u64 = null;
     var expected_project_context: ?[]u8 = null;
