@@ -341,7 +341,7 @@ fn createMarkdown(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInst
 fn createLucid(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     const impl_ = try allocator.create(root.LucidMemory);
     errdefer allocator.destroy(impl_);
-    impl_.* = try root.LucidMemory.init(allocator, cfg.db_path.?, cfg.workspace_dir);
+    impl_.* = try root.LucidMemory.initWithInstanceId(allocator, cfg.db_path.?, cfg.instance_id, cfg.workspace_dir);
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
 }

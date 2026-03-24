@@ -14,6 +14,9 @@ const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
+const MemoryEvent = root.MemoryEvent;
+const MemoryEventFeedInfo = root.MemoryEventFeedInfo;
+const MemoryEventInput = root.MemoryEventInput;
 
 pub const LucidMemory = struct {
     local: root.SqliteMemory,
@@ -40,8 +43,17 @@ pub const LucidMemory = struct {
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
     pub fn init(allocator: std.mem.Allocator, db_path: [*:0]const u8, workspace_dir: []const u8) !Self {
+        return initWithInstanceId(allocator, db_path, "default", workspace_dir);
+    }
+
+    pub fn initWithInstanceId(
+        allocator: std.mem.Allocator,
+        db_path: [*:0]const u8,
+        instance_id: []const u8,
+        workspace_dir: []const u8,
+    ) !Self {
         return Self{
-            .local = try root.SqliteMemory.init(allocator, db_path),
+            .local = try root.SqliteMemory.initWithInstanceId(allocator, db_path, instance_id),
             .allocator = allocator,
             .lucid_cmd = DEFAULT_LUCID_CMD,
             .workspace_dir = workspace_dir,
@@ -462,6 +474,41 @@ pub const LucidMemory = struct {
         return self.localMemory().forgetScoped(self.allocator, key, session_id);
     }
 
+    fn implListEvents(ptr: *anyopaque, allocator: std.mem.Allocator, after_sequence: u64, limit: usize) anyerror![]MemoryEvent {
+        const self = castSelf(ptr);
+        return self.localMemory().listEvents(allocator, after_sequence, limit);
+    }
+
+    fn implApplyEvent(ptr: *anyopaque, input: MemoryEventInput) anyerror!void {
+        const self = castSelf(ptr);
+        return self.localMemory().applyEvent(input);
+    }
+
+    fn implLastEventSequence(ptr: *anyopaque) anyerror!u64 {
+        const self = castSelf(ptr);
+        return self.localMemory().lastEventSequence();
+    }
+
+    fn implEventFeedInfo(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!MemoryEventFeedInfo {
+        const self = castSelf(ptr);
+        return self.localMemory().eventFeedInfo(allocator);
+    }
+
+    fn implCompactEvents(ptr: *anyopaque) anyerror!u64 {
+        const self = castSelf(ptr);
+        return self.localMemory().compactEvents();
+    }
+
+    fn implExportCheckpoint(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+        const self = castSelf(ptr);
+        return self.localMemory().exportCheckpoint(allocator);
+    }
+
+    fn implApplyCheckpoint(ptr: *anyopaque, payload: []const u8) anyerror!void {
+        const self = castSelf(ptr);
+        return self.localMemory().applyCheckpoint(payload);
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self = castSelf(ptr);
         return self.localMemory().count();
@@ -493,6 +540,13 @@ pub const LucidMemory = struct {
         .list = &implList,
         .forget = &implForget,
         .forgetScoped = &implForgetScoped,
+        .listEvents = &implListEvents,
+        .applyEvent = &implApplyEvent,
+        .lastEventSequence = &implLastEventSequence,
+        .eventFeedInfo = &implEventFeedInfo,
+        .compactEvents = &implCompactEvents,
+        .exportCheckpoint = &implExportCheckpoint,
+        .applyCheckpoint = &implApplyCheckpoint,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -684,6 +738,32 @@ test "lucid forget delegates to local" {
 
     const entry = try m.get(allocator, "temp");
     try std.testing.expect(entry == null);
+}
+
+test "lucid exposes native feed via local sqlite with configured instance id" {
+    const allocator = std.testing.allocator;
+    var mem = try LucidMemory.initWithInstanceId(
+        allocator,
+        ":memory:",
+        "agent-b",
+        "/tmp/test",
+    );
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("pref.theme", "dark", .core, null);
+
+    var info = try m.eventFeedInfo(allocator);
+    defer info.deinit(allocator);
+    try std.testing.expectEqualStrings("agent-b", info.instance_id);
+    try std.testing.expectEqual(root.MemoryEventFeedStorage.native, info.storage_kind);
+    try std.testing.expect(info.last_sequence > 0);
+
+    const events = try m.listEvents(allocator, 0, 8);
+    defer root.freeEvents(allocator, events);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("agent-b", events[0].origin_instance_id);
+    try std.testing.expectEqualStrings("pref.theme", events[0].key);
 }
 
 test "lucid count delegates to local" {

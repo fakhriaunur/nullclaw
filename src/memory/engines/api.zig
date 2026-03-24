@@ -733,7 +733,6 @@ pub const ApiMemory = struct {
         return switch (field) {
             .string => |text| {
                 if (std.mem.eql(u8, text, "native")) return .native;
-                if (std.mem.eql(u8, text, "overlay")) return .overlay;
                 return error.ApiInvalidResponse;
             },
             else => error.ApiInvalidResponse,
@@ -2167,10 +2166,10 @@ test "api parse memory events rejects invalid feed counters" {
     );
 }
 
-test "api parse feed info with overlay lifecycle fields" {
+test "api parse feed info with native lifecycle fields" {
     const alloc = std.testing.allocator;
     const json =
-        \\{"instance_id":"default","last_sequence":42,"next_local_origin_sequence":9,"supports_compaction":true,"storage_kind":"overlay","journal_path":"/tmp/journal","checkpoint_path":"/tmp/checkpoint","compacted_through_sequence":41,"oldest_available_sequence":42}
+        \\{"instance_id":"default","last_sequence":42,"next_local_origin_sequence":9,"supports_compaction":true,"storage_kind":"native","journal_path":"/tmp/journal","checkpoint_path":"/tmp/checkpoint","compacted_through_sequence":41,"oldest_available_sequence":42}
     ;
 
     var info = try ApiMemory.parseFeedInfo(alloc, json);
@@ -2180,7 +2179,7 @@ test "api parse feed info with overlay lifecycle fields" {
     try std.testing.expectEqual(@as(u64, 42), info.last_sequence);
     try std.testing.expectEqual(@as(u64, 9), info.next_local_origin_sequence);
     try std.testing.expect(info.supports_compaction);
-    try std.testing.expectEqual(root.MemoryEventFeedStorage.overlay, info.storage_kind);
+    try std.testing.expectEqual(root.MemoryEventFeedStorage.native, info.storage_kind);
     try std.testing.expectEqualStrings("/tmp/journal", info.journal_path.?);
     try std.testing.expectEqualStrings("/tmp/checkpoint", info.checkpoint_path.?);
     try std.testing.expectEqual(@as(u64, 41), info.compacted_through_sequence);

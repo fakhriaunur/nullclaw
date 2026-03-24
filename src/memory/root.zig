@@ -11,7 +11,6 @@ const std = @import("std");
 const build_options = @import("build_options");
 const config_types = @import("../config_types.zig");
 const fs_compat = @import("../fs_compat.zig");
-const platform = @import("../platform.zig");
 const provider_api_key = @import("../providers/api_key.zig");
 const log = std.log.scoped(.memory);
 
@@ -31,7 +30,6 @@ pub const lancedb = if (build_options.enable_memory_lancedb) @import("engines/la
 pub const api = @import("engines/api.zig");
 pub const clickhouse = @import("engines/clickhouse.zig");
 pub const registry = @import("engines/registry.zig");
-pub const feed_overlay = @import("feed_overlay.zig");
 
 // retrieval/ (Layer B: Retrieval Engine)
 pub const retrieval = @import("retrieval/engine.zig");
@@ -78,7 +76,6 @@ pub const RedisMemory = redis.RedisMemory;
 pub const ClickHouseMemory = clickhouse.ClickHouseMemory;
 pub const LanceDbMemory = lancedb.LanceDbMemory;
 pub const ApiMemory = api.ApiMemory;
-pub const EventFeedOverlay = feed_overlay.EventFeedOverlay;
 pub const ResponseCache = cache.ResponseCache;
 pub const Chunk = chunker.Chunk;
 pub const chunkMarkdown = chunker.chunkMarkdown;
@@ -423,12 +420,10 @@ pub const MemoryEventInput = struct {
 
 pub const MemoryEventFeedStorage = enum {
     native,
-    overlay,
 
     pub fn toString(self: MemoryEventFeedStorage) []const u8 {
         return switch (self) {
             .native => "native",
-            .overlay => "overlay",
         };
     }
 };
@@ -1369,83 +1364,6 @@ fn syncPreservedChunkToVector(
     );
 }
 
-fn isRemoteOverlayBackend(backend_name: []const u8) bool {
-    return std.mem.eql(u8, backend_name, "postgres") or
-        std.mem.eql(u8, backend_name, "redis") or
-        std.mem.eql(u8, backend_name, "api") or
-        std.mem.eql(u8, backend_name, "clickhouse");
-}
-
-fn buildOverlayJournalRootDir(
-    allocator: std.mem.Allocator,
-    backend_name: []const u8,
-    workspace_dir: []const u8,
-) ![]u8 {
-    const dir = if (isRemoteOverlayBackend(backend_name)) blk: {
-        const home = platform.getHomeDir(allocator) catch break :blk try std.fs.path.join(allocator, &.{ workspace_dir, ".nullclaw", "memory-feed-overlay" });
-        defer allocator.free(home);
-        break :blk try std.fs.path.join(allocator, &.{ home, ".nullclaw", "memory-feed-overlay" });
-    } else try std.fs.path.join(allocator, &.{ workspace_dir, ".nullclaw", "memory-feed-overlay" });
-    errdefer allocator.free(dir);
-
-    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => try fs_compat.makePath(dir),
-    };
-
-    return dir;
-}
-
-fn buildOverlayJournalIdentity(
-    allocator: std.mem.Allocator,
-    backend_name: []const u8,
-    workspace_dir: []const u8,
-    cfg: registry.BackendConfig,
-) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    const writer = out.writer(allocator);
-
-    try writer.writeAll("overlay_protocol=v2\n");
-    try writer.print("backend={s}\n", .{backend_name});
-    try writer.print("instance_id={s}\n", .{cfg.instance_id});
-
-    if (std.mem.eql(u8, backend_name, "markdown") or std.mem.eql(u8, backend_name, "lucid")) {
-        try writer.print("workspace={s}\n", .{workspace_dir});
-    }
-    if (cfg.db_path) |path| {
-        try writer.print("db_path={s}\n", .{std.mem.span(path)});
-    }
-    if (cfg.postgres_url) |url| {
-        try writer.print("postgres_url={s}\n", .{std.mem.span(url)});
-        try writer.print("postgres_schema={s}\n", .{cfg.postgres_schema});
-        try writer.print("postgres_table={s}\n", .{cfg.postgres_table});
-        try writer.print("postgres_connect_timeout_secs={d}\n", .{cfg.postgres_connect_timeout_secs});
-    }
-    if (cfg.redis_config) |redis_cfg| {
-        try writer.print("redis_host={s}\n", .{redis_cfg.host});
-        try writer.print("redis_port={d}\n", .{redis_cfg.port});
-        try writer.print("redis_db_index={d}\n", .{redis_cfg.db_index});
-        try writer.print("redis_key_prefix={s}\n", .{redis_cfg.key_prefix});
-        try writer.print("redis_ttl_seconds={d}\n", .{redis_cfg.ttl_seconds});
-    }
-    if (cfg.api_config) |api_cfg| {
-        try writer.print("api_url={s}\n", .{api_cfg.url});
-        try writer.print("api_namespace={s}\n", .{api_cfg.namespace});
-        try writer.print("api_timeout_ms={d}\n", .{api_cfg.timeout_ms});
-    }
-    if (cfg.clickhouse_config) |clickhouse_cfg| {
-        try writer.print("clickhouse_host={s}\n", .{clickhouse_cfg.host});
-        try writer.print("clickhouse_port={d}\n", .{clickhouse_cfg.port});
-        try writer.print("clickhouse_database={s}\n", .{clickhouse_cfg.database});
-        try writer.print("clickhouse_table={s}\n", .{clickhouse_cfg.table});
-        try writer.print("clickhouse_user={s}\n", .{clickhouse_cfg.user});
-        try writer.print("clickhouse_use_https={any}\n", .{clickhouse_cfg.use_https});
-    }
-
-    return out.toOwnedSlice(allocator);
-}
-
 /// Create a MemoryRuntime from a MemoryConfig and workspace directory.
 /// Goes through the registry to find the backend, resolve paths, and
 /// create the instance. Returns null on any error (unknown backend,
@@ -1503,50 +1421,6 @@ pub fn initRuntime(
         if (cfg.db_path) |p| allocator.free(std.mem.span(p));
         return null;
     };
-
-    if (instance.memory.vtable.listEvents == null and !std.mem.eql(u8, config.backend, "none")) {
-        const overlay_root = buildOverlayJournalRootDir(allocator, config.backend, workspace_dir) catch |err| {
-            log.warn("memory backend '{s}' event feed root init failed: {}", .{ config.backend, err });
-            instance.memory.deinit();
-            if (cfg.postgres_url) |pu| allocator.free(std.mem.span(pu));
-            if (cfg.db_path) |p| allocator.free(std.mem.span(p));
-            return null;
-        };
-        defer allocator.free(overlay_root);
-
-        const overlay_identity = buildOverlayJournalIdentity(allocator, config.backend, workspace_dir, cfg) catch |err| {
-            log.warn("memory backend '{s}' event feed identity init failed: {}", .{ config.backend, err });
-            instance.memory.deinit();
-            if (cfg.postgres_url) |pu| allocator.free(std.mem.span(pu));
-            if (cfg.db_path) |p| allocator.free(std.mem.span(p));
-            return null;
-        };
-        defer allocator.free(overlay_identity);
-
-        const overlay = allocator.create(feed_overlay.EventFeedOverlay) catch {
-            log.warn("memory backend '{s}' event feed init failed: OutOfMemory", .{config.backend});
-            instance.memory.deinit();
-            if (cfg.postgres_url) |pu| allocator.free(std.mem.span(pu));
-            if (cfg.db_path) |p| allocator.free(std.mem.span(p));
-            return null;
-        };
-        overlay.* = feed_overlay.EventFeedOverlay.init(
-            allocator,
-            instance.memory,
-            overlay_root,
-            overlay_identity,
-            cfg.instance_id,
-        ) catch |err| {
-            allocator.destroy(overlay);
-            log.warn("memory backend '{s}' event feed init failed: {}", .{ config.backend, err });
-            instance.memory.deinit();
-            if (cfg.postgres_url) |pu| allocator.free(std.mem.span(pu));
-            if (cfg.db_path) |p| allocator.free(std.mem.span(p));
-            return null;
-        };
-        overlay.owns_self = true;
-        instance.memory = overlay.memory();
-    }
 
     // ── Lifecycle: snapshot hydrate (before hygiene) ──
     if (config.lifecycle.auto_hydrate) {
