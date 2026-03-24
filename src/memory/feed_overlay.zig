@@ -87,7 +87,7 @@ pub const EventFeedOverlay = struct {
 
     const RecordedEvent = struct {
         event: MemoryEvent,
-        effect: ?Effect = null,
+        effect: Effect,
         resolved_state: ?ResolvedMemoryState = null,
 
         fn deinit(self: *RecordedEvent, allocator: std.mem.Allocator) void {
@@ -220,7 +220,6 @@ pub const EventFeedOverlay = struct {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         try self_.ensureProjectionUpToDate();
         if (self_.findDefaultStatePtr(key)) |state| return try self_.cloneStateEntry(allocator, state.*);
-        if (self_.findLatestStatePtr(key)) |state| return try self_.cloneStateEntry(allocator, state.*);
         return null;
     }
 
@@ -457,15 +456,7 @@ pub const EventFeedOverlay = struct {
             defer recorded.deinit(self.allocator);
 
             const input = memoryEventInput(recorded.event);
-            var decision = if (recorded.effect) |effect|
-                EventDecision{
-                    .effect = effect,
-                    .resolved_state = recorded.resolved_state,
-                }
-            else
-                try self.computeDecision(input);
-            defer if (recorded.effect == null) decision.deinit(self.allocator);
-            try self.applyProjectionEffect(input, decision.effect, decision.resolved_state);
+            try self.applyProjectionEffect(input, recorded.effect, recorded.resolved_state);
             self.projection_offset_bytes = line_end;
         }
     }
@@ -520,15 +511,7 @@ pub const EventFeedOverlay = struct {
             defer recorded.deinit(self.allocator);
 
             const input = memoryEventInput(recorded.event);
-            var decision = if (recorded.effect) |effect|
-                EventDecision{
-                    .effect = effect,
-                    .resolved_state = recorded.resolved_state,
-                }
-            else
-                try self.computeDecision(input);
-            defer if (recorded.effect == null) decision.deinit(self.allocator);
-            try self.applyMetadataUpdate(recorded.event.sequence, input, decision.effect, decision.resolved_state);
+            try self.applyMetadataUpdate(recorded.event.sequence, input, recorded.effect, recorded.resolved_state);
             self.loaded_size_bytes = line_end;
         }
     }
@@ -1111,16 +1094,6 @@ pub const EventFeedOverlay = struct {
         return null;
     }
 
-    fn findLatestStatePtr(self: *Self, key: []const u8) ?*StoredState {
-        var best: ?*StoredState = null;
-        var it = self.state_entries.iterator();
-        while (it.next()) |kv| {
-            if (!std.mem.eql(u8, kv.value_ptr.key, key)) continue;
-            if (best == null or compareStoredStates(kv.value_ptr.*, best.?.*) > 0) best = kv.value_ptr;
-        }
-        return best;
-    }
-
     fn cloneStateEntry(self: *Self, allocator: std.mem.Allocator, state: StoredState) !MemoryEntry {
         _ = self;
         return .{
@@ -1440,7 +1413,10 @@ fn parseRecordedEventLine(allocator: std.mem.Allocator, line: []const u8) !Event
     const origin_sequence = jsonUnsignedField(val, "origin_sequence") orelse return error.InvalidEvent;
     const timestamp_ms = jsonIntegerField(val, "timestamp_ms") orelse return error.InvalidEvent;
     const operation_str = jsonStringField(val, "operation") orelse return error.InvalidEvent;
+    const effect_str = jsonStringField(val, "effect") orelse return error.InvalidEvent;
     const key = jsonStringField(val, "key") orelse return error.InvalidEvent;
+    const schema_version_raw = jsonUnsignedField(val, "schema_version") orelse return error.InvalidEvent;
+    if (schema_version_raw == 0) return error.InvalidEvent;
 
     const event_category = if (jsonNullableStringField(val, "category")) |cat|
         try root.cloneMemoryCategory(allocator, root.MemoryCategory.fromString(cat))
@@ -1451,9 +1427,30 @@ fn parseRecordedEventLine(allocator: std.mem.Allocator, line: []const u8) !Event
         else => {},
     };
 
+    const effect = EventFeedOverlay.Effect.fromString(effect_str) orelse return error.InvalidEvent;
+    const resolved_state = blk: {
+        const resolved_category_text = jsonNullableStringField(val, "resolved_category") orelse break :blk null;
+        const resolved_content = jsonNullableStringField(val, "resolved_content") orelse return error.InvalidEvent;
+        const resolved_category = try root.cloneMemoryCategory(allocator, root.MemoryCategory.fromString(resolved_category_text));
+        errdefer switch (resolved_category) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        };
+        break :blk ResolvedMemoryState{
+            .content = try allocator.dupe(u8, resolved_content),
+            .category = resolved_category,
+            .value_kind = if (jsonNullableStringField(val, "resolved_value_kind")) |kind|
+                MemoryValueKind.fromString(kind) orelse return error.InvalidEvent
+            else
+                null,
+        };
+    };
+    errdefer if (resolved_state) |*state| state.deinit(allocator);
+    if (effect == .put and resolved_state == null) return error.InvalidEvent;
+
     return .{
         .event = .{
-            .schema_version = @intCast(jsonUnsignedField(val, "schema_version") orelse 1),
+            .schema_version = @intCast(schema_version_raw),
             .sequence = sequence,
             .origin_instance_id = try allocator.dupe(u8, origin_instance_id),
             .origin_sequence = origin_sequence,
@@ -1468,27 +1465,8 @@ fn parseRecordedEventLine(allocator: std.mem.Allocator, line: []const u8) !Event
                 null,
             .content = if (jsonNullableStringField(val, "content")) |content| try allocator.dupe(u8, content) else null,
         },
-        .effect = blk: {
-            const effect_str = jsonStringField(val, "effect") orelse break :blk null;
-            break :blk EventFeedOverlay.Effect.fromString(effect_str) orelse return error.InvalidEvent;
-        },
-        .resolved_state = blk: {
-            const resolved_category_text = jsonNullableStringField(val, "resolved_category") orelse break :blk null;
-            const resolved_content = jsonNullableStringField(val, "resolved_content") orelse return error.InvalidEvent;
-            const resolved_category = try root.cloneMemoryCategory(allocator, root.MemoryCategory.fromString(resolved_category_text));
-            errdefer switch (resolved_category) {
-                .custom => |name| allocator.free(name),
-                else => {},
-            };
-            break :blk ResolvedMemoryState{
-                .content = try allocator.dupe(u8, resolved_content),
-                .category = resolved_category,
-                .value_kind = if (jsonNullableStringField(val, "resolved_value_kind")) |kind|
-                    MemoryValueKind.fromString(kind) orelse return error.InvalidEvent
-                else
-                    null,
-            };
-        },
+        .effect = effect,
+        .resolved_state = resolved_state,
     };
 }
 
@@ -1804,6 +1782,30 @@ test "feed overlay canonical reads ignore projection drift" {
     defer root.freeEntries(std.testing.allocator, listed);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
     try std.testing.expectEqualStrings("preferences.theme", listed[0].key);
+}
+
+test "feed overlay get ignores scoped-only entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var backend = FailingProjectionBackend.init(std.testing.allocator);
+    backend.fail_writes = false;
+    var overlay = try EventFeedOverlay.init(std.testing.allocator, backend.memory(), workspace, "scoped-get", "agent-a");
+    defer overlay.deinit();
+
+    const mem = overlay.memory();
+    try mem.store("preferences.locale", "ru", .core, "sess-a");
+
+    const global = try mem.get(std.testing.allocator, "preferences.locale");
+    defer if (global) |entry| entry.deinit(std.testing.allocator);
+    try std.testing.expect(global == null);
+
+    const scoped = (try mem.getScoped(std.testing.allocator, "preferences.locale", "sess-a")).?;
+    defer scoped.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ru", scoped.content);
 }
 
 test "feed overlay delegates recall to projection backend when available" {

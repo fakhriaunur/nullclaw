@@ -43,7 +43,7 @@ const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
-const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|put|merge-object|merge-set|delete|events|checkpoint|apply|compact|drain-outbox|forget";
+const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|put|merge-object|merge-set|delete|events|checkpoint|apply|compact|drain-outbox";
 const HISTORY_SUBCOMMANDS = "list|show";
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
 const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
@@ -1017,8 +1017,6 @@ fn printMemoryUsage() void {
         \\  apply <path|->                Apply JSON array or NDJSON event feed from file/stdin
         \\  compact                       Checkpoint current state and compact event feed history
         \\  drain-outbox                  Drain durable vector outbox queue
-        \\  forget <key> [--session-id ID]
-        \\                                Alias for delete
         \\
     , .{MEMORY_SUBCOMMANDS}), .{});
 }
@@ -1218,12 +1216,14 @@ fn jsonIntegerField(val: std.json.Value, key: []const u8) ?i64 {
 }
 
 fn parseMemoryEventValue(val: std.json.Value) !yc.memory.MemoryEventInput {
+    const schema_version_raw = jsonIntegerField(val, "schema_version") orelse return error.InvalidEvent;
     const origin_instance_id = jsonStringField(val, "origin_instance_id") orelse return error.InvalidEvent;
     const origin_sequence_raw = jsonIntegerField(val, "origin_sequence") orelse return error.InvalidEvent;
     const timestamp_ms = jsonIntegerField(val, "timestamp_ms") orelse return error.InvalidEvent;
     const operation_str = jsonStringField(val, "operation") orelse return error.InvalidEvent;
     const key = jsonStringField(val, "key") orelse return error.InvalidEvent;
 
+    if (schema_version_raw != 1) return error.InvalidEvent;
     if (origin_sequence_raw < 0) return error.InvalidEvent;
     const operation = yc.memory.MemoryEventOp.fromString(operation_str) orelse return error.InvalidEvent;
     const category_str = jsonNullableStringField(val, "category");
@@ -1261,7 +1261,10 @@ fn isCheckpointPayload(allocator: std.mem.Allocator, payload: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, first_line, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
-    return parsed.value.object.get("kind") != null;
+    const kind = jsonStringField(parsed.value, "kind") orelse return false;
+    if (!std.mem.eql(u8, kind, "meta")) return false;
+    const schema_version = jsonIntegerField(parsed.value, "schema_version") orelse return false;
+    return schema_version == 1;
 }
 
 fn collectMemoryKeyScopes(allocator: std.mem.Allocator, memory: yc.memory.Memory, key: []const u8) ![]?[]u8 {
@@ -1365,12 +1368,10 @@ const LocalMemoryEventOrigin = struct {
 };
 
 fn nextLocalMemoryEventOrigin(allocator: std.mem.Allocator, memory: yc.memory.Memory) !LocalMemoryEventOrigin {
-    var info = try memory.eventFeedInfo(allocator);
-    const instance_id = info.instance_id;
-    info.instance_id = "";
+    const info = try memory.eventFeedInfo(allocator);
     defer info.deinit(allocator);
     return .{
-        .instance_id = instance_id,
+        .instance_id = try allocator.dupe(u8, info.instance_id),
         .next_origin_sequence = info.next_local_origin_sequence,
     };
 }
@@ -2005,9 +2006,9 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         return;
     }
 
-    if (std.mem.eql(u8, subcmd, "forget") or std.mem.eql(u8, subcmd, "delete")) {
+    if (std.mem.eql(u8, subcmd, "delete")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw memory {s} <key> [--session-id ID]\n", .{subcmd});
+            std.debug.print("Usage: nullclaw memory delete <key> [--session-id ID]\n", .{});
             std.process.exit(1);
         }
         const key = sub_args[1];
@@ -2017,13 +2018,13 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--session-id")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory {s} <key> [--session-id ID]\n", .{subcmd});
+                    std.debug.print("Usage: nullclaw memory delete <key> [--session-id ID]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
                 session_id = sub_args[i];
             } else {
-                std.debug.print("Unknown option for memory {s}: {s}\n", .{ subcmd, sub_args[i] });
+                std.debug.print("Unknown option for memory delete: {s}\n", .{sub_args[i]});
                 std.process.exit(1);
             }
         }
@@ -4982,7 +4983,7 @@ test "applyMemoryEventWithVectorSync ignores stale put for vector sync" {
 
 test "parseMemoryEventValue parses merge event and checkpoint detector distinguishes payloads" {
     const event_json =
-        \\{"origin_instance_id":"agent-a","origin_sequence":7,"timestamp_ms":1234,"operation":"merge_object","key":"profile.behavior","session_id":null,"category":"core","value_kind":"json_object","content":"{\"tone\":\"formal\"}"}
+        \\{"schema_version":1,"origin_instance_id":"agent-a","origin_sequence":7,"timestamp_ms":1234,"operation":"merge_object","key":"profile.behavior","session_id":null,"category":"core","value_kind":"json_object","content":"{\"tone\":\"formal\"}"}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event_json, .{});
     defer parsed.deinit();
@@ -5002,6 +5003,23 @@ test "parseMemoryEventValue parses merge event and checkpoint detector distingui
         \\
         \\{"kind":"entry","key":"prefs/theme","content":"dark","category":"core","session_id":null}
     ;
+    const not_checkpoint_payload =
+        \\{"kind":"event","schema_version":1,"origin_instance_id":"agent-a"}
+    ;
+    const wrong_schema_event_json =
+        \\{"schema_version":2,"origin_instance_id":"agent-a","origin_sequence":7,"timestamp_ms":1234,"operation":"merge_object","key":"profile.behavior","session_id":null,"category":"core","value_kind":"json_object","content":"{\"tone\":\"formal\"}"}
+    ;
+    const wrong_schema_checkpoint_payload =
+        \\{"kind":"meta","schema_version":2,"last_sequence":4}
+        \\
+        \\{"kind":"entry","key":"prefs/theme","content":"dark","category":"core","session_id":null}
+    ;
     try std.testing.expect(isCheckpointPayload(std.testing.allocator, checkpoint_payload));
     try std.testing.expect(!isCheckpointPayload(std.testing.allocator, event_json));
+    try std.testing.expect(!isCheckpointPayload(std.testing.allocator, not_checkpoint_payload));
+
+    var wrong_schema_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, wrong_schema_event_json, .{});
+    defer wrong_schema_parsed.deinit();
+    try std.testing.expectError(error.InvalidEvent, parseMemoryEventValue(wrong_schema_parsed.value));
+    try std.testing.expect(!isCheckpointPayload(std.testing.allocator, wrong_schema_checkpoint_payload));
 }

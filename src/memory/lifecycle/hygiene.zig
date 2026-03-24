@@ -104,8 +104,7 @@ fn shouldRunNow(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
     const entry = m.get(allocator, LAST_HYGIENE_KEY) catch return true;
     if (entry) |e| {
         defer e.deinit(allocator);
-        // Parse raw timestamps (sqlite-like) and markdown-encoded entries
-        // (markdown backend stores as "**key**: value").
+        // Hygiene marker content is stored as a raw unix timestamp string.
         const last_ts = parseLastHygieneTimestamp(e.content) orelse return true;
         const now = std.time.timestamp();
         return (now - last_ts) >= HYGIENE_INTERVAL_SECS;
@@ -116,12 +115,7 @@ fn shouldRunNow(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
 
 fn parseLastHygieneTimestamp(content: []const u8) ?i64 {
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    return std.fmt.parseInt(i64, trimmed, 10) catch {
-        const marker = "**" ++ LAST_HYGIENE_KEY ++ "**:";
-        if (!std.mem.startsWith(u8, trimmed, marker)) return null;
-        const value = std.mem.trim(u8, trimmed[marker.len..], " \t");
-        return std.fmt.parseInt(i64, value, 10) catch null;
-    };
+    return std.fmt.parseInt(i64, trimmed, 10) catch null;
 }
 
 /// Archive old daily memory .md files from memory/ to memory/archive/.
@@ -384,11 +378,6 @@ test "runIfDue no memory first run" {
 test "shouldRunNow returns true with no memory" {
     const config = HygieneConfig{};
     try std.testing.expect(shouldRunNow(std.testing.allocator, config, null));
-}
-
-test "parseLastHygieneTimestamp supports markdown format" {
-    const ts = parseLastHygieneTimestamp("**last_hygiene_at**: 1772051598") orelse return error.TestFailed;
-    try std.testing.expectEqual(@as(i64, 1772051598), ts);
 }
 
 test "runIfDue with markdown backend does not append hygiene marker twice inside interval" {

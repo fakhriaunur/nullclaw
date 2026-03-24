@@ -37,10 +37,6 @@ pub const MarkdownMemory = struct {
         return std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{self.workspace_dir});
     }
 
-    fn rootPath(self: *const Self, allocator: std.mem.Allocator, filename: []const u8) ![]u8 {
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.workspace_dir, filename });
-    }
-
     fn memoryDir(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}/memory", .{self.workspace_dir});
     }
@@ -158,6 +154,13 @@ pub const MarkdownMemory = struct {
         const core = try self.corePath(allocator);
         defer allocator.free(core);
         std.fs.deleteFileAbsolute(core) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+
+        const legacy_core = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{self.workspace_dir});
+        defer allocator.free(legacy_core);
+        std.fs.deleteFileAbsolute(legacy_core) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
@@ -318,41 +321,14 @@ pub const MarkdownMemory = struct {
             all.deinit(allocator);
         }
 
-        var seen_root_paths: std.StringHashMapUnmanaged(void) = .empty;
-        defer {
-            var key_it = seen_root_paths.keyIterator();
-            while (key_it.next()) |key| allocator.free(key.*);
-            seen_root_paths.deinit(allocator);
-        }
-
-        const root_candidates = [_]struct {
-            filename: []const u8,
-            label: []const u8,
-        }{
-            .{ .filename = "MEMORY.md", .label = "MEMORY" },
-            .{ .filename = "memory.md", .label = "memory" },
-        };
-
-        for (root_candidates) |candidate| {
-            const root_path = try self.rootPath(allocator, candidate.filename);
-            defer allocator.free(root_path);
-
-            const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, root_path, 1024 * 1024) catch continue;
+        const root_path = try self.corePath(allocator);
+        defer allocator.free(root_path);
+        if (fs_compat.readFileAlloc(std.fs.cwd(), allocator, root_path, 1024 * 1024)) |content| {
             defer allocator.free(content);
-
-            const canonical = std.fs.realpathAlloc(allocator, root_path) catch
-                try allocator.dupe(u8, root_path);
-            errdefer allocator.free(canonical);
-            if (seen_root_paths.contains(canonical)) {
-                allocator.free(canonical);
-                continue;
-            }
-            try seen_root_paths.put(allocator, canonical, {});
-
-            const entries = try parseEntries(content, candidate.label, .core, allocator);
+            const entries = try parseEntries(content, "MEMORY", .core, allocator);
             defer allocator.free(entries);
             for (entries) |e| try all.append(allocator, e);
-        }
+        } else |_| {}
 
         const md = try self.memoryDir(allocator);
         defer allocator.free(md);
@@ -521,15 +497,9 @@ pub const MarkdownMemory = struct {
         var found: ?MemoryEntry = null;
         for (all) |*entry_ptr| {
             const entry = entry_ptr.*;
-            if (std.mem.eql(u8, entry.key, key)) {
-                if (entry.session_id == null) {
-                    if (found) |*prev| prev.deinit(allocator);
-                    found = entry;
-                } else if (found == null) {
-                    found = entry;
-                } else {
-                    @constCast(entry_ptr).deinit(allocator);
-                }
+            if (std.mem.eql(u8, entry.key, key) and entry.session_id == null) {
+                if (found) |*prev| prev.deinit(allocator);
+                found = entry;
             } else {
                 @constCast(entry_ptr).deinit(allocator);
             }
@@ -862,78 +832,6 @@ test "markdown getScoped returns entry inside isolated workspace" {
     try std.testing.expectEqualStrings("session-123", entry.session_id.?);
 }
 
-test "markdown reads memory.md when MEMORY.md is absent" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
-        .sub_path = "memory.md",
-        .data = "- legacy-memory-entry",
-    });
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(base);
-
-    var mem = try MarkdownMemory.init(std.testing.allocator, base);
-    defer mem.deinit();
-    const m = mem.memory();
-
-    const recalled = try m.recall(std.testing.allocator, "legacy", 10, null);
-    defer {
-        for (recalled) |*e| e.deinit(std.testing.allocator);
-        std.testing.allocator.free(recalled);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), recalled.len);
-    try std.testing.expect(std.mem.indexOf(u8, recalled[0].content, "legacy-memory-entry") != null);
-}
-
-test "markdown reads both MEMORY.md and memory.md when distinct" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(.{
-        .sub_path = "MEMORY.md",
-        .data = "- primary-entry",
-    });
-
-    var has_distinct_case_files = true;
-    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
-        error.PathAlreadyExists => blk: {
-            has_distinct_case_files = false;
-            break :blk null;
-        },
-        else => return err,
-    };
-    if (alt) |f| {
-        defer f.close();
-        try f.writeAll("- alt-entry");
-    }
-
-    if (!has_distinct_case_files) return;
-
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(base);
-
-    var mem = try MarkdownMemory.init(std.testing.allocator, base);
-    defer mem.deinit();
-    const m = mem.memory();
-
-    const listed = try m.list(std.testing.allocator, .core, null);
-    defer {
-        for (listed) |*e| e.deinit(std.testing.allocator);
-        std.testing.allocator.free(listed);
-    }
-
-    var found_primary = false;
-    var found_alt = false;
-    for (listed) |entry| {
-        if (std.mem.indexOf(u8, entry.content, "primary-entry") != null) found_primary = true;
-        if (std.mem.indexOf(u8, entry.content, "alt-entry") != null) found_alt = true;
-    }
-
-    try std.testing.expect(found_primary);
-    try std.testing.expect(found_alt);
-}
-
 test "markdown get returns latest matching entry for duplicate key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -950,4 +848,18 @@ test "markdown get returns latest matching entry for duplicate key" {
     const entry = (try m.get(std.testing.allocator, "dup_key")).?;
     defer entry.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, entry.content, "new") != null);
+}
+
+test "markdown get ignores session-scoped entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("scoped_only", "session data", .core, "sess-a");
+    try std.testing.expect((try m.get(std.testing.allocator, "scoped_only")) == null);
 }

@@ -78,6 +78,10 @@ fn getNowTimestamp(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{ts});
 }
 
+fn normalizeInstanceId(instance_id: []const u8) []const u8 {
+    return if (instance_id.len > 0) instance_id else "default";
+}
+
 fn generateId(allocator: std.mem.Allocator) ![]u8 {
     const ts = std.time.nanoTimestamp();
     var buf: [16]u8 = undefined;
@@ -97,7 +101,7 @@ const PostgresMemoryImpl = struct {
     owns_self: bool = false,
     schema_q: []const u8, // validated+quoted schema name
     table_q: []const u8, // validated+quoted table name
-    instance_id: []const u8 = "",
+    instance_id: []const u8 = "default",
 
     // Pre-built query templates
     q_store: []const u8,
@@ -148,7 +152,7 @@ const PostgresMemoryImpl = struct {
             .allocator = allocator,
             .schema_q = schema_q,
             .table_q = table_q,
-            .instance_id = instance_id,
+            .instance_id = normalizeInstanceId(instance_id),
             .q_store = undefined,
             .q_get = undefined,
             .q_get_scoped = undefined,
@@ -175,8 +179,8 @@ const PostgresMemoryImpl = struct {
             .q_list_sid = undefined,
         };
 
-        // Build query templates
-        // instance_id filtering is always included; empty string matches the default column value.
+        // Build query templates.
+        // instance_id is normalized eagerly, so every plane uses the same namespace.
         self_.q_store = try buildQuery(allocator,
             "WITH deleted AS (" ++
                 "DELETE FROM {schema}.{table} WHERE key = $2 AND instance_id = $6 AND ((session_id IS NULL AND $5 IS NULL) OR session_id = $5)" ++
@@ -335,7 +339,7 @@ const PostgresMemoryImpl = struct {
             \\    content TEXT NOT NULL,
             \\    category TEXT NOT NULL DEFAULT 'core',
             \\    session_id TEXT,
-            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    instance_id TEXT NOT NULL DEFAULT 'default',
             \\    value_kind TEXT,
             \\    event_timestamp_ms BIGINT NOT NULL DEFAULT 0,
             \\    event_origin_instance_id TEXT NOT NULL DEFAULT 'default',
@@ -343,7 +347,7 @@ const PostgresMemoryImpl = struct {
             \\    created_at TEXT NOT NULL,
             \\    updated_at TEXT NOT NULL
             \\);
-            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
+            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT 'default';
             \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS value_kind TEXT;
             \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_timestamp_ms BIGINT NOT NULL DEFAULT 0;
             \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_origin_instance_id TEXT NOT NULL DEFAULT 'default';
@@ -356,7 +360,7 @@ const PostgresMemoryImpl = struct {
             \\CREATE INDEX IF NOT EXISTS idx_{s}_instance ON {s}.{s}(instance_id);
             \\CREATE INDEX IF NOT EXISTS idx_{s}_event_order ON {s}.{s}(instance_id, event_timestamp_ms, event_origin_instance_id, event_origin_sequence);
             \\CREATE TABLE IF NOT EXISTS {s}.memory_events (
-            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    instance_id TEXT NOT NULL DEFAULT 'default',
             \\    local_sequence BIGINT NOT NULL,
             \\    schema_version INTEGER NOT NULL DEFAULT 1,
             \\    origin_instance_id TEXT NOT NULL,
@@ -372,13 +376,13 @@ const PostgresMemoryImpl = struct {
             \\);
             \\CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_origin ON {s}.memory_events(instance_id, origin_instance_id, origin_sequence);
             \\CREATE TABLE IF NOT EXISTS {s}.memory_event_frontiers (
-            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    instance_id TEXT NOT NULL DEFAULT 'default',
             \\    origin_instance_id TEXT NOT NULL,
             \\    last_origin_sequence BIGINT NOT NULL,
             \\    PRIMARY KEY(instance_id, origin_instance_id)
             \\);
             \\CREATE TABLE IF NOT EXISTS {s}.memory_tombstones (
-            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    instance_id TEXT NOT NULL DEFAULT 'default',
             \\    key TEXT NOT NULL,
             \\    scope TEXT NOT NULL,
             \\    session_key TEXT NOT NULL,
@@ -390,7 +394,7 @@ const PostgresMemoryImpl = struct {
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_memory_tombstones_key ON {s}.memory_tombstones(instance_id, key);
             \\CREATE TABLE IF NOT EXISTS {s}.memory_feed_meta (
-            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    instance_id TEXT NOT NULL DEFAULT 'default',
             \\    key TEXT NOT NULL,
             \\    value TEXT NOT NULL,
             \\    PRIMARY KEY(instance_id, key)
@@ -398,20 +402,20 @@ const PostgresMemoryImpl = struct {
             \\CREATE TABLE IF NOT EXISTS {s}.messages (
             \\    id SERIAL PRIMARY KEY,
             \\    session_id TEXT NOT NULL,
-            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    instance_id TEXT NOT NULL DEFAULT 'default',
             \\    role TEXT NOT NULL,
             \\    content TEXT NOT NULL,
             \\    created_at TIMESTAMP DEFAULT NOW()
             \\);
-            \\ALTER TABLE {s}.messages ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
+            \\ALTER TABLE {s}.messages ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT 'default';
             \\CREATE INDEX IF NOT EXISTS idx_messages_instance_session ON {s}.messages(instance_id, session_id);
             \\CREATE TABLE IF NOT EXISTS {s}.session_usage (
             \\    session_id TEXT NOT NULL,
-            \\    instance_id TEXT NOT NULL DEFAULT '',
+            \\    instance_id TEXT NOT NULL DEFAULT 'default',
             \\    total_tokens BIGINT NOT NULL DEFAULT 0,
             \\    updated_at TIMESTAMP DEFAULT NOW()
             \\);
-            \\ALTER TABLE {s}.session_usage ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
+            \\ALTER TABLE {s}.session_usage ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT 'default';
             \\DO $$
             \\DECLARE
             \\    old_pk_name text;
@@ -503,7 +507,7 @@ const PostgresMemoryImpl = struct {
         }
     }
 
-    fn querySingleU64(self: *Self, _: std.mem.Allocator, query: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !u64 {
+    fn querySingleU64(self: *Self, query: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !u64 {
         const result = try self.execParams(query, params, lengths);
         defer c.PQclear(result);
         if (c.PQntuples(result) == 0 or c.PQgetisnull(result, 0, 0) != 0) return 0;
@@ -526,7 +530,7 @@ const PostgresMemoryImpl = struct {
             self.table_q,
         );
         defer self.allocator.free(state_count_sql);
-        const state_count = try self.querySingleU64(self.allocator, state_count_sql, &params, &lengths);
+        const state_count = try self.querySingleU64(state_count_sql, &params, &lengths);
         if (state_count == 0) return;
 
         const event_count_sql = try buildQuery(
@@ -536,7 +540,7 @@ const PostgresMemoryImpl = struct {
             self.table_q,
         );
         defer self.allocator.free(event_count_sql);
-        const event_count = try self.querySingleU64(self.allocator, event_count_sql, &params, &lengths);
+        const event_count = try self.querySingleU64(event_count_sql, &params, &lengths);
         if (event_count != 0) return;
 
         try self.begin();
@@ -623,7 +627,7 @@ const PostgresMemoryImpl = struct {
     }
 
     fn localInstanceId(self: *Self) []const u8 {
-        return if (self.instance_id.len > 0) self.instance_id else "default";
+        return normalizeInstanceId(self.instance_id);
     }
 
     fn compareInputToMetadata(input: MemoryEventInput, timestamp_ms: i64, origin_instance_id: []const u8, origin_sequence: u64) i8 {
@@ -2184,10 +2188,11 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionSaveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try self_.allocator.dupeZ(u8, local_instance_id);
         defer self_.allocator.free(iid_z);
         const role_z = try self_.allocator.dupeZ(u8, role);
         defer self_.allocator.free(role_z);
@@ -2197,7 +2202,7 @@ const PostgresMemoryImpl = struct {
         const params = [_]?[*:0]const u8{ sid_z, iid_z, role_z, content_z };
         const lengths = [_]c_int{
             @intCast(session_id.len),
-            @intCast(self_.instance_id.len),
+            @intCast(local_instance_id.len),
             @intCast(role.len),
             @intCast(content.len),
         };
@@ -2208,14 +2213,15 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionLoadMessages(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]root.MessageEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const sid_z = try allocator.dupeZ(u8, session_id);
         defer allocator.free(sid_z);
-        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try allocator.dupeZ(u8, local_instance_id);
         defer allocator.free(iid_z);
 
         const params = [_]?[*:0]const u8{ sid_z, iid_z };
-        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len) };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(local_instance_id.len) };
 
         const result = try self_.execParams(self_.q_load_msgs, &params, &lengths);
         defer c.PQclear(result);
@@ -2246,14 +2252,15 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionClearMessages(ptr: *anyopaque, session_id: []const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try self_.allocator.dupeZ(u8, local_instance_id);
         defer self_.allocator.free(iid_z);
 
         const params = [_]?[*:0]const u8{ sid_z, iid_z };
-        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len) };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(local_instance_id.len) };
 
         const result = try self_.execParams(self_.q_clear_msgs, &params, &lengths);
         c.PQclear(result);
@@ -2264,20 +2271,21 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionClearAutoSaved(ptr: *anyopaque, session_id: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try self_.allocator.dupeZ(u8, local_instance_id);
         defer self_.allocator.free(iid_z);
 
         if (session_id) |sid| {
             const sid_z = try self_.allocator.dupeZ(u8, sid);
             defer self_.allocator.free(sid_z);
             const params = [_]?[*:0]const u8{ sid_z, iid_z };
-            const lengths = [_]c_int{ @intCast(sid.len), @intCast(self_.instance_id.len) };
+            const lengths = [_]c_int{ @intCast(sid.len), @intCast(local_instance_id.len) };
             const result = try self_.execParams(self_.q_clear_auto_sid, &params, &lengths);
             c.PQclear(result);
         } else {
             const params = [_]?[*:0]const u8{iid_z};
-            const lengths = [_]c_int{@intCast(self_.instance_id.len)};
+            const lengths = [_]c_int{@intCast(local_instance_id.len)};
             const result = try self_.execParams(self_.q_clear_auto, &params, &lengths);
             c.PQclear(result);
         }
@@ -2285,16 +2293,17 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionSaveUsage(ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try self_.allocator.dupeZ(u8, local_instance_id);
         defer self_.allocator.free(iid_z);
 
         const total_z = try std.fmt.allocPrintZ(self_.allocator, "{d}", .{total_tokens});
         defer self_.allocator.free(total_z);
         const params = [_]?[*:0]const u8{ sid_z, iid_z, total_z };
-        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len), @intCast(total_z.len) };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(local_instance_id.len), @intCast(total_z.len) };
 
         const result = try self_.execParams(self_.q_save_usage, &params, &lengths);
         c.PQclear(result);
@@ -2302,14 +2311,15 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionLoadUsage(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try self_.allocator.dupeZ(u8, local_instance_id);
         defer self_.allocator.free(iid_z);
 
         const params = [_]?[*:0]const u8{ sid_z, iid_z };
-        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len) };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(local_instance_id.len) };
 
         const result = try self_.execParams(self_.q_load_usage, &params, &lengths);
         defer c.PQclear(result);
@@ -2322,11 +2332,12 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try self_.allocator.dupeZ(u8, local_instance_id);
         defer self_.allocator.free(iid_z);
         const params = [_]?[*:0]const u8{iid_z};
-        const lengths = [_]c_int{@intCast(self_.instance_id.len)};
+        const lengths = [_]c_int{@intCast(local_instance_id.len)};
 
         const result = try self_.execParams(self_.q_count_sessions, &params, &lengths);
         defer c.PQclear(result);
@@ -2339,8 +2350,9 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionListSessions(ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]root.SessionInfo {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
-        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try allocator.dupeZ(u8, local_instance_id);
         defer allocator.free(iid_z);
         var limit_buf: [20]u8 = undefined;
         const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
@@ -2348,7 +2360,7 @@ const PostgresMemoryImpl = struct {
         const offset_str = try std.fmt.bufPrintZ(&offset_buf, "{d}", .{offset});
 
         const params = [_]?[*:0]const u8{ iid_z, limit_str.ptr, offset_str.ptr };
-        const lengths = [_]c_int{ @intCast(self_.instance_id.len), @intCast(std.mem.len(limit_str)), @intCast(std.mem.len(offset_str)) };
+        const lengths = [_]c_int{ @intCast(local_instance_id.len), @intCast(std.mem.len(limit_str)), @intCast(std.mem.len(offset_str)) };
 
         const result = try self_.execParams(self_.q_list_sessions, &params, &lengths);
         defer c.PQclear(result);
@@ -2385,14 +2397,15 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
-        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try self_.allocator.dupeZ(u8, local_instance_id);
         defer self_.allocator.free(iid_z);
 
         const params = [_]?[*:0]const u8{ sid_z, iid_z };
-        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len) };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(local_instance_id.len) };
 
         const result = try self_.execParams(self_.q_count_detailed_msgs, &params, &lengths);
         defer c.PQclear(result);
@@ -2405,10 +2418,11 @@ const PostgresMemoryImpl = struct {
 
     fn implSessionLoadMessagesDetailed(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]root.DetailedMessageEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const local_instance_id = self_.localInstanceId();
 
         const sid_z = try allocator.dupeZ(u8, session_id);
         defer allocator.free(sid_z);
-        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        const iid_z = try allocator.dupeZ(u8, local_instance_id);
         defer allocator.free(iid_z);
         var limit_buf: [20]u8 = undefined;
         const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
@@ -2418,7 +2432,7 @@ const PostgresMemoryImpl = struct {
         const params = [_]?[*:0]const u8{ sid_z, iid_z, limit_str.ptr, offset_str.ptr };
         const lengths = [_]c_int{
             @intCast(session_id.len),
-            @intCast(self_.instance_id.len),
+            @intCast(local_instance_id.len),
             @intCast(std.mem.len(limit_str)),
             @intCast(std.mem.len(offset_str)),
         };
@@ -2601,6 +2615,11 @@ test "buildQuery no placeholders" {
     try std.testing.expectEqualStrings("SELECT 1", result);
 }
 
+test "normalizeInstanceId maps empty id to default" {
+    try std.testing.expectEqualStrings("default", normalizeInstanceId(""));
+    try std.testing.expectEqualStrings("agent-a", normalizeInstanceId("agent-a"));
+}
+
 test "getNowTimestamp returns numeric string" {
     const ts = try getNowTimestamp(std.testing.allocator);
     defer std.testing.allocator.free(ts);
@@ -2775,6 +2794,6 @@ test "integration: postgres migration backfills existing state and promotes defa
 
     const no_params = [_]?[*:0]const u8{};
     const no_lengths = [_]c_int{};
-    try std.testing.expectEqual(@as(u64, 1), try mem.querySingleU64(std.testing.allocator, default_sql, &no_params, &no_lengths));
-    try std.testing.expectEqual(@as(u64, 0), try mem.querySingleU64(std.testing.allocator, legacy_sql, &no_params, &no_lengths));
+    try std.testing.expectEqual(@as(u64, 1), try mem.querySingleU64(default_sql, &no_params, &no_lengths));
+    try std.testing.expectEqual(@as(u64, 0), try mem.querySingleU64(legacy_sql, &no_params, &no_lengths));
 }

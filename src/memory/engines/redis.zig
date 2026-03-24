@@ -147,8 +147,12 @@ pub const RedisConfig = struct {
     db_index: u8 = 0,
     key_prefix: []const u8 = "nullclaw",
     ttl_seconds: ?u32 = null,
-    instance_id: []const u8 = "",
+    instance_id: []const u8 = "default",
 };
+
+fn normalizeInstanceId(instance_id: []const u8) []const u8 {
+    return if (instance_id.len > 0) instance_id else "default";
+}
 
 // ── RedisMemory ─────────────────────────────────────────────────────
 
@@ -161,7 +165,7 @@ pub const RedisMemory = struct {
     db_index: u8,
     key_prefix: []const u8,
     ttl_seconds: ?u32,
-    instance_id: []const u8 = "",
+    instance_id: []const u8 = "default",
     owns_self: bool = false,
 
     const Self = @This();
@@ -175,7 +179,7 @@ pub const RedisMemory = struct {
             .db_index = config.db_index,
             .key_prefix = config.key_prefix,
             .ttl_seconds = config.ttl_seconds,
-            .instance_id = config.instance_id,
+            .instance_id = normalizeInstanceId(config.instance_id),
         };
 
         try self_.connect();
@@ -281,21 +285,15 @@ pub const RedisMemory = struct {
     // ── Key helpers ────────────────────────────────────────────────
 
     fn prefixedKey(self: *Self, comptime suffix: []const u8, key: []const u8) ![]u8 {
-        if (self.instance_id.len > 0) {
-            return std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}:{s}", .{ self.key_prefix, self.instance_id, suffix, key });
-        }
-        return std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}", .{ self.key_prefix, suffix, key });
+        return std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}:{s}", .{ self.key_prefix, self.instance_id, suffix, key });
     }
 
     fn prefixedSimple(self: *Self, comptime suffix: []const u8) ![]u8 {
-        if (self.instance_id.len > 0) {
-            return std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}", .{ self.key_prefix, self.instance_id, suffix });
-        }
-        return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ self.key_prefix, suffix });
+        return std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}", .{ self.key_prefix, self.instance_id, suffix });
     }
 
     fn localInstanceId(self: *Self) []const u8 {
-        return if (self.instance_id.len > 0) self.instance_id else "default";
+        return normalizeInstanceId(self.instance_id);
     }
 
     fn feedEventsKey(self: *Self) ![]u8 {
@@ -1966,6 +1964,32 @@ test "formatCommand roundtrip with parseResp" {
     try std.testing.expectEqual(@as(usize, 2), arr.len);
     try std.testing.expectEqualStrings("GET", arr[0].bulk_string.?);
     try std.testing.expectEqualStrings("mykey", arr[1].bulk_string.?);
+}
+
+test "normalizeInstanceId maps empty id to default" {
+    try std.testing.expectEqualStrings("default", normalizeInstanceId(""));
+    try std.testing.expectEqualStrings("agent-a", normalizeInstanceId("agent-a"));
+}
+
+test "redis prefixes always include normalized instance id" {
+    var mem = RedisMemory{
+        .allocator = std.testing.allocator,
+        .host = "127.0.0.1",
+        .port = 6379,
+        .password = null,
+        .db_index = 0,
+        .key_prefix = "nullclaw",
+        .ttl_seconds = null,
+        .instance_id = normalizeInstanceId(""),
+    };
+
+    const simple = try mem.prefixedSimple("keys");
+    defer std.testing.allocator.free(simple);
+    try std.testing.expectEqualStrings("nullclaw:default:keys", simple);
+
+    const full = try mem.prefixedKey("entry", "prefs/theme|null");
+    defer std.testing.allocator.free(full);
+    try std.testing.expectEqualStrings("nullclaw:default:entry:prefs/theme|null", full);
 }
 
 // Integration tests — guarded by Redis availability

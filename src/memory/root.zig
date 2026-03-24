@@ -472,13 +472,6 @@ pub fn cloneMemoryCategory(allocator: std.mem.Allocator, cat: MemoryCategory) !M
     };
 }
 
-pub fn eventProducesState(operation: MemoryEventOp) bool {
-    return switch (operation) {
-        .put, .merge_object, .merge_string_set => true,
-        .delete_scoped, .delete_all => false,
-    };
-}
-
 pub fn resolveMemoryEventState(
     allocator: std.mem.Allocator,
     existing_content: ?[]const u8,
@@ -1412,11 +1405,10 @@ fn buildOverlayJournalIdentity(
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     const writer = out.writer(allocator);
-    const effective_instance_id = if (cfg.instance_id.len > 0) cfg.instance_id else "default";
 
     try writer.writeAll("overlay_protocol=v2\n");
     try writer.print("backend={s}\n", .{backend_name});
-    try writer.print("instance_id={s}\n", .{effective_instance_id});
+    try writer.print("instance_id={s}\n", .{cfg.instance_id});
 
     if (std.mem.eql(u8, backend_name, "markdown") or std.mem.eql(u8, backend_name, "lucid")) {
         try writer.print("workspace={s}\n", .{workspace_dir});
@@ -1534,7 +1526,7 @@ pub fn initRuntime(
             instance.memory,
             overlay_root,
             overlay_identity,
-            config.instance_id,
+            cfg.instance_id,
         ) catch |err| {
             allocator.destroy(overlay);
             log.warn("memory backend '{s}' event feed init failed: {}", .{ config.backend, err });

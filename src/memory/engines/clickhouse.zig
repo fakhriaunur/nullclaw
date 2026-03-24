@@ -2,7 +2,7 @@
 //!
 //! No C dependency — pure Zig HTTP via std.http.Client.
 //! Writes are append-only with server-generated Snowflake ordering keys, and
-//! reads collapse to the latest row per logical key via argMax. This keeps
+//! reads collapse to the latest row per logical key+session via argMax. This keeps
 //! ordering independent from client clock skew while ReplacingMergeTree(version)
 //! provides eventual on-disk compaction. User data is parameterized via
 //! ClickHouse query parameters ({name:Type} syntax).
@@ -268,10 +268,24 @@ fn isLoopbackHost(host: []const u8) bool {
     return false;
 }
 
-fn validateTransportSecurity(host: []const u8, use_https: bool) !void {
-    if (use_https or isLoopbackHost(host)) return;
-    return error.InsecureTransportNotAllowed;
-}
+    fn validateTransportSecurity(host: []const u8, use_https: bool) !void {
+        if (use_https or isLoopbackHost(host)) return;
+        return error.InsecureTransportNotAllowed;
+    }
+
+    fn memorySortingKeySupportsSessions(sorting_key: []const u8) bool {
+        var normalized: std.ArrayListUnmanaged(u8) = .empty;
+        defer normalized.deinit(std.heap.page_allocator);
+
+        for (sorting_key) |ch| {
+            switch (ch) {
+                ' ', '\t', '\r', '\n', '`', '"', '(', ')' => {},
+                else => normalized.append(std.heap.page_allocator, ch) catch return false,
+            }
+        }
+
+        return std.mem.indexOf(u8, normalized.items, "instance_id,key,session_id") != null;
+    }
 
 // ── ClickHouseMemory ──────────────────────────────────────────────
 
@@ -336,6 +350,7 @@ const ClickHouseMemoryImpl = struct {
 
         try self_.ensureServerCapabilities();
         try self_.migrate();
+        try self_.ensureScopedMemorySchema();
 
         return self_;
     }
@@ -489,6 +504,29 @@ const ClickHouseMemoryImpl = struct {
         self.allocator.free(body);
     }
 
+    fn ensureScopedMemorySchema(self: *Self) !void {
+        const body = try self.executeQuery(self.allocator,
+            \\SELECT sorting_key
+            \\FROM system.tables
+            \\WHERE database = {{db:String}} AND name = {{table:String}}
+            \\LIMIT 1
+        , &.{
+            .{ "db", self.database },
+            .{ "table", self.table },
+        });
+        defer self.allocator.free(body);
+
+        const sorting_key = std.mem.trim(u8, body, " \t\r\n");
+        if (sorting_key.len == 0 or !memorySortingKeySupportsSessions(sorting_key)) {
+            log.err("ClickHouse memory table {s}.{s} must use ORDER BY (instance_id, key, session_id); found sorting_key={s}", .{
+                self.database,
+                self.table,
+                if (sorting_key.len > 0) sorting_key else "(empty)",
+            });
+            return error.ClickHouseInvalidSchema;
+        }
+    }
+
     fn migrate(self: *Self) !void {
         // 1. Main memories table (ReplacingMergeTree)
         const create_memories = try std.fmt.allocPrint(self.allocator,
@@ -503,7 +541,7 @@ const ClickHouseMemoryImpl = struct {
             \\    updated_at DateTime64(3) DEFAULT now64(3),
             \\    version UInt64 DEFAULT generateSnowflakeID()
             \\) ENGINE = ReplacingMergeTree(version)
-            \\ORDER BY (instance_id, key)
+            \\ORDER BY (instance_id, key, session_id)
         , .{ self.db_q, self.table_q });
         defer self.allocator.free(create_memories);
         try self.executeStatement(create_memories, &.{});
@@ -1793,4 +1831,10 @@ test "integration: clickhouse name" {
     defer mem.deinit();
 
     try std.testing.expectEqualStrings("clickhouse", mem.memory().name());
+}
+
+test "clickhouse sorting key must include session_id" {
+    try std.testing.expect(memorySortingKeySupportsSessions("instance_id, key, session_id"));
+    try std.testing.expect(memorySortingKeySupportsSessions("(instance_id, key, session_id)"));
+    try std.testing.expect(!memorySortingKeySupportsSessions("instance_id, key"));
 }

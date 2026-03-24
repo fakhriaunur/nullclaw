@@ -6,7 +6,7 @@
 //! - FTS5 sync triggers (insert/update/delete)
 //! - Upsert semantics (ON CONFLICT DO UPDATE)
 //! - Session-scoped memory isolation via session_id
-//! - Session message storage (legacy compat)
+//! - Session message storage
 //! - KV store for settings
 
 const std = @import("std");
@@ -578,7 +578,7 @@ pub const SqliteMemory = struct {
         try self.execSql(
             "event stream migration",
             \\CREATE TABLE IF NOT EXISTS memory_events (
-            \\  local_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  local_sequence INTEGER PRIMARY KEY,
             \\  schema_version INTEGER NOT NULL DEFAULT 1,
             \\  origin_instance_id TEXT NOT NULL,
             \\  origin_sequence INTEGER NOT NULL,
@@ -592,7 +592,6 @@ pub const SqliteMemory = struct {
             \\  UNIQUE(origin_instance_id, origin_sequence)
             \\);
         );
-        try self.execSqlAllowDuplicateColumn("event stream migration", "ALTER TABLE memory_events ADD COLUMN value_kind TEXT;");
         try self.execSql("event stream migration", "CREATE INDEX IF NOT EXISTS idx_memory_events_local_sequence ON memory_events(local_sequence);");
         try self.execSql("event stream migration", "CREATE INDEX IF NOT EXISTS idx_memory_events_origin ON memory_events(origin_instance_id, origin_sequence);");
         try self.execSql(
@@ -627,7 +626,7 @@ pub const SqliteMemory = struct {
     }
 
     fn localInstanceId(self: *Self) []const u8 {
-        return if (self.instance_id.len > 0) self.instance_id else "default";
+        return self.instance_id;
     }
 
     fn getCompactedThroughSequence(self: *Self) !u64 {
@@ -656,19 +655,6 @@ pub const SqliteMemory = struct {
         var value_buf: [32]u8 = undefined;
         const value = try std.fmt.bufPrint(&value_buf, "{d}", .{sequence});
         _ = c.sqlite3_bind_text(stmt, 1, value.ptr, @intCast(value.len), SQLITE_STATIC);
-        rc = c.sqlite3_step(stmt);
-        if (rc != c.SQLITE_DONE) return error.StepFailed;
-    }
-
-    fn setLocalSequenceFloorTx(self: *Self, sequence: u64) !void {
-        const sql =
-            "INSERT INTO sqlite_sequence (name, seq) VALUES ('memory_events', ?1) " ++
-            "ON CONFLICT(name) DO UPDATE SET seq = MAX(seq, excluded.seq)";
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
-        if (rc != c.SQLITE_OK) return error.PrepareFailed;
-        defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, @intCast(sequence));
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
     }
@@ -2451,7 +2437,8 @@ pub const SqliteMemory = struct {
 
     fn readEventFromRow(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !MemoryEvent {
         const schema_version_raw = c.sqlite3_column_int64(stmt, 1);
-        const schema_version: u32 = @intCast(@max(schema_version_raw, 0));
+        if (schema_version_raw <= 0) return error.InvalidEvent;
+        const schema_version: u32 = @intCast(schema_version_raw);
         const operation_str = try dupeColumnText(stmt, 5, allocator);
         defer allocator.free(operation_str);
         const operation = MemoryEventOp.fromString(operation_str) orelse return error.InvalidEvent;

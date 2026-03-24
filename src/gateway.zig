@@ -2995,11 +2995,13 @@ fn memoryJsonIntegerField(val: std.json.Value, key: []const u8) ?i64 {
 }
 
 fn parseMemoryEventValue(val: std.json.Value) !memory_mod.MemoryEventInput {
+    const schema_version_raw = memoryJsonIntegerField(val, "schema_version") orelse return error.InvalidEvent;
     const origin_instance_id = memoryJsonStringField(val, "origin_instance_id") orelse return error.InvalidEvent;
     const origin_sequence_raw = memoryJsonIntegerField(val, "origin_sequence") orelse return error.InvalidEvent;
     const timestamp_ms = memoryJsonIntegerField(val, "timestamp_ms") orelse return error.InvalidEvent;
     const operation_str = memoryJsonStringField(val, "operation") orelse return error.InvalidEvent;
     const key = memoryJsonStringField(val, "key") orelse return error.InvalidEvent;
+    if (schema_version_raw != 1) return error.InvalidEvent;
     if (origin_sequence_raw < 0) return error.InvalidEvent;
     return .{
         .origin_instance_id = origin_instance_id,
@@ -3031,7 +3033,10 @@ fn isGatewayCheckpointPayload(allocator: std.mem.Allocator, payload: []const u8)
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, first_line, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
-    return parsed.value.object.get("kind") != null;
+    const kind = memoryJsonStringField(parsed.value, "kind") orelse return false;
+    if (!std.mem.eql(u8, kind, "meta")) return false;
+    const schema_version = memoryJsonIntegerField(parsed.value, "schema_version") orelse return false;
+    return schema_version == 1;
 }
 
 fn writeMemoryEventJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, event: memory_mod.MemoryEvent) !void {
@@ -6380,7 +6385,7 @@ test "memory gateway apply route accepts event payloads" {
 
     const raw = try std.fmt.allocPrint(
         req_allocator,
-        "POST /memory/apply HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"origin_instance_id\":\"{s}\",\"origin_sequence\":{d},\"timestamp_ms\":{d},\"operation\":\"{s}\",\"key\":\"{s}\",\"session_id\":\"{s}\",\"category\":\"{s}\",\"value_kind\":null,\"content\":\"{s}\"}}",
+        "POST /memory/apply HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"schema_version\":1,\"origin_instance_id\":\"{s}\",\"origin_sequence\":{d},\"timestamp_ms\":{d},\"operation\":\"{s}\",\"key\":\"{s}\",\"session_id\":\"{s}\",\"category\":\"{s}\",\"value_kind\":null,\"content\":\"{s}\"}}",
         .{
             events[0].origin_instance_id,
             events[0].origin_sequence,
@@ -6442,6 +6447,28 @@ test "memory gateway apply route accepts checkpoint payloads" {
         return error.TestUnexpectedResult;
     defer scoped_entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("zed", scoped_entry.content);
+}
+
+test "memory gateway apply route rejects unsupported schema versions" {
+    var target = try GatewayMemoryRouteTestFixture.init();
+    defer target.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.memory_rt = &target.rt;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    const raw =
+        "POST /memory/apply HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n" ++
+        "{\"schema_version\":2,\"origin_instance_id\":\"agent-a\",\"origin_sequence\":1,\"timestamp_ms\":1234,\"operation\":\"put\",\"key\":\"prefs/theme\",\"session_id\":null,\"category\":\"core\",\"value_kind\":null,\"content\":\"dark\"}";
+
+    var ctx = initMemoryRouteContext(req_allocator, &state, raw, "POST", "/memory/apply");
+    handleMemoryApplyRoute(&ctx);
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "\"error\":\"invalid event\"") != null);
 }
 
 test "memory gateway compact and checkpoint routes expose lifecycle controls" {

@@ -703,22 +703,58 @@ pub const ApiMemory = struct {
         };
     }
 
+    fn parseRequiredJsonU64Field(val: std.json.Value, key: []const u8) !u64 {
+        const value = jsonIntegerField(val, key) orelse return error.ApiInvalidResponse;
+        if (value < 0) return error.ApiInvalidResponse;
+        return @intCast(value);
+    }
+
+    fn parseOptionalJsonU64Field(val: std.json.Value, key: []const u8, default_value: u64) !u64 {
+        if (val != .object) return error.ApiInvalidResponse;
+        const field = val.object.get(key) orelse return default_value;
+        return switch (field) {
+            .integer => |n| if (n >= 0) @intCast(n) else error.ApiInvalidResponse,
+            else => error.ApiInvalidResponse,
+        };
+    }
+
+    fn parseOptionalJsonBoolField(val: std.json.Value, key: []const u8, default_value: bool) !bool {
+        if (val != .object) return error.ApiInvalidResponse;
+        const field = val.object.get(key) orelse return default_value;
+        return switch (field) {
+            .bool => field.bool,
+            else => error.ApiInvalidResponse,
+        };
+    }
+
+    fn parseOptionalStorageKindField(val: std.json.Value, key: []const u8, default_value: root.MemoryEventFeedStorage) !root.MemoryEventFeedStorage {
+        if (val != .object) return error.ApiInvalidResponse;
+        const field = val.object.get(key) orelse return default_value;
+        return switch (field) {
+            .string => |text| {
+                if (std.mem.eql(u8, text, "native")) return .native;
+                if (std.mem.eql(u8, text, "overlay")) return .overlay;
+                return error.ApiInvalidResponse;
+            },
+            else => error.ApiInvalidResponse,
+        };
+    }
+
     fn parseMemoryEventFromValue(alloc: Allocator, val: std.json.Value) !MemoryEvent {
         const origin_instance_id = jsonStringField(val, "origin_instance_id") orelse return error.ApiInvalidResponse;
-        const origin_sequence_raw = jsonIntegerField(val, "origin_sequence") orelse return error.ApiInvalidResponse;
+        const origin_sequence = try parseRequiredJsonU64Field(val, "origin_sequence");
         const timestamp_ms = jsonIntegerField(val, "timestamp_ms") orelse return error.ApiInvalidResponse;
         const operation_str = jsonStringField(val, "operation") orelse return error.ApiInvalidResponse;
         const key = jsonStringField(val, "key") orelse return error.ApiInvalidResponse;
-        const sequence_raw = jsonIntegerField(val, "sequence") orelse return error.ApiInvalidResponse;
+        const sequence = try parseRequiredJsonU64Field(val, "sequence");
         const category_str = jsonNullableStringField(val, "category");
         const value_kind_str = jsonNullableStringField(val, "value_kind");
         const content = jsonNullableStringField(val, "content");
         const session_id = jsonNullableStringField(val, "session_id");
-
-        const origin_sequence: u64 = @intCast(origin_sequence_raw);
-        const sequence: u64 = @intCast(sequence_raw);
+        const schema_version_u64 = try parseOptionalJsonU64Field(val, "schema_version", 1);
+        if (schema_version_u64 > std.math.maxInt(u32)) return error.ApiInvalidResponse;
         return .{
-            .schema_version = @intCast(jsonIntegerField(val, "schema_version") orelse 1),
+            .schema_version = @intCast(schema_version_u64),
             .sequence = sequence,
             .origin_instance_id = try alloc.dupe(u8, origin_instance_id),
             .origin_sequence = origin_sequence,
@@ -766,30 +802,25 @@ pub const ApiMemory = struct {
         if (parsed.value != .object) return error.ApiInvalidResponse;
 
         const instance_id = jsonStringField(parsed.value, "instance_id") orelse return error.ApiInvalidResponse;
-        const last_sequence = jsonIntegerField(parsed.value, "last_sequence") orelse return error.ApiInvalidResponse;
-        const next_local_origin_sequence = jsonIntegerField(parsed.value, "next_local_origin_sequence") orelse 1;
-        const supports_compaction = if (parsed.value.object.get("supports_compaction")) |value|
-            switch (value) {
-                .bool => value.bool,
-                else => false,
-            }
-        else
-            false;
-        const storage_kind = if (jsonStringField(parsed.value, "storage_kind")) |value|
-            if (std.mem.eql(u8, value, "overlay")) root.MemoryEventFeedStorage.overlay else root.MemoryEventFeedStorage.native
-        else
-            root.MemoryEventFeedStorage.native;
+        const last_sequence = try parseRequiredJsonU64Field(parsed.value, "last_sequence");
+        const next_local_origin_sequence = try parseOptionalJsonU64Field(parsed.value, "next_local_origin_sequence", 1);
+        if (next_local_origin_sequence == 0) return error.ApiInvalidResponse;
+        const supports_compaction = try parseOptionalJsonBoolField(parsed.value, "supports_compaction", false);
+        const storage_kind = try parseOptionalStorageKindField(parsed.value, "storage_kind", .native);
+        const compacted_through_sequence = try parseOptionalJsonU64Field(parsed.value, "compacted_through_sequence", 0);
+        const oldest_available_sequence = try parseOptionalJsonU64Field(parsed.value, "oldest_available_sequence", 1);
+        if (oldest_available_sequence == 0) return error.ApiInvalidResponse;
 
         return .{
             .instance_id = try alloc.dupe(u8, instance_id),
-            .last_sequence = @intCast(last_sequence),
-            .next_local_origin_sequence = @intCast(next_local_origin_sequence),
+            .last_sequence = last_sequence,
+            .next_local_origin_sequence = next_local_origin_sequence,
             .supports_compaction = supports_compaction,
             .storage_kind = storage_kind,
             .journal_path = if (jsonNullableStringField(parsed.value, "journal_path")) |value| try alloc.dupe(u8, value) else null,
             .checkpoint_path = if (jsonNullableStringField(parsed.value, "checkpoint_path")) |value| try alloc.dupe(u8, value) else null,
-            .compacted_through_sequence = @intCast(jsonIntegerField(parsed.value, "compacted_through_sequence") orelse 0),
-            .oldest_available_sequence = @intCast(jsonIntegerField(parsed.value, "oldest_available_sequence") orelse 1),
+            .compacted_through_sequence = compacted_through_sequence,
+            .oldest_available_sequence = oldest_available_sequence,
         };
     }
 
@@ -1148,9 +1179,7 @@ pub const ApiMemory = struct {
         const alloc = self.allocator;
         const url = try self.buildFeedApplyUrl(alloc);
         defer alloc.free(url);
-        const body = try alloc.dupe(u8, payload);
-        defer alloc.free(body);
-        const resp = try self.doRequest(alloc, url, .POST, body);
+        const resp = try self.doRequest(alloc, url, .POST, payload);
         defer alloc.free(resp.body);
         if (resp.status != .ok) return error.ApiRequestFailed;
     }
@@ -2122,6 +2151,22 @@ test "api parse memory events response" {
     try std.testing.expectEqual(root.MemoryValueKind.string_set, events[0].value_kind.?);
 }
 
+test "api parse memory events rejects invalid feed counters" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.ApiInvalidResponse,
+        ApiMemory.parseMemoryEvents(alloc,
+            \\{"events":[{"sequence":-1,"schema_version":1,"origin_instance_id":"agent-a","origin_sequence":7,"timestamp_ms":1234,"operation":"put","key":"preferences.theme","session_id":null,"category":"core","value_kind":null,"content":"dark"}]}
+        ),
+    );
+    try std.testing.expectError(
+        error.ApiInvalidResponse,
+        ApiMemory.parseMemoryEvents(alloc,
+            \\{"events":[{"sequence":1,"schema_version":-1,"origin_instance_id":"agent-a","origin_sequence":7,"timestamp_ms":1234,"operation":"put","key":"preferences.theme","session_id":null,"category":"core","value_kind":null,"content":"dark"}]}
+        ),
+    );
+}
+
 test "api parse feed info with overlay lifecycle fields" {
     const alloc = std.testing.allocator;
     const json =
@@ -2140,6 +2185,22 @@ test "api parse feed info with overlay lifecycle fields" {
     try std.testing.expectEqualStrings("/tmp/checkpoint", info.checkpoint_path.?);
     try std.testing.expectEqual(@as(u64, 41), info.compacted_through_sequence);
     try std.testing.expectEqual(@as(u64, 42), info.oldest_available_sequence);
+}
+
+test "api parse feed info rejects invalid lifecycle fields" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.ApiInvalidResponse,
+        ApiMemory.parseFeedInfo(alloc,
+            \\{"instance_id":"default","last_sequence":42,"next_local_origin_sequence":0}
+        ),
+    );
+    try std.testing.expectError(
+        error.ApiInvalidResponse,
+        ApiMemory.parseFeedInfo(alloc,
+            \\{"instance_id":"default","last_sequence":42,"storage_kind":"mystery"}
+        ),
+    );
 }
 
 test "api parse compact response" {

@@ -8,7 +8,6 @@ const build_options = @import("build_options");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
-const MemoryEntry = root.MemoryEntry;
 
 const SqliteMemory = if (build_options.enable_sqlite) @import("sqlite.zig").SqliteMemory else @import("sqlite_disabled.zig").SqliteMemory;
 const NoneMemory = @import("none.zig").NoneMemory;
@@ -40,16 +39,16 @@ fn contractBasics(m: Memory) !void {
 
     // Empty store: recall returns empty
     const recalled = try m.recall(allocator, "query", 10, null);
-    defer allocator.free(recalled);
+    defer root.freeEntries(allocator, recalled);
     try std.testing.expectEqual(@as(usize, 0), recalled.len);
 
     // Empty store: list returns empty
     const listed = try m.list(allocator, null, null);
-    defer allocator.free(listed);
+    defer root.freeEntries(allocator, listed);
     try std.testing.expectEqual(@as(usize, 0), listed.len);
 }
 
-/// Full CRUD contract for backends that truly persist (sqlite, lucid, postgres).
+/// Exact CRUD contract for backends that store concrete memory state.
 /// After store(), the entry is retrievable via get(), recall(), list(), count().
 /// After forget(), the entry is gone.
 fn contractCrud(m: Memory) !void {
@@ -125,12 +124,12 @@ fn contractNone(m: Memory) !void {
 
     // recall returns empty
     const recalled = try m.recall(allocator, "test", 10, null);
-    defer allocator.free(recalled);
+    defer root.freeEntries(allocator, recalled);
     try std.testing.expectEqual(@as(usize, 0), recalled.len);
 
     // list returns empty
     const listed = try m.list(allocator, .core, null);
-    defer allocator.free(listed);
+    defer root.freeEntries(allocator, listed);
     try std.testing.expectEqual(@as(usize, 0), listed.len);
 
     // count is always 0
@@ -190,22 +189,6 @@ fn contractMarkdown(m: Memory) !void {
     // forget removes all scopes for the logical key
     try std.testing.expect(try m.forget("test_key"));
     try std.testing.expectEqual(@as(usize, 1), try m.count());
-}
-
-/// Contract: session_id parameter is accepted by all backends.
-fn contractSessionId(m: Memory) !void {
-    const allocator = std.testing.allocator;
-
-    // store with session_id does not crash
-    try m.store("sess_key", "session data", .core, "session-42");
-
-    // recall with session_id
-    const recalled = try m.recall(allocator, "session", 10, "session-42");
-    defer root.freeEntries(allocator, recalled);
-
-    // list with session_id
-    const listed = try m.list(allocator, null, "session-42");
-    defer root.freeEntries(allocator, listed);
 }
 
 fn expectScopedEntry(m: Memory, key: []const u8, session_id: ?[]const u8, expected_content: []const u8) !void {
@@ -286,13 +269,6 @@ test "contract: sqlite crud" {
     try contractCrud(mem.memory());
 }
 
-test "contract: sqlite session_id" {
-    if (!build_options.enable_sqlite) return;
-    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
-    defer mem.deinit();
-    try contractSessionId(mem.memory());
-}
-
 test "contract: sqlite scoped namespaces" {
     if (!build_options.enable_sqlite) return;
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
@@ -312,12 +288,6 @@ test "contract: none noop" {
     var mem = NoneMemory.init();
     defer mem.deinit();
     try contractNone(mem.memory());
-}
-
-test "contract: none session_id" {
-    var mem = NoneMemory.init();
-    defer mem.deinit();
-    try contractSessionId(mem.memory());
 }
 
 // ── MarkdownMemory tests ─────────────────────────────────────────────
@@ -344,17 +314,6 @@ test "contract: markdown crud" {
     try contractMarkdown(mem.memory());
 }
 
-test "contract: markdown session_id" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(base);
-
-    var mem = try MarkdownMemory.init(std.testing.allocator, base);
-    defer mem.deinit();
-    try contractSessionId(mem.memory());
-}
-
 test "contract: markdown scoped namespaces" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -378,12 +337,6 @@ test "contract: memory_lru crud" {
     var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
     defer mem.deinit();
     try contractCrud(mem.memory());
-}
-
-test "contract: memory_lru session_id" {
-    var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
-    defer mem.deinit();
-    try contractSessionId(mem.memory());
 }
 
 test "contract: memory_lru scoped namespaces" {

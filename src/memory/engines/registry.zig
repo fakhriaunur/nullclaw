@@ -44,7 +44,7 @@ pub const BackendConfig = struct {
     redis_config: ?config_types.MemoryRedisConfig = null,
     api_config: ?config_types.MemoryApiConfig = null,
     clickhouse_config: ?config_types.MemoryClickHouseConfig = null,
-    instance_id: []const u8 = "",
+    instance_id: []const u8 = "default",
 };
 
 pub const BackendInstance = struct {
@@ -86,7 +86,7 @@ const lucid_backend = BackendDescriptor{
 
 const memory_backend = BackendDescriptor{
     .name = "memory",
-    .label = "In-memory LRU — no persistence, ideal for testing",
+    .label = "In-memory LRU — lightweight local store",
     .auto_save_default = false,
     .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
     .needs_db_path = false,
@@ -126,7 +126,7 @@ const api_backend = BackendDescriptor{
 
 const none_backend = BackendDescriptor{
     .name = "none",
-    .label = "None — disable persistent memory",
+    .label = "None — disable memory backend",
     .auto_save_default = false,
     .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
     .needs_db_path = false,
@@ -277,6 +277,7 @@ pub fn resolvePaths(
     api_cfg: ?config_types.MemoryApiConfig,
     clickhouse_cfg: ?config_types.MemoryClickHouseConfig,
 ) !BackendConfig {
+    const effective_instance_id = normalizeInstanceId(instance_id);
     const db_path: ?[*:0]const u8 = if (desc.needs_db_path)
         try std.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" })
     else
@@ -306,8 +307,12 @@ pub fn resolvePaths(
         .redis_config = redis_cfg,
         .api_config = api_cfg,
         .clickhouse_config = clickhouse_cfg,
-        .instance_id = instance_id,
+        .instance_id = effective_instance_id,
     };
+}
+
+fn normalizeInstanceId(instance_id: []const u8) []const u8 {
+    return if (instance_id.len > 0) instance_id else "default";
 }
 
 // ── Factory wrappers ─────────────────────────────────────────────
@@ -648,6 +653,7 @@ test "resolvePaths sqlite has db_path" {
     const path_slice = std.mem.span(cfg.db_path.?);
     try std.testing.expect(std.mem.endsWith(u8, path_slice, "memory.db"));
     try std.testing.expectEqualStrings("/tmp/ws", cfg.workspace_dir);
+    try std.testing.expectEqualStrings("default", cfg.instance_id);
 }
 
 test "resolvePaths markdown has no db_path" {
@@ -726,6 +732,18 @@ test "resolvePaths redis config is preserved" {
     try std.testing.expectEqual(@as(u8, 2), cfg.redis_config.?.db_index);
     try std.testing.expectEqualStrings("agent", cfg.redis_config.?.key_prefix);
     try std.testing.expectEqual(@as(u32, 120), cfg.redis_config.?.ttl_seconds);
+    try std.testing.expectEqualStrings("default", cfg.instance_id);
+}
+
+test "resolvePaths preserves explicit instance_id" {
+    if (!build_options.enable_memory_none) {
+        try std.testing.expect(findBackend("none") == null);
+        return;
+    }
+    const desc = findBackend("none") orelse return error.TestUnexpectedResult;
+    const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", "agent-b", null, null, null, null);
+
+    try std.testing.expectEqualStrings("agent-b", cfg.instance_id);
 }
 
 test "applyPostgresConnectTimeout uri appends query parameter" {

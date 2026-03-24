@@ -3,7 +3,6 @@
 //! Combines SQLite for storage
 //! with cosine similarity search for vector-augmented recall. Features:
 //!
-//! - Duplicate detection: skip entries with >95% cosine similarity
 //! - Importance scoring (0.0-1.0) per entry
 //! - Full-scan cosine similarity on recall (no ANN index)
 //! - Min search score filtering
@@ -29,7 +28,6 @@ const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 // ── Config ────────────────────────────────────────────────────────
 
 pub const LanceDbConfig = struct {
-    duplicate_threshold: f32 = 0.95,
     min_search_score: f32 = 0.3,
     default_importance: f32 = 0.5,
 };
@@ -101,7 +99,7 @@ pub const LanceDbMemory = struct {
             \\  text       TEXT NOT NULL,
             \\  embedding  BLOB,
             \\  importance REAL DEFAULT 0.5,
-            \\  category   TEXT DEFAULT 'other',
+            \\  category   TEXT DEFAULT 'conversation',
             \\  created_at TEXT NOT NULL,
             \\  updated_at TEXT NOT NULL,
             \\  session_id TEXT
@@ -146,56 +144,18 @@ pub const LanceDbMemory = struct {
         });
     }
 
-    // ── Duplicate detection ──────────────────────────────────────
-
-    fn isDuplicate(self: *Self, new_embedding: []const f32, exclude_key: []const u8) bool {
-        const db = self.db orelse return false;
-
-        const sql = "SELECT embedding, key FROM lancedb_memories WHERE embedding IS NOT NULL";
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return false;
-        defer _ = c.sqlite3_finalize(stmt);
-
-        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-            // Skip the entry being updated so upserts are not blocked by self-similarity
-            const row_key_ptr = c.sqlite3_column_text(stmt, 1);
-            if (row_key_ptr != null) {
-                const row_key = std.mem.span(row_key_ptr);
-                if (std.mem.eql(u8, row_key, exclude_key)) continue;
-            }
-
-            const blob_ptr = c.sqlite3_column_blob(stmt, 0);
-            const blob_len = c.sqlite3_column_bytes(stmt, 0);
-            if (blob_ptr == null or blob_len <= 0) continue;
-
-            const bytes: [*]const u8 = @ptrCast(blob_ptr);
-            const slice = bytes[0..@intCast(blob_len)];
-            const existing = vector.bytesToVec(self.allocator, slice) catch continue;
-            defer self.allocator.free(existing);
-
-            const sim = vector.cosineSimilarity(new_embedding, existing);
-            if (sim >= self.config.duplicate_threshold) return true;
-        }
-
-        return false;
-    }
-
     // ── Category conversion ──────────────────────────────────────
 
     fn categoryToString(cat: MemoryCategory) []const u8 {
-        return switch (cat) {
-            .core => "fact",
-            .daily => "preference",
-            .conversation => "other",
-            .custom => |name| name,
-        };
+        return cat.toString();
     }
 
     fn stringToCategory(s: []const u8) MemoryCategory {
-        if (std.mem.eql(u8, s, "fact") or std.mem.eql(u8, s, "core")) return .core;
-        if (std.mem.eql(u8, s, "preference") or std.mem.eql(u8, s, "daily")) return .daily;
-        if (std.mem.eql(u8, s, "other") or std.mem.eql(u8, s, "conversation")) return .conversation;
-        return .conversation; // default
+        return MemoryCategory.fromString(s);
+    }
+
+    fn ownedCategoryFromString(allocator: std.mem.Allocator, s: []const u8) !MemoryCategory {
+        return root.cloneMemoryCategory(allocator, stringToCategory(s));
     }
 
     // ── Memory vtable implementation ────────────────────────────
@@ -221,11 +181,6 @@ pub const LanceDbMemory = struct {
             };
             if (emb) |e| {
                 if (e.len > 0) {
-                    // Check for duplicates (exclude same key so upserts work)
-                    if (self_.isDuplicate(e, key)) {
-                        log.debug("duplicate detected for key '{s}', skipping store", .{key});
-                        return;
-                    }
                     emb_bytes = vector.vecToBytes(self_.allocator, e) catch null;
                 }
             }
@@ -357,7 +312,7 @@ pub const LanceDbMemory = struct {
             errdefer allocator.free(id);
             const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
             errdefer allocator.free(timestamp);
-            const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+            const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "conversation";
             const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 5) > 0)
                 try allocator.dupe(u8, std.mem.span(sid_ptr))
             else
@@ -369,7 +324,7 @@ pub const LanceDbMemory = struct {
                     .id = id,
                     .key = key,
                     .content = content,
-                    .category = stringToCategory(cat_str),
+                    .category = try ownedCategoryFromString(allocator, cat_str),
                     .timestamp = timestamp,
                     .session_id = stored_sid,
                 },
@@ -448,7 +403,7 @@ pub const LanceDbMemory = struct {
             errdefer allocator.free(id);
             const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
             errdefer allocator.free(timestamp);
-            const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+            const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "conversation";
             const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 4) > 0)
                 try allocator.dupe(u8, std.mem.span(sid_ptr))
             else
@@ -459,7 +414,7 @@ pub const LanceDbMemory = struct {
                 .id = id,
                 .key = key,
                 .content = content,
-                .category = stringToCategory(cat_str),
+                .category = try ownedCategoryFromString(allocator, cat_str),
                 .timestamp = timestamp,
                 .session_id = stored_sid,
             });
@@ -500,7 +455,7 @@ pub const LanceDbMemory = struct {
             errdefer allocator.free(id);
             const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
             errdefer allocator.free(timestamp);
-            const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+            const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "conversation";
             const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 4) > 0)
                 try allocator.dupe(u8, std.mem.span(sid_ptr))
             else
@@ -511,7 +466,7 @@ pub const LanceDbMemory = struct {
                 .id = id,
                 .key = k,
                 .content = content,
-                .category = stringToCategory(cat_str),
+                .category = try ownedCategoryFromString(allocator, cat_str),
                 .timestamp = timestamp,
                 .session_id = stored_sid,
             };
@@ -560,7 +515,7 @@ pub const LanceDbMemory = struct {
         errdefer allocator.free(id);
         const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
         errdefer allocator.free(timestamp);
-        const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+        const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "conversation";
         const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 4) > 0)
             try allocator.dupe(u8, std.mem.span(sid_ptr))
         else
@@ -571,7 +526,7 @@ pub const LanceDbMemory = struct {
             .id = id,
             .key = out_key,
             .content = content,
-            .category = stringToCategory(cat_str),
+            .category = try ownedCategoryFromString(allocator, cat_str),
             .timestamp = timestamp,
             .session_id = stored_sid,
         };
@@ -639,7 +594,7 @@ pub const LanceDbMemory = struct {
             errdefer allocator.free(id);
             const timestamp = if (ts_ptr != null) try allocator.dupe(u8, std.mem.span(ts_ptr)) else try allocator.dupe(u8, "0");
             errdefer allocator.free(timestamp);
-            const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "other";
+            const cat_str = if (cat_ptr != null) std.mem.span(cat_ptr) else "conversation";
             const stored_sid = if (sid_ptr != null and c.sqlite3_column_bytes(stmt, 4) > 0)
                 try allocator.dupe(u8, std.mem.span(sid_ptr))
             else
@@ -650,7 +605,7 @@ pub const LanceDbMemory = struct {
                 .id = id,
                 .key = k,
                 .content = content,
-                .category = stringToCategory(cat_str),
+                .category = try ownedCategoryFromString(allocator, cat_str),
                 .timestamp = timestamp,
                 .session_id = stored_sid,
             });
@@ -757,6 +712,42 @@ pub const LanceDbMemory = struct {
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+const ConstantEmbedding = struct {
+    values: []const f32,
+
+    const Self = @This();
+
+    fn implName(_: *anyopaque) []const u8 {
+        return "test-constant";
+    }
+
+    fn implDimensions(ptr: *anyopaque) u32 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return @intCast(self_.values.len);
+    }
+
+    fn implEmbed(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]f32 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return allocator.dupe(f32, self_.values);
+    }
+
+    fn implDeinit(_: *anyopaque) void {}
+
+    const vtable = EmbeddingProvider.VTable{
+        .name = &implName,
+        .dimensions = &implDimensions,
+        .embed = &implEmbed,
+        .deinit = &implDeinit,
+    };
+
+    fn provider(self: *Self) EmbeddingProvider {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+};
 
 test "lancedb store and recall" {
     const allocator = testing.allocator;
@@ -870,4 +861,36 @@ test "lancedb forget nonexistent returns false" {
     var mem = impl_.memory();
     const deleted = try mem.forget("no_such_key");
     try testing.expect(!deleted);
+}
+
+test "lancedb does not drop stores with identical embeddings" {
+    const allocator = testing.allocator;
+    var embedder_impl = ConstantEmbedding{
+        .values = &.{ 1.0, 0.0, 0.0 },
+    };
+    var impl_ = try LanceDbMemory.init(allocator, ":memory:", embedder_impl.provider(), .{});
+    defer impl_.deinit();
+
+    var mem = impl_.memory();
+    try mem.store("alpha", "first", .core, null);
+    try mem.store("beta", "second", .core, null);
+
+    try testing.expectEqual(@as(usize, 2), try mem.count());
+}
+
+test "lancedb preserves custom categories" {
+    const allocator = testing.allocator;
+    var impl_ = try LanceDbMemory.init(allocator, ":memory:", null, .{});
+    defer impl_.deinit();
+
+    var mem = impl_.memory();
+    try mem.store("behavior", "precise", .{ .custom = "behavior" }, null);
+
+    const entry = try mem.get(allocator, "behavior");
+    try testing.expect(entry != null);
+    if (entry) |e| {
+        var e_mut = e;
+        defer e_mut.deinit(allocator);
+        try testing.expect(e.category.eql(.{ .custom = "behavior" }));
+    }
 }
