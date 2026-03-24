@@ -3069,6 +3069,103 @@ test "cross-backend runtimes synchronize via events and checkpoints" {
     try std.testing.expectEqualStrings("solarized", restored_entry.content);
 }
 
+test "cross-backend runtimes synchronize deterministic behavioral merge events" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    try requireBackendEnabledForTests("memory");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_dir = try std.fs.path.join(std.testing.allocator, &.{ "source-merge" });
+    defer std.testing.allocator.free(source_dir);
+    const replica_dir = try std.fs.path.join(std.testing.allocator, &.{ "replica-merge" });
+    defer std.testing.allocator.free(replica_dir);
+    try tmp.dir.makePath(source_dir);
+    try tmp.dir.makePath(replica_dir);
+
+    const source_workspace = try tmp.dir.realpathAlloc(std.testing.allocator, source_dir);
+    defer std.testing.allocator.free(source_workspace);
+    const replica_workspace = try tmp.dir.realpathAlloc(std.testing.allocator, replica_dir);
+    defer std.testing.allocator.free(replica_workspace);
+
+    const source_cfg = config_types.MemoryConfig{ .backend = "memory" };
+    const replica_cfg = config_types.MemoryConfig{ .backend = "sqlite" };
+
+    var source = initRuntime(std.testing.allocator, &source_cfg, source_workspace) orelse return error.TestUnexpectedResult;
+    defer source.deinit();
+    var replica = initRuntime(std.testing.allocator, &replica_cfg, replica_workspace) orelse return error.TestUnexpectedResult;
+    defer replica.deinit();
+
+    const baseline_sequence = try source.memory.lastEventSequence();
+    try source.memory.applyEvent(.{
+        .origin_instance_id = "agent-a",
+        .origin_sequence = 1,
+        .timestamp_ms = 10,
+        .operation = .merge_string_set,
+        .key = "traits.tags",
+        .category = .core,
+        .value_kind = .string_set,
+        .content = "friendly",
+    });
+    try source.memory.applyEvent(.{
+        .origin_instance_id = "agent-b",
+        .origin_sequence = 1,
+        .timestamp_ms = 11,
+        .operation = .merge_string_set,
+        .key = "traits.tags",
+        .value_kind = .string_set,
+        .content = "[\"concise\",\"friendly\"]",
+    });
+    try source.memory.applyEvent(.{
+        .origin_instance_id = "agent-a",
+        .origin_sequence = 2,
+        .timestamp_ms = 20,
+        .operation = .merge_object,
+        .key = "profile.behavior",
+        .category = .core,
+        .value_kind = .json_object,
+        .content = "{\"tone\":\"formal\",\"persona\":{\"warm\":true}}",
+    });
+    try source.memory.applyEvent(.{
+        .origin_instance_id = "agent-b",
+        .origin_sequence = 2,
+        .timestamp_ms = 21,
+        .operation = .merge_object,
+        .key = "profile.behavior",
+        .value_kind = .json_object,
+        .content = "{\"persona\":{\"direct\":true},\"verbosity\":\"low\"}",
+    });
+
+    const events = try source.memory.listEvents(std.testing.allocator, baseline_sequence, 16);
+    defer freeEvents(std.testing.allocator, events);
+    try std.testing.expectEqual(@as(usize, 4), events.len);
+
+    for (events) |event| {
+        try replica.memory.applyEvent(.{
+            .origin_instance_id = event.origin_instance_id,
+            .origin_sequence = event.origin_sequence,
+            .timestamp_ms = event.timestamp_ms,
+            .operation = event.operation,
+            .key = event.key,
+            .session_id = event.session_id,
+            .category = event.category,
+            .value_kind = event.value_kind,
+            .content = event.content,
+        });
+    }
+
+    const tags = (try replica.memory.getScoped(std.testing.allocator, "traits.tags", null)).?;
+    defer tags.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("[\"concise\",\"friendly\"]", tags.content);
+
+    const behavior = (try replica.memory.getScoped(std.testing.allocator, "profile.behavior", null)).?;
+    defer behavior.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "{\"persona\":{\"direct\":true,\"warm\":true},\"tone\":\"formal\",\"verbosity\":\"low\"}",
+        behavior.content,
+    );
+}
+
 test {
     // engines/ (Layer A)
     _ = sqlite;

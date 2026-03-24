@@ -4979,3 +4979,29 @@ test "applyMemoryEventWithVectorSync ignores stale put for vector sync" {
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("new", entry.content);
 }
+
+test "parseMemoryEventValue parses merge event and checkpoint detector distinguishes payloads" {
+    const event_json =
+        \\{"origin_instance_id":"agent-a","origin_sequence":7,"timestamp_ms":1234,"operation":"merge_object","key":"profile.behavior","session_id":null,"category":"core","value_kind":"json_object","content":"{\"tone\":\"formal\"}"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event_json, .{});
+    defer parsed.deinit();
+
+    const input = try parseMemoryEventValue(parsed.value);
+    try std.testing.expectEqualStrings("agent-a", input.origin_instance_id);
+    try std.testing.expectEqual(@as(u64, 7), input.origin_sequence);
+    try std.testing.expectEqual(yc.memory.MemoryEventOp.merge_object, input.operation);
+    try std.testing.expectEqualStrings("profile.behavior", input.key);
+    try std.testing.expect(input.session_id == null);
+    try std.testing.expect(input.category.?.eql(.core));
+    try std.testing.expectEqual(yc.memory.MemoryValueKind.json_object, input.value_kind.?);
+    try std.testing.expectEqualStrings("{\"tone\":\"formal\"}", input.content.?);
+
+    const checkpoint_payload =
+        \\{"kind":"meta","schema_version":1,"last_sequence":4}
+        \\
+        \\{"kind":"entry","key":"prefs/theme","content":"dark","category":"core","session_id":null}
+    ;
+    try std.testing.expect(isCheckpointPayload(std.testing.allocator, checkpoint_payload));
+    try std.testing.expect(!isCheckpointPayload(std.testing.allocator, event_json));
+}
