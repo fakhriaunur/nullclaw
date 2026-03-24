@@ -1477,10 +1477,19 @@ pub fn initRuntime(
     const redis_cfg: ?config_types.MemoryRedisConfig = if (std.mem.eql(u8, config.backend, "redis")) config.redis else null;
     const api_cfg: ?config_types.MemoryApiConfig = if (std.mem.eql(u8, config.backend, "api")) config.api else null;
     const clickhouse_cfg: ?config_types.MemoryClickHouseConfig = if (std.mem.eql(u8, config.backend, "clickhouse")) config.clickhouse else null;
-    const cfg = registry.resolvePaths(allocator, desc, workspace_dir, config.instance_id, pg_cfg, redis_cfg, api_cfg, clickhouse_cfg) catch |err| {
+    var embed_provider: ?embeddings.EmbeddingProvider = initSearchEmbeddingProvider(allocator, config.search);
+    var embed_provider_owned_by_runtime = false;
+    defer {
+        if (!embed_provider_owned_by_runtime) {
+            if (embed_provider) |ep| ep.deinit();
+        }
+    }
+
+    var cfg = registry.resolvePaths(allocator, desc, workspace_dir, config.instance_id, pg_cfg, redis_cfg, api_cfg, clickhouse_cfg) catch |err| {
         log.warn("memory path resolution failed for backend '{s}': {}", .{ config.backend, err });
         return null;
     };
+    cfg.embed_provider = embed_provider;
 
     var instance = desc.create(allocator, cfg) catch |err| {
         log.warn("memory backend '{s}' init failed: {}", .{ config.backend, err });
@@ -1609,7 +1618,6 @@ pub fn initRuntime(
     }
 
     // ── P3: Vector plane wiring ──
-    var embed_provider: ?embeddings.EmbeddingProvider = null;
     var vs_iface: ?vector_store.VectorStore = null;
     var cb_inst: ?*circuit_breaker.CircuitBreaker = null;
     var outbox_inst: ?*outbox.VectorOutbox = null;
@@ -1617,48 +1625,7 @@ pub fn initRuntime(
     var resolved_vector_mode: []const u8 = "none";
     var resolved_vector_sync_mode: []const u8 = "best_effort";
     if (config.search.enabled and !std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled) vec_plane: {
-        const primary_api_key = provider_api_key.resolveApiKey(allocator, config.search.provider, null) catch null;
-        defer if (primary_api_key) |k| allocator.free(k);
-
-        // 1. Create EmbeddingProvider (with optional fallback via ProviderRouter)
-        const primary_ep = embeddings.createEmbeddingProvider(
-            allocator,
-            config.search.provider,
-            primary_api_key,
-            config.search.model,
-            config.search.dimensions,
-        ) catch break :vec_plane;
-
-        embed_provider = primary_ep;
-
-        // Wrap primary + fallback in a ProviderRouter when fallback is configured
-        if (!std.mem.eql(u8, config.search.fallback_provider, "none") and
-            config.search.fallback_provider.len > 0)
-        wrap_router: {
-            const fallback_api_key = provider_api_key.resolveApiKey(allocator, config.search.fallback_provider, null) catch null;
-            defer if (fallback_api_key) |k| allocator.free(k);
-
-            const fallback_ep = embeddings.createEmbeddingProvider(
-                allocator,
-                config.search.fallback_provider,
-                fallback_api_key,
-                config.search.model,
-                config.search.dimensions,
-            ) catch {
-                log.warn("fallback embedding provider '{s}' init failed, using primary only", .{config.search.fallback_provider});
-                break :wrap_router;
-            };
-            const router = provider_router.ProviderRouter.init(
-                allocator,
-                primary_ep,
-                &.{fallback_ep},
-                &.{},
-            ) catch {
-                fallback_ep.deinit();
-                break :wrap_router;
-            };
-            embed_provider = router.provider();
-        }
+        const active_embed_provider = embed_provider orelse break :vec_plane;
 
         // 2. Resolve vector store mode based on config.search.store.kind
         //    "auto"           → sqlite_shared if primary is sqlite-based, else sqlite_sidecar
@@ -1811,7 +1778,7 @@ pub fn initRuntime(
 
         // 5. Wire into retrieval engine
         if (engine) |eng| {
-            eng.setVectorSearch(embed_provider.?, vs_iface.?, cb, config.search.query.hybrid);
+            eng.setVectorSearch(active_embed_provider, vs_iface.?, cb, config.search.query.hybrid);
         }
     }
 
@@ -1866,7 +1833,10 @@ pub fn initRuntime(
             // Clean up partially-created P3 resources
             if (outbox_inst) |ob| ob.deinit();
             if (vs_iface) |vs| vs.deinitStore();
-            if (embed_provider) |ep| ep.deinit();
+            if (embed_provider) |ep| {
+                ep.deinit();
+                embed_provider = null;
+            }
             if (cb_inst) |cb| allocator.destroy(cb);
             if (sidecar_db_path) |p| allocator.free(std.mem.span(p));
             // Clean up response cache
@@ -1946,6 +1916,8 @@ pub fn initRuntime(
 
     const embed_name: []const u8 = if (embed_provider) |ep_| ep_.getName() else "none";
 
+    embed_provider_owned_by_runtime = true;
+
     return .{
         .memory = instance.memory,
         .session_store = instance.session_store,
@@ -1981,6 +1953,58 @@ pub fn initRuntime(
         ._outbox = outbox_inst,
         ._sidecar_db_path = sidecar_db_path,
     };
+}
+
+fn initSearchEmbeddingProvider(
+    allocator: std.mem.Allocator,
+    search_cfg: config_types.MemorySearchConfig,
+) ?embeddings.EmbeddingProvider {
+    if (!search_cfg.enabled) return null;
+    if (std.mem.eql(u8, search_cfg.provider, "none")) return null;
+    if (!search_cfg.query.hybrid.enabled) return null;
+
+    const primary_api_key = provider_api_key.resolveApiKey(allocator, search_cfg.provider, null) catch null;
+    defer if (primary_api_key) |k| allocator.free(k);
+
+    const primary_ep = embeddings.createEmbeddingProvider(
+        allocator,
+        search_cfg.provider,
+        primary_api_key,
+        search_cfg.model,
+        search_cfg.dimensions,
+    ) catch return null;
+
+    var embed_provider = primary_ep;
+
+    if (!std.mem.eql(u8, search_cfg.fallback_provider, "none") and
+        search_cfg.fallback_provider.len > 0)
+    wrap_router: {
+        const fallback_api_key = provider_api_key.resolveApiKey(allocator, search_cfg.fallback_provider, null) catch null;
+        defer if (fallback_api_key) |k| allocator.free(k);
+
+        const fallback_ep = embeddings.createEmbeddingProvider(
+            allocator,
+            search_cfg.fallback_provider,
+            fallback_api_key,
+            search_cfg.model,
+            search_cfg.dimensions,
+        ) catch {
+            log.warn("fallback embedding provider '{s}' init failed, using primary only", .{search_cfg.fallback_provider});
+            break :wrap_router;
+        };
+        const router = provider_router.ProviderRouter.init(
+            allocator,
+            primary_ep,
+            &.{fallback_ep},
+            &.{},
+        ) catch {
+            fallback_ep.deinit();
+            break :wrap_router;
+        };
+        embed_provider = router.provider();
+    }
+
+    return embed_provider;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -2542,6 +2566,30 @@ test "initRuntime with hybrid disabled has no embedding provider" {
     try std.testing.expect(rt._outbox == null);
 }
 
+test "initRuntime lancedb backend receives embedding provider" {
+    if (!build_options.enable_memory_lancedb or !build_options.enable_sqlite) return;
+    try requireBackendEnabledForTests("lancedb");
+
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
+    var rt = initRuntime(std.testing.allocator, &.{
+        .backend = "lancedb",
+        .search = .{
+            .provider = "ollama",
+            .query = .{ .hybrid = .{ .enabled = true } },
+        },
+    }, ws.path) orelse return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expect(rt._embedding_provider != null);
+    try std.testing.expectEqualStrings("lancedb", rt.memory.name());
+
+    const impl_: *LanceDbMemory = @ptrCast(@alignCast(rt.memory.ptr));
+    try std.testing.expect(impl_.embedder != null);
+    try std.testing.expectEqualStrings(rt._embedding_provider.?.getName(), impl_.embedder.?.getName());
+}
+
 test "initRuntime with search.provider=none has no vector store" {
     try requireBackendEnabledForTests("none");
 
@@ -2894,7 +2942,7 @@ test "MemoryRuntime.deinit cleans up P3 resources" {
     // testing allocator detects leaks
 }
 
-test "initRuntime memory backend persists deterministic feed across restart" {
+test "initRuntime memory backend restores deterministic feed from checkpoint" {
     try requireBackendEnabledForTests("memory");
 
     var tmp = std.testing.tmpDir(.{});
@@ -2913,10 +2961,15 @@ test "initRuntime memory backend persists deterministic feed across restart" {
     defer first_info.deinit(std.testing.allocator);
     try std.testing.expect(first_info.last_sequence > 0);
 
+    const checkpoint = try first.memory.exportCheckpoint(std.testing.allocator);
+    defer std.testing.allocator.free(checkpoint);
+
     first.deinit();
 
     var second = initRuntime(std.testing.allocator, &cfg, workspace) orelse return error.TestUnexpectedResult;
     defer second.deinit();
+
+    try second.memory.applyCheckpoint(checkpoint);
 
     const entry = (try second.memory.getScoped(std.testing.allocator, "preferences.theme", null)).?;
     defer entry.deinit(std.testing.allocator);

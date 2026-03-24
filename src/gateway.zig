@@ -6343,7 +6343,7 @@ test "memory gateway routes expose status and events" {
     defer parsed_status.deinit();
     try std.testing.expectEqualStrings("default", parsed_status.value.object.get("instance_id").?.string);
     try std.testing.expect(parsed_status.value.object.get("last_sequence").?.integer >= 1);
-    try std.testing.expectEqualStrings("overlay", parsed_status.value.object.get("storage_kind").?.string);
+    try std.testing.expectEqualStrings("native", parsed_status.value.object.get("storage_kind").?.string);
 
     var events_ctx = initMemoryRouteContext(
         req_allocator,

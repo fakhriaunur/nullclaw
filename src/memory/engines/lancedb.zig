@@ -219,7 +219,6 @@ pub const LanceDbMemory = struct {
         try self.execSqlAllowDuplicateColumn("lancedb migration", "ALTER TABLE lancedb_memories ADD COLUMN event_origin_instance_id TEXT NOT NULL DEFAULT 'default';");
         try self.execSqlAllowDuplicateColumn("lancedb migration", "ALTER TABLE lancedb_memories ADD COLUMN event_origin_sequence INTEGER NOT NULL DEFAULT 0;");
         try self.execSql("lancedb migration", "CREATE INDEX IF NOT EXISTS idx_lance_event_order ON lancedb_memories(event_timestamp_ms, event_origin_instance_id, event_origin_sequence);");
-        try self.bootstrapEventFeedFromExistingMemories();
     }
 
     fn localInstanceId(self: *Self) []const u8 {
@@ -521,78 +520,6 @@ pub const LanceDbMemory = struct {
         defer self.allocator.free(embedding);
         if (embedding.len == 0) return null;
         return vector.vecToBytes(self.allocator, embedding) catch null;
-    }
-
-    fn bootstrapEventFeedFromExistingMemories(self: *Self) !void {
-        if (try self.getCompactedThroughSequence() > 0) return;
-        if (try self.queryCount("SELECT COUNT(*) FROM memory_events") > 0) return;
-        if (try self.queryCount("SELECT COUNT(*) FROM lancedb_memories") == 0) return;
-
-        var owns_tx = c.sqlite3_get_autocommit(self.db) != 0;
-        if (owns_tx) owns_tx = try self.beginImmediate();
-        var committed = false;
-        errdefer if (owns_tx and !committed) self.rollbackTxn();
-
-        const select_sql =
-            "SELECT rowid, key, text, category, session_id, value_kind, " ++
-            "COALESCE(CAST(updated_at AS INTEGER), 0) " ++
-            "FROM lancedb_memories ORDER BY updated_at ASC, rowid ASC";
-        var select_stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, select_sql, -1, &select_stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
-        defer _ = c.sqlite3_finalize(select_stmt);
-
-        const update_sql =
-            "UPDATE lancedb_memories SET event_timestamp_ms = ?1, event_origin_instance_id = ?2, event_origin_sequence = ?3 WHERE rowid = ?4";
-        var update_stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, update_sql, -1, &update_stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
-        defer _ = c.sqlite3_finalize(update_stmt);
-
-        var next_origin_sequence: u64 = 1;
-        while (c.sqlite3_step(select_stmt) == c.SQLITE_ROW) {
-            const rowid = c.sqlite3_column_int64(select_stmt, 0);
-            const key = try dupeColumnText(select_stmt.?, 1, self.allocator);
-            defer self.allocator.free(key);
-            const content = try dupeColumnText(select_stmt.?, 2, self.allocator);
-            defer self.allocator.free(content);
-            const category_text = try dupeColumnText(select_stmt.?, 3, self.allocator);
-            defer self.allocator.free(category_text);
-            const session_id = try dupeColumnTextNullable(select_stmt.?, 4, self.allocator);
-            defer if (session_id) |sid| self.allocator.free(sid);
-            const value_kind_text = try dupeColumnTextNullable(select_stmt.?, 5, self.allocator);
-            defer if (value_kind_text) |text| self.allocator.free(text);
-            const updated_at_secs = c.sqlite3_column_int64(select_stmt, 6);
-            const timestamp_ms: i64 = if (updated_at_secs > 0) updated_at_secs * 1000 else @intCast(next_origin_sequence);
-            const input = MemoryEventInput{
-                .origin_instance_id = self.localInstanceId(),
-                .origin_sequence = next_origin_sequence,
-                .timestamp_ms = timestamp_ms,
-                .operation = .put,
-                .key = key,
-                .session_id = session_id,
-                .category = MemoryCategory.fromString(category_text),
-                .value_kind = if (value_kind_text) |text| MemoryValueKind.fromString(text) else null,
-                .content = content,
-            };
-            const inserted = try self.insertEventTx(input);
-            if (!inserted) return error.StepFailed;
-
-            _ = c.sqlite3_reset(update_stmt);
-            _ = c.sqlite3_clear_bindings(update_stmt);
-            _ = c.sqlite3_bind_int64(update_stmt, 1, timestamp_ms);
-            _ = c.sqlite3_bind_text(update_stmt, 2, self.localInstanceId().ptr, @intCast(self.localInstanceId().len), SQLITE_STATIC);
-            _ = c.sqlite3_bind_int64(update_stmt, 3, @intCast(next_origin_sequence));
-            _ = c.sqlite3_bind_int64(update_stmt, 4, rowid);
-            if (c.sqlite3_step(update_stmt) != c.SQLITE_DONE) return error.StepFailed;
-
-            next_origin_sequence += 1;
-        }
-
-        if (next_origin_sequence > 1) {
-            try self.setFrontierTx(self.localInstanceId(), next_origin_sequence - 1);
-        }
-
-        if (owns_tx) try self.commitTxn();
-        committed = true;
     }
 
     fn insertEventTx(self: *Self, input: MemoryEventInput) !bool {

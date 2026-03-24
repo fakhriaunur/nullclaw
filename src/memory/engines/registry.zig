@@ -45,6 +45,7 @@ pub const BackendConfig = struct {
     api_config: ?config_types.MemoryApiConfig = null,
     clickhouse_config: ?config_types.MemoryClickHouseConfig = null,
     instance_id: []const u8 = "default",
+    embed_provider: ?root.EmbeddingProvider = null,
 };
 
 pub const BackendInstance = struct {
@@ -108,7 +109,7 @@ const lancedb_backend = BackendDescriptor{
     .name = "lancedb",
     .label = "LanceDB — SQLite + vector-augmented recall",
     .auto_save_default = true,
-    .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+    .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = true, .supports_outbox = true },
     .needs_db_path = true,
     .needs_workspace = false,
     .create = &createLanceDb,
@@ -372,7 +373,13 @@ fn createRedis(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstanc
 fn createLanceDb(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     const impl_ = try allocator.create(lancedb_engine.LanceDbMemory);
     errdefer allocator.destroy(impl_);
-    impl_.* = try lancedb_engine.LanceDbMemory.initWithInstanceId(allocator, cfg.db_path.?, cfg.instance_id, null, .{});
+    impl_.* = try lancedb_engine.LanceDbMemory.initWithInstanceId(
+        allocator,
+        cfg.db_path.?,
+        cfg.instance_id,
+        cfg.embed_provider,
+        .{},
+    );
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = null };
 }
@@ -567,6 +574,8 @@ test "findBackend lancedb" {
     try std.testing.expectEqualStrings("lancedb", desc.name);
     try std.testing.expect(!desc.capabilities.supports_keyword_rank);
     try std.testing.expect(!desc.capabilities.supports_session_store);
+    try std.testing.expect(desc.capabilities.supports_transactions);
+    try std.testing.expect(desc.capabilities.supports_outbox);
     try std.testing.expect(desc.needs_db_path);
     try std.testing.expect(!desc.needs_workspace);
     try std.testing.expect(desc.auto_save_default);
