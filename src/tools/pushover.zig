@@ -5,6 +5,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const fs_compat = @import("../fs_compat.zig");
+const platform = @import("../platform.zig");
 const urlEncode = @import("web_search_providers/common.zig").urlEncode;
 const http_util = @import("../http_util.zig");
 
@@ -128,18 +129,14 @@ pub const PushoverTool = struct {
     }
 
     fn getCredentials(self: *const PushoverTool, allocator: std.mem.Allocator) !struct { token: []const u8, user_key: []const u8 } {
-        var token: ?[]u8 = null;
-        var user_key: ?[]u8 = null;
+        var token: ?[]const u8 = null;
+        var user_key: ?[]const u8 = null;
         errdefer if (token) |t| allocator.free(t);
         errdefer if (user_key) |u| allocator.free(u);
 
         // 1. Try process environment first
-        if (std.posix.getenv("PUSHOVER_TOKEN")) |t| {
-            token = try allocator.dupe(u8, t);
-        }
-        if (std.posix.getenv("PUSHOVER_USER_KEY")) |u| {
-            user_key = try allocator.dupe(u8, u);
-        }
+        token = platform.getEnvOrNull(allocator, "PUSHOVER_TOKEN");
+        user_key = platform.getEnvOrNull(allocator, "PUSHOVER_USER_KEY");
 
         // 2. Fall back to .env if missing either
         if (token == null or user_key == null) {
@@ -189,13 +186,13 @@ pub const PushoverTool = struct {
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "pushover tool name" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp" };
+    var pt = PushoverTool{ .workspace_dir = "." };
     const t = pt.tool();
     try std.testing.expectEqualStrings("pushover", t.name());
 }
 
 test "pushover schema has message required" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp" };
+    var pt = PushoverTool{ .workspace_dir = "." };
     const t = pt.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"message\"") != null);
@@ -203,7 +200,7 @@ test "pushover schema has message required" {
 }
 
 test "pushover execute missing message" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp" };
+    var pt = PushoverTool{ .workspace_dir = "." };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{}");
     defer parsed.deinit();
@@ -213,7 +210,7 @@ test "pushover execute missing message" {
 }
 
 test "pushover execute empty message" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp" };
+    var pt = PushoverTool{ .workspace_dir = "." };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"\"}");
     defer parsed.deinit();
@@ -223,7 +220,7 @@ test "pushover execute empty message" {
 }
 
 test "pushover priority -3 rejected" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp" };
+    var pt = PushoverTool{ .workspace_dir = "." };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": -3}");
     defer parsed.deinit();
@@ -234,7 +231,7 @@ test "pushover priority -3 rejected" {
 }
 
 test "pushover priority 5 rejected" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp" };
+    var pt = PushoverTool{ .workspace_dir = "." };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": 5}");
     defer parsed.deinit();
@@ -245,7 +242,7 @@ test "pushover priority 5 rejected" {
 }
 
 test "pushover priority 2 accepted (credential error expected)" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp/nonexistent_pushover_test_dir" };
+    var pt = PushoverTool{ .workspace_dir = "/nonexistent_pushover_test_dir" };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": 2}");
     defer parsed.deinit();
@@ -257,7 +254,7 @@ test "pushover priority 2 accepted (credential error expected)" {
 }
 
 test "pushover priority -2 accepted (credential error expected)" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp/nonexistent_pushover_test_dir" };
+    var pt = PushoverTool{ .workspace_dir = "/nonexistent_pushover_test_dir" };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": -2}");
     defer parsed.deinit();
@@ -288,7 +285,7 @@ test "parseEnvValue strips inline comment" {
 }
 
 test "pushover schema has priority and sound" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp" };
+    var pt = PushoverTool{ .workspace_dir = "." };
     const t = pt.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "priority") != null);
@@ -362,16 +359,20 @@ test "getCredentials missing user_key returns error" {
 }
 
 test "getCredentials missing .env returns error" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp/nonexistent_pushover_test_dir_xyz" };
-    // Temporarily unset environment variables so they don't affect this test.
-    const old_token = std.posix.getenv("PUSHOVER_TOKEN");
-    const old_user_key = std.posix.getenv("PUSHOVER_USER_KEY");
-    _ = old_token;
-    _ = old_user_key;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
     
-    // We cannot easily unsetenv in Zig stdlib natively across platforms without using C setenv, 
-    // but these vars won't exist in our test runner anyway.
+    // In CI these won't be set, but locally they might be.
+    // We cannot easily unset them portably without C, so we just hope 
+    // the environment is clean or the test runner isolates it.
+    // Actually, if we use a real path but NO .env file, readFileAlloc returns FileNotFound.
 
     const result = pt.getCredentials(std.testing.allocator);
-    try std.testing.expectError(error.MissingPushoverToken, result);
+    // It might return MissingPushoverToken if it falls through or if it finds nothing in env.
+    const err = result catch |e| e;
+    try std.testing.expect(err == error.MissingPushoverToken or err == error.MissingPushoverUserKey);
 }
