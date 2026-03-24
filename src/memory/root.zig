@@ -1503,7 +1503,7 @@ pub fn initRuntime(
         return null;
     };
 
-    if ((instance.memory.vtable.listEvents == null or std.mem.eql(u8, config.backend, "memory")) and !std.mem.eql(u8, config.backend, "none")) {
+    if (instance.memory.vtable.listEvents == null and !std.mem.eql(u8, config.backend, "none")) {
         const overlay_root = buildOverlayJournalRootDir(allocator, config.backend, workspace_dir) catch |err| {
             log.warn("memory backend '{s}' event feed root init failed: {}", .{ config.backend, err });
             instance.memory.deinit();

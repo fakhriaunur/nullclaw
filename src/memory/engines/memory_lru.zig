@@ -739,11 +739,6 @@ pub const InMemoryLruMemory = struct {
         .list = &implList,
         .forget = &implForget,
         .forgetScoped = &implForgetScoped,
-        .listEvents = &implListEvents,
-        .applyEvent = &implApplyEvent,
-        .lastEventSequence = &implLastEventSequence,
-        .eventFeedInfo = &implEventFeedInfo,
-        .compactEvents = &implCompactEvents,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -1278,85 +1273,4 @@ test "LRU eviction with capacity 1" {
     const got_b = (try m.get(std.testing.allocator, "b")).?;
     defer got_b.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("second", got_b.content);
-}
-
-test "memory_lru event feed converges across replicas and is idempotent" {
-    var source = try InMemoryLruMemory.initWithInstanceId(std.testing.allocator, 100, "agent-a");
-    defer source.deinit();
-    var replica = try InMemoryLruMemory.initWithInstanceId(std.testing.allocator, 100, "agent-b");
-    defer replica.deinit();
-
-    const source_mem = source.memory();
-    const replica_mem = replica.memory();
-
-    try source_mem.store("preferences.theme", "dark", .core, null);
-    try source_mem.store("preferences.tone", "formal", .core, "sess-1");
-    try std.testing.expect(try source_mem.forgetScoped(std.testing.allocator, "preferences.tone", "sess-1"));
-
-    const events = try source_mem.listEvents(std.testing.allocator, 0, 32);
-    defer root.freeEvents(std.testing.allocator, events);
-    try std.testing.expectEqual(@as(usize, 3), events.len);
-
-    for (events) |event| {
-        try replica_mem.applyEvent(.{
-            .origin_instance_id = event.origin_instance_id,
-            .origin_sequence = event.origin_sequence,
-            .timestamp_ms = event.timestamp_ms,
-            .operation = event.operation,
-            .key = event.key,
-            .session_id = event.session_id,
-            .category = event.category,
-            .content = event.content,
-        });
-    }
-
-    const theme = (try replica_mem.getScoped(std.testing.allocator, "preferences.theme", null)).?;
-    defer theme.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("dark", theme.content);
-
-    const tone = try replica_mem.getScoped(std.testing.allocator, "preferences.tone", "sess-1");
-    defer if (tone) |entry| entry.deinit(std.testing.allocator);
-    try std.testing.expect(tone == null);
-
-    for (events) |event| {
-        try replica_mem.applyEvent(.{
-            .origin_instance_id = event.origin_instance_id,
-            .origin_sequence = event.origin_sequence,
-            .timestamp_ms = event.timestamp_ms,
-            .operation = event.operation,
-            .key = event.key,
-            .session_id = event.session_id,
-            .category = event.category,
-            .content = event.content,
-        });
-    }
-    try std.testing.expectEqual(@as(usize, 1), try replica_mem.count());
-    try std.testing.expectEqual(@as(u64, 3), try replica_mem.lastEventSequence());
-}
-
-test "memory_lru tombstones block older cross-origin put replay" {
-    var mem = try InMemoryLruMemory.initWithInstanceId(std.testing.allocator, 100, "replica");
-    defer mem.deinit();
-    const memory = mem.memory();
-
-    try memory.applyEvent(.{
-        .origin_instance_id = "agent-delete",
-        .origin_sequence = 1,
-        .timestamp_ms = 2000,
-        .operation = .delete_all,
-        .key = "preferences.locale",
-    });
-    try memory.applyEvent(.{
-        .origin_instance_id = "agent-put",
-        .origin_sequence = 1,
-        .timestamp_ms = 1000,
-        .operation = .put,
-        .key = "preferences.locale",
-        .category = .core,
-        .content = "ru",
-    });
-
-    const entry = try memory.getScoped(std.testing.allocator, "preferences.locale", null);
-    defer if (entry) |value| value.deinit(std.testing.allocator);
-    try std.testing.expect(entry == null);
 }
