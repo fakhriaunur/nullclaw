@@ -71,6 +71,7 @@ pub fn runTaskWithTools(
         provider_user_agent,
         provider_api_mode,
         provider_max_streaming_prompt_bytes,
+        if (provider_entry) |entry| entry.chat_template_enable_thinking_param else false,
         provider_extra_body_params,
     );
     defer provider_holder.deinit();
@@ -225,6 +226,22 @@ test "findProviderEntry threads api_mode from entry" {
     };
     const found = findProviderEntry("sub2api", &entries) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(config_types.ProviderEntry.ApiMode.responses, found.api_mode);
+}
+
+test "findProviderEntry threads chat_template_enable_thinking_param from entry" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://example.com/v1", .api_key = "sk-test", .chat_template_enable_thinking_param = true },
+    };
+    const found = findProviderEntry("custom:https://example.com/v1", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(found.chat_template_enable_thinking_param);
+}
+
+test "findProviderEntry threads extra_body_params from entry" {
+    const entries = [_]config_types.ProviderEntry{
+        .{ .name = "groq", .api_key = "sk-test", .extra_body_params = "{\"seed\":42}" },
+    };
+    const found = findProviderEntry("groq", &entries) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("{\"seed\":42}", found.extra_body_params.?);
 }
 
 test "findProviderEntry returns null when provider not in list" {

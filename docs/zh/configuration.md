@@ -117,6 +117,15 @@ nullclaw onboard --interactive
 }
 ```
 
+常见的 provider 级字段：
+
+- `api_key`：该 provider 条目的凭据。
+- `base_url`：用于自定义或自托管 OpenAI 兼容端点的地址覆盖。
+- `api_mode`：为兼容 provider 选择 `chat_completions` 或 `responses`。
+- `user_agent`：可选的 `User-Agent` 请求头覆盖。
+- `max_streaming_prompt_bytes`：当估算 prompt 大小超过该阈值时跳过流式请求。
+- `chat_template_enable_thinking_param`：针对自定义 OpenAI 兼容的 vLLM/Qwen 端点，把 `reasoning_effort` 映射到 `chat_template_kwargs.enable_thinking`。
+
 ### `agents.defaults.model.primary`
 
 - 设置默认模型路由，格式通常为：`provider/vendor/model`。

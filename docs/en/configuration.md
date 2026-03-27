@@ -132,6 +132,15 @@ Example:
 }
 ```
 
+Common per-provider fields:
+
+- `api_key`: credential for that provider entry.
+- `base_url`: override for custom or self-hosted OpenAI-compatible endpoints.
+- `api_mode`: select `chat_completions` or `responses` for compatible providers.
+- `user_agent`: optional `User-Agent` header override.
+- `max_streaming_prompt_bytes`: skip streaming above this estimated prompt size.
+- `chat_template_enable_thinking_param`: for custom OpenAI-compatible vLLM/Qwen endpoints, map `reasoning_effort` to `chat_template_kwargs.enable_thinking`.
+
 ### `agents.defaults.model.primary`
 
 - Sets default model route, typically `provider/vendor/model`.
