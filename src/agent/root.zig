@@ -715,11 +715,29 @@ pub const Agent = struct {
 
         // Recursively collect all .md files
         var files = std.ArrayList([]const u8).empty;
-        defer files.deinit(self.allocator);
+        defer {
+            for (files.items) |file_path| {
+                self.allocator.free(file_path);
+            }
+            files.deinit(self.allocator);
+        }
 
         var dirs_to_visit = std.ArrayList([]const u8).empty;
-        defer dirs_to_visit.deinit(self.allocator);
-        dirs_to_visit.append(self.allocator, messages_dir) catch |err| {
+        defer {
+            for (dirs_to_visit.items) |dir_path| {
+                self.allocator.free(dir_path);
+            }
+            dirs_to_visit.deinit(self.allocator);
+        }
+
+        const initial_dir = self.allocator.dupe(u8, messages_dir) catch |err| {
+            log.warn("Warm start: failed to allocate initial dir path: {s}", .{@errorName(err)});
+            return;
+        };
+        errdefer self.allocator.free(initial_dir);
+
+        dirs_to_visit.append(self.allocator, initial_dir) catch |err| {
+            self.allocator.free(initial_dir);
             log.warn("Warm start: failed to allocate initial dir: {s}", .{@errorName(err)});
             return;
         };
@@ -879,7 +897,12 @@ pub const Agent = struct {
         // Append messages to history in chronological order
         var appended: usize = 0;
         for (records.items) |rec| {
-            self.appendOwnedHistoryMessage(.{ .role = rec.role, .content = rec.content }, &[_]ParsedToolCall{}, null) catch |err| {
+            // Warm-start rehydrates existing history; do not write duplicate
+            // message-log files while replaying that history.
+            self.history.append(self.allocator, .{
+                .role = rec.role,
+                .content = rec.content,
+            }) catch |err| {
                 log.warn("Warm start: failed to append message to history: {s}", .{@errorName(err)});
                 self.allocator.free(rec.content);
                 continue;

@@ -9,10 +9,20 @@ const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const mcp_mod = @import("../mcp.zig");
-const Sandbox = @import("../security/sandbox.zig").Sandbox;
 const SandboxBackend = @import("../security/sandbox.zig").SandboxBackend;
 const createSandbox = @import("../security/sandbox.zig").createSandbox;
 const ConfigSandboxBackend = @import("../config.zig").SandboxBackend;
+
+fn mapConfigSandboxBackend(backend: ConfigSandboxBackend) SandboxBackend {
+    return switch (backend) {
+        .auto => .auto,
+        .landlock => .landlock,
+        .firejail => .firejail,
+        .bubblewrap => .bubblewrap,
+        .docker => .docker,
+        .none => .none,
+    };
+}
 
 // ── JSON arg extraction helpers ─────────────────────────────────
 // Used by all tool implementations to extract typed fields from
@@ -342,9 +352,12 @@ pub fn allTools(
         // sandbox and sandbox_storage initialized below if enabled
     };
     if (opts.sandbox_enabled) {
-        // Convert from config_types.SandboxBackend to security.detect.SandboxBackend
-        const backend: SandboxBackend = @enumFromInt(@intFromEnum(opts.sandbox_backend));
-        st.sandbox = createSandbox(allocator, backend, workspace_dir, &st.sandbox_storage);
+        st.sandbox = createSandbox(
+            allocator,
+            mapConfigSandboxBackend(opts.sandbox_backend),
+            workspace_dir,
+            &st.sandbox_storage,
+        );
     }
     try list.append(allocator, st.tool());
 
@@ -1061,6 +1074,17 @@ test "subagent tools wire bootstrap provider into file_read for sqlite backends"
     }
 
     try std.testing.expect(checked);
+}
+
+test "config sandbox backend mapping preserves explicit values" {
+    // Regression: config_types.SandboxBackend and security.detect.SandboxBackend
+    // do not share the same enum ordering.
+    try std.testing.expect(mapConfigSandboxBackend(.auto) == .auto);
+    try std.testing.expect(mapConfigSandboxBackend(.landlock) == .landlock);
+    try std.testing.expect(mapConfigSandboxBackend(.firejail) == .firejail);
+    try std.testing.expect(mapConfigSandboxBackend(.bubblewrap) == .bubblewrap);
+    try std.testing.expect(mapConfigSandboxBackend(.docker) == .docker);
+    try std.testing.expect(mapConfigSandboxBackend(.none) == .none);
 }
 
 test "subagent tools wire http allowlist, response limit, and timeout" {

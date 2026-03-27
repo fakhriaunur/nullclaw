@@ -1282,11 +1282,6 @@ pub const SessionManager = struct {
             agent.usage_record_ctx = @ptrCast(self);
         }
 
-        // Warm start: load history from message logs if enabled
-        if (agent.warm_start) {
-            agent.attemptWarmStart();
-        }
-
         const session_provider_holder = session.provider_holder;
         const session_owned_provider_api_key = session.owned_provider_api_key;
         session.* = .{
@@ -1319,6 +1314,10 @@ pub const SessionManager = struct {
                     session.agent.total_tokens = estimateRestoredSessionTokens(entries);
                 }
             }
+        }
+
+        if (session.agent.warm_start and session.agent.historyLen() == 0) {
+            session.agent.attemptWarmStart();
         }
 
         try self.sessions.put(self.allocator, owned_key, session);
@@ -2251,6 +2250,66 @@ fn expectPathEndsWith(path: []const u8, unix_path_suffix: []const u8) !void {
     const ends_unix = std.mem.endsWith(u8, path, unix_path_suffix);
     const ends_native = std.mem.endsWith(u8, path, native_suffix);
     try testing.expect(ends_unix or ends_native);
+}
+
+fn writeWarmStartMessageLog(
+    allocator: Allocator,
+    dir: std.fs.Dir,
+    relative_path: []const u8,
+    role: []const u8,
+    session_id: ?[]const u8,
+    content: []const u8,
+) !void {
+    if (std.fs.path.dirname(relative_path)) |parent| {
+        try dir.makePath(parent);
+    }
+
+    const session_field = if (session_id) |sid|
+        try std.fmt.allocPrint(allocator, "\"{s}\"", .{sid})
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(session_field);
+
+    const file_content = try std.fmt.allocPrint(
+        allocator,
+        "---\nrole: \"{s}\"\nsession_id: {s}\n---\n{s}\n",
+        .{ role, session_field, content },
+    );
+    defer allocator.free(file_content);
+
+    var file = try dir.createFile(relative_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(file_content);
+}
+
+fn countMessageLogFiles(dir: std.fs.Dir) !usize {
+    var messages_dir = dir.openDir("messages", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer messages_dir.close();
+
+    var total: usize = 0;
+    var iter = messages_dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".md")) {
+            total += 1;
+            continue;
+        }
+        if (entry.kind != .directory) continue;
+
+        var date_dir = try messages_dir.openDir(entry.name, .{ .iterate = true });
+        defer date_dir.close();
+
+        var date_iter = date_dir.iterate();
+        while (try date_iter.next()) |date_entry| {
+            if (date_entry.kind == .file and std.mem.endsWith(u8, date_entry.name, ".md")) {
+                total += 1;
+            }
+        }
+    }
+
+    return total;
 }
 
 // ---------------------------------------------------------------------------
@@ -3832,6 +3891,95 @@ test "processMessage runtime slash commands persist across reload" {
     try testing.expect(restored.agent.activation_mode == .mention);
     try testing.expect(restored.agent.send_mode == .inherit);
     try testing.expectEqual(@as(usize, 0), restored.agent.historyLen());
+}
+
+test "warm start skips replay when persisted session history exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agent.warm_start = true;
+
+    const session_key = "telegram:main:warm-start-restore";
+    try writeWarmStartMessageLog(
+        testing.allocator,
+        tmp.dir,
+        "messages/2026-03-22/120000_000000.md",
+        "user",
+        session_key,
+        "warm-start user",
+    );
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+    try store.saveMessage(session_key, "user", "persisted user");
+    try store.saveMessage(session_key, "assistant", "persisted assistant");
+
+    var mock = MockProvider{ .response = "ok" };
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        store,
+        null,
+    );
+    defer sm.deinit();
+
+    // Regression: warm-start should not prepend log replay onto sessions that
+    // already have persisted store-backed history.
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 2), session.agent.historyLen());
+    try testing.expectEqualStrings("persisted user", session.agent.history.items[0].content);
+    try testing.expectEqualStrings("persisted assistant", session.agent.history.items[1].content);
+}
+
+test "warm start restores message logs without duplicating files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agent.warm_start = true;
+    cfg.save_messages = true;
+
+    const session_key = "telegram:main:warm-start-replay";
+    try writeWarmStartMessageLog(
+        testing.allocator,
+        tmp.dir,
+        "messages/2026-03-22/121500_000000.md",
+        "assistant",
+        session_key,
+        "warm-start assistant",
+    );
+    try testing.expectEqual(@as(usize, 1), try countMessageLogFiles(tmp.dir));
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    // Regression: replayed history must not be logged back into workspace/messages/.
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 1), session.agent.historyLen());
+    try testing.expectEqualStrings("warm-start assistant\n", session.agent.history.items[0].content);
+    try testing.expectEqual(@as(usize, 1), try countMessageLogFiles(tmp.dir));
 }
 
 test "processMessage different keys — independent sessions" {
