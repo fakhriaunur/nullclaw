@@ -450,7 +450,7 @@ pub const OtelObserver = struct {
     pub fn init(allocator: std.mem.Allocator, endpoint: ?[]const u8, service_name: ?[]const u8) OtelObserver {
         return .{
             .allocator = allocator,
-            .endpoint = endpoint orelse "http://localhost:4318",
+            .endpoint = endpoint orelse "https://localhost:4318",
             .service_name = service_name orelse "nullclaw",
             .headers = &.{},
             .spans = .empty,
@@ -1500,7 +1500,7 @@ test "OtelObserver name" {
 test "OtelObserver init defaults" {
     var otel = OtelObserver.init(std.testing.allocator, null, null);
     defer otel.deinit();
-    try std.testing.expectEqualStrings("http://localhost:4318", otel.endpoint);
+    try std.testing.expectEqualStrings("https://localhost:4318", otel.endpoint);
     try std.testing.expectEqualStrings("nullclaw", otel.service_name);
     try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
 }
