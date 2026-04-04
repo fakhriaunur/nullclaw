@@ -479,9 +479,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else if (agent_memory_session_id) |memory_session_id| {
             agent.memory_session_id = memory_session_id;
         }
-        if (cfg.agent.warm_start) {
-            agent.attemptWarmStart();
-        }
         defer agent.deinit();
 
         // Enable streaming if provider supports it
@@ -589,9 +586,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         agent.memory_session_id = sid;
     } else if (agent_memory_session_id) |memory_session_id| {
         agent.memory_session_id = memory_session_id;
-    }
-    if (cfg.agent.warm_start) {
-        agent.attemptWarmStart();
     }
     defer agent.deinit();
 

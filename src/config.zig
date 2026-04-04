@@ -153,7 +153,6 @@ pub const Config = struct {
     legacy_default_model_detected: bool = false,
     default_temperature: f64 = 0.7,
     reasoning_effort: ?[]const u8 = null,
-    save_messages: bool = false,
 
     // Model routing and delegate agents
     model_routes: []const ModelRouteConfig = &.{},
@@ -857,7 +856,6 @@ pub const Config = struct {
         if (self.reasoning_effort) |value| {
             try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
         }
-        try w.print("  \"save_messages\": {s},\n", .{if (self.save_messages) "true" else "false"});
 
         // models.providers
         if (self.providers.len > 0) {

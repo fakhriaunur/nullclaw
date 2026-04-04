@@ -709,10 +709,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
-    if (root.get("save_messages")) |v| {
-        if (v == .bool) self.save_messages = v.bool;
-    }
-
     // Model routes
     if (root.get("model_routes")) |v| {
         if (v == .array) {

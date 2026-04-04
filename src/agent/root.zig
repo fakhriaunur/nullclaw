@@ -27,9 +27,6 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const verbose_mod = @import("../verbose.zig");
-const telemetry = @import("../telemetry/message_log.zig");
-const fs_compat = @import("../fs_compat.zig");
-const ToolCall = providers.ToolCall;
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -319,10 +316,6 @@ pub const Agent = struct {
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
     log_llm_io: bool = false,
-    save_messages: bool = false,
-    message_logger: ?telemetry.MessageLogger = null,
-    warm_start: bool = false,
-    warm_start_max_messages: u32 = 30,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
@@ -390,50 +383,11 @@ pub const Agent = struct {
 
     /// Append a history message that owns its content.
     /// On append failure, the message is deinitialized to avoid leaks.
-    fn appendOwnedHistoryMessage(
-        self: *Agent,
-        msg: OwnedMessage,
-        tool_calls: []const ParsedToolCall,
-        display_text: ?[]const u8,
-    ) !void {
+    fn appendOwnedHistoryMessage(self: *Agent, msg: OwnedMessage) !void {
         self.history.append(self.allocator, msg) catch |err| {
             msg.deinit(self.allocator);
             return err;
         };
-
-        // Log to file if message logging is enabled and message is user or assistant
-        if (self.message_logger) |*logger| {
-            if (msg.role == .user or msg.role == .assistant) {
-                // Use display_text if provided, else content. For assistant with tool calls,
-                // display_text should be the clean user-facing text (without tool blocks).
-                const body = if (display_text != null) display_text.? else msg.content;
-
-                if (tool_calls.len > 0) {
-                    var logs = try self.allocator.alloc(telemetry.MessageLogger.ToolCallLog, tool_calls.len);
-                    errdefer self.allocator.free(logs);
-                    for (tool_calls, 0..) |call, i| {
-                        logs[i] = .{
-                            .name = call.name,
-                            .arguments_json = call.arguments_json,
-                        };
-                    }
-                    logger.logMessage(
-                        @tagName(msg.role),
-                        body,
-                        self.memory_session_id,
-                        logs,
-                    );
-                    self.allocator.free(logs);
-                } else {
-                    logger.logMessage(
-                        @tagName(msg.role),
-                        body,
-                        self.memory_session_id,
-                        null,
-                    );
-                }
-            }
-        }
     }
 
     /// Initialize agent from a loaded Config.
@@ -508,17 +462,6 @@ pub const Agent = struct {
             effective_workspace_dir,
         ) catch null;
 
-        // Initialize message logger if save_messages is enabled
-        var message_logger: ?telemetry.MessageLogger = null;
-        if (cfg.save_messages) {
-            const init_result = telemetry.MessageLogger.init(allocator, effective_workspace_dir, true);
-            message_logger = if (init_result) |logger| logger else |err| blk: {
-                // Log failure but continue without message logging
-                std.debug.print("MessageLogger.init failed: {s}\n", .{@errorName(err)});
-                break :blk null;
-            };
-        }
-
         return .{
             .allocator = allocator,
             .provider = provider_i,
@@ -555,10 +498,6 @@ pub const Agent = struct {
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .log_tool_calls = cfg.diagnostics.log_tool_calls,
             .log_llm_io = cfg.diagnostics.log_llm_io,
-            .save_messages = cfg.save_messages,
-            .message_logger = message_logger,
-            .warm_start = cfg.agent.warm_start,
-            .warm_start_max_messages = cfg.agent.warm_start_max_messages,
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
@@ -606,310 +545,6 @@ pub const Agent = struct {
         }
         self.degraded_routes.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
-        if (self.message_logger) |*logger| {
-            logger.deinit();
-        }
-    }
-
-    /// Parse a message log file (YAML frontmatter + content).
-    /// Returns role, optional session_id, and content (slice into data).
-    fn parseMessageFile(self: *Agent, data: []const u8) !struct {
-        role: providers.Role,
-        session_id: ?[]const u8,
-        content: []const u8,
-    } {
-        _ = self; // unused
-        var pos: usize = 0;
-        var line_start: usize = 0;
-        var state: enum { before_frontmatter, in_frontmatter, after_frontmatter } = .before_frontmatter;
-        var role_str: ?[]const u8 = null;
-        var session_id_slice: ?[]const u8 = null;
-        var content_start: usize = 0;
-
-        while (pos < data.len) {
-            if (data[pos] == '\n') {
-                const line = data[line_start..pos]; // exclude newline
-                pos += 1;
-                line_start = pos;
-
-                // Trim trailing '\r' if present (Windows line endings)
-                const line_clean = if (std.mem.endsWith(u8, line, "\r")) line[0 .. line.len - 1] else line;
-
-                if (state == .before_frontmatter) {
-                    if (std.mem.eql(u8, line_clean, "---")) {
-                        state = .in_frontmatter;
-                    } else {
-                        return error.NoFrontmatter;
-                    }
-                } else if (state == .in_frontmatter) {
-                    if (std.mem.eql(u8, line_clean, "---")) {
-                        state = .after_frontmatter;
-                        content_start = line_start;
-                        break;
-                    } else {
-                        // Parse "key: value"
-                        if (std.mem.indexOf(u8, line, ":")) |colon_idx| {
-                            const key = std.mem.trim(u8, line[0..colon_idx], " \t\r");
-                            const raw_val = std.mem.trim(u8, line[colon_idx + 1 ..], " \t\r");
-                            if (std.mem.eql(u8, key, "role")) {
-                                if (raw_val.len >= 2 and raw_val[0] == '"' and raw_val[raw_val.len - 1] == '"') {
-                                    role_str = raw_val[1 .. raw_val.len - 1];
-                                } else {
-                                    return error.InvalidRoleFormat;
-                                }
-                            } else if (std.mem.eql(u8, key, "session_id")) {
-                                if (std.mem.eql(u8, raw_val, "null")) {
-                                    session_id_slice = null;
-                                } else if (raw_val.len >= 2 and raw_val[0] == '"' and raw_val[raw_val.len - 1] == '"') {
-                                    session_id_slice = raw_val[1 .. raw_val.len - 1];
-                                } else {
-                                    return error.InvalidSessionIdFormat;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                pos += 1;
-            }
-        }
-
-        if (state != .after_frontmatter) return error.NoClosingDelimiter;
-        if (role_str == null) return error.MissingRole;
-
-        const role = providers.Role.fromSlice(role_str.?) orelse return error.UnknownRole;
-
-        return .{
-            .role = role,
-            .session_id = session_id_slice,
-            .content = data[content_start..],
-        };
-    }
-
-    /// Warm start: Rebuild conversation history from saved message logs.
-    pub fn attemptWarmStart(self: *Agent) void {
-        // Guard: skip if history already exists or workspace_dir is empty
-        if (self.history.items.len > 0 or self.workspace_dir.len == 0) {
-            log.debug("Warm start: skipped (history already has {d} entries or workspace_dir empty)", .{self.history.items.len});
-            return;
-        }
-
-        // Build messages directory path
-        const messages_dir = std.fs.path.join(self.allocator, &.{ self.workspace_dir, "messages" }) catch |err| {
-            log.warn("Warm start: failed to construct messages directory path: {s}", .{@errorName(err)});
-            return;
-        };
-        defer self.allocator.free(messages_dir);
-
-        // Verify messages_dir exists and is accessible
-        std.fs.accessAbsolute(messages_dir, .{}) catch |err| {
-            if (err == error.FileNotFound or err == error.NotDir) {
-                // No messages directory; nothing to warm start
-                log.info("Warm start: messages directory does not exist", .{});
-                return;
-            }
-            log.warn("Warm start: cannot access messages directory '{s}': {s}", .{ messages_dir, @errorName(err) });
-            return;
-        };
-        log.info("Warm start: scanning messages dir: {s}", .{messages_dir});
-
-        // Recursively collect all .md files
-        var files = std.ArrayList([]const u8).empty;
-        defer {
-            for (files.items) |file_path| {
-                self.allocator.free(file_path);
-            }
-            files.deinit(self.allocator);
-        }
-
-        var dirs_to_visit = std.ArrayList([]const u8).empty;
-        defer {
-            for (dirs_to_visit.items) |dir_path| {
-                self.allocator.free(dir_path);
-            }
-            dirs_to_visit.deinit(self.allocator);
-        }
-
-        const initial_dir = self.allocator.dupe(u8, messages_dir) catch |err| {
-            log.warn("Warm start: failed to allocate initial dir path: {s}", .{@errorName(err)});
-            return;
-        };
-        errdefer self.allocator.free(initial_dir);
-
-        dirs_to_visit.append(self.allocator, initial_dir) catch |err| {
-            self.allocator.free(initial_dir);
-            log.warn("Warm start: failed to allocate initial dir: {s}", .{@errorName(err)});
-            return;
-        };
-
-        while (dirs_to_visit.items.len > 0) {
-            const current_dir = dirs_to_visit.pop().?;
-            var dir = std.fs.openDirAbsolute(current_dir, .{ .iterate = true }) catch |err| {
-                log.warn("Warm start: failed to open directory '{s}': {s}", .{ current_dir, @errorName(err) });
-                self.allocator.free(current_dir);
-                continue;
-            };
-            defer dir.close();
-
-            var iter = dir.iterate();
-            while (true) {
-                const entry = iter.next() catch |err| {
-                    log.warn("Warm start: directory iteration error in '{s}': {s}", .{ current_dir, @errorName(err) });
-                    continue;
-                } orelse break;
-                // Skip special entries
-                if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
-
-                if (entry.kind == .file) {
-                    if (std.mem.endsWith(u8, entry.name, ".md")) {
-                        const full_path = std.fs.path.join(self.allocator, &.{ current_dir, entry.name }) catch |err| {
-                            log.warn("Warm start: failed to allocate file path: {s}", .{@errorName(err)});
-                            continue;
-                        };
-                        files.append(self.allocator, full_path) catch |err| {
-                            self.allocator.free(full_path);
-                            log.warn("Warm start: failed to append file path: {s}", .{@errorName(err)});
-                        };
-                    }
-                } else if (entry.kind == .directory) {
-                    const subdir_path = std.fs.path.join(self.allocator, &.{ current_dir, entry.name }) catch |err| {
-                        log.warn("Warm start: failed to allocate subdir path: {s}", .{@errorName(err)});
-                        continue;
-                    };
-                    dirs_to_visit.append(self.allocator, subdir_path) catch |err| {
-                        self.allocator.free(subdir_path);
-                        log.warn("Warm start: failed to append subdir: {s}", .{@errorName(err)});
-                    };
-                }
-            }
-            // Free the current_dir path after we're done with it
-            self.allocator.free(current_dir);
-        }
-
-        if (files.items.len == 0) {
-            log.info("Warm start: no markdown files found", .{});
-            return;
-        }
-        log.info("Warm start: found {d} markdown files, sorting...", .{files.items.len});
-
-        // Sort lexicographically (oldest first)
-        std.mem.sort([]const u8, files.items, {}, struct {
-            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lessThan);
-
-        const max_to_load = @min(self.warm_start_max_messages, self.max_history_messages);
-        var records = std.ArrayList(struct { role: providers.Role, content: []u8 }).empty;
-        defer records.deinit(self.allocator);
-
-        var skipped_session_mismatch: usize = 0;
-        var skipped_system: usize = 0;
-        var skipped_parse: usize = 0;
-        var skipped_other: usize = 0;
-
-        // Iterate from newest to oldest
-        var i = files.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (records.items.len >= max_to_load) break;
-            const file_path = files.items[i];
-
-            var file = std.fs.openFileAbsolute(file_path, .{ .mode = .read_only }) catch |err| {
-                log.warn("Warm start: failed to open message file '{s}': {s}", .{ file_path, @errorName(err) });
-                skipped_other += 1;
-                continue;
-            };
-            defer file.close();
-
-            const file_stat = fs_compat.stat(file) catch |err| {
-                log.warn("Warm start: failed to stat message file '{s}': {s}", .{ file_path, @errorName(err) });
-                skipped_other += 1;
-                continue;
-            };
-            const file_size = file_stat.size;
-
-            var file_buf = self.allocator.alloc(u8, file_size) catch |err| {
-                log.warn("Warm start: allocation failed for file buffer (size {d}): {s}", .{ file_size, @errorName(err) });
-                skipped_other += 1;
-                continue;
-            };
-            defer self.allocator.free(file_buf);
-
-            const read_len = file.readAll(file_buf) catch |err| {
-                log.warn("Warm start: failed to read file '{s}': {s}", .{ file_path, @errorName(err) });
-                skipped_other += 1;
-                continue;
-            };
-            if (read_len < file_size) {
-                log.warn("Warm start: incomplete read of file '{s}': expected {d}, got {d}", .{ file_path, file_size, read_len });
-                skipped_other += 1;
-                continue;
-            }
-
-            const parsed = self.parseMessageFile(file_buf[0..read_len]) catch |err| {
-                log.warn("Warm start: parse error in file '{s}': {s}", .{ file_path, @errorName(err) });
-                skipped_parse += 1;
-                continue;
-            };
-
-            // Skip system messages
-            if (parsed.role == .system) {
-                skipped_system += 1;
-                continue;
-            }
-
-            // Enforce session ID match if configured: only skip if the message
-            // has a non-null session_id that doesn't match the current session.
-            // Messages with null session_id (legacy logs) are always included.
-            if (self.memory_session_id != null) {
-                if (parsed.session_id != null and !std.mem.eql(u8, parsed.session_id.?, self.memory_session_id.?)) {
-                    skipped_session_mismatch += 1;
-                    continue;
-                }
-            }
-
-            // Duplicate content for history
-            const owned_content = self.allocator.dupe(u8, parsed.content) catch |err| {
-                log.warn("Warm start: allocation failed for content: {s}", .{@errorName(err)});
-                skipped_other += 1;
-                continue;
-            };
-
-            records.append(self.allocator, .{ .role = parsed.role, .content = owned_content }) catch |err| {
-                self.allocator.free(owned_content);
-                log.warn("Warm start: failed to append record: {s}", .{@errorName(err)});
-                skipped_other += 1;
-                continue;
-            };
-        }
-
-        if (records.items.len == 0) {
-            log.info("Warm start: no valid messages loaded (skipped: system={d}, parse={d}, session_mismatch={d}, other={d})", .{ skipped_system, skipped_parse, skipped_session_mismatch, skipped_other });
-            return;
-        }
-
-        log.info("Warm start: loaded {d} valid messages (examined up to {d} files)", .{ records.items.len, max_to_load });
-
-        // Reverse to chronological order (oldest first)
-        std.mem.reverse(@TypeOf(records.items[0]), records.items);
-
-        // Append messages to history in chronological order
-        var appended: usize = 0;
-        for (records.items) |rec| {
-            // Warm-start rehydrates existing history; do not write duplicate
-            // message-log files while replaying that history.
-            self.history.append(self.allocator, .{
-                .role = rec.role,
-                .content = rec.content,
-            }) catch |err| {
-                log.warn("Warm start: failed to append message to history: {s}", .{@errorName(err)});
-                self.allocator.free(rec.content);
-                continue;
-            };
-            appended += 1;
-        }
-        log.info("Warm start: complete, {d} messages appended to history", .{appended});
     }
 
     pub fn requestInterrupt(self: *Agent) void {
@@ -983,10 +618,10 @@ pub const Agent = struct {
         else
             try self.allocator.dupe(u8, "Interrupted by /stop. Halting tool execution for this turn.");
         errdefer self.allocator.free(msg);
-        try self.appendOwnedHistoryMessage(.{
+        try self.history.append(self.allocator, .{
             .role = .assistant,
             .content = try self.allocator.dupe(u8, msg),
-        }, &[_]ParsedToolCall{}, null);
+        });
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
         return msg;
@@ -2113,7 +1748,7 @@ pub const Agent = struct {
             try self.allocator.dupe(u8, effective_user_message);
 
         // Keep the user message retained even if provider/tool steps fail.
-        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched }, &[_]ParsedToolCall{}, null);
+        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
 
         // ── Response cache check ──
         if (self.response_cache) |rc| {
@@ -2127,10 +1762,10 @@ pub const Agent = struct {
                 errdefer self.allocator.free(cached_response);
                 const history_copy = try self.allocator.dupe(u8, cached_response);
                 errdefer self.allocator.free(history_copy);
-                try self.appendOwnedHistoryMessage(.{
+                try self.history.append(self.allocator, .{
                     .role = .assistant,
                     .content = history_copy,
-                }, &[_]ParsedToolCall{}, null);
+                });
                 self.last_turn_usage = .{};
                 return cached_response;
             }
@@ -2517,7 +2152,7 @@ pub const Agent = struct {
                     if (empty_response_retry_count < 1 and
                         iteration + 1 < self.max_tool_iterations)
                     {
-                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.") }, &[_]ParsedToolCall{}, null);
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.") });
                         self.trimHistory();
                         empty_response_retry_count += 1;
                         continue;
@@ -2534,10 +2169,10 @@ pub const Agent = struct {
                     iteration + 1 < self.max_tool_iterations and
                     shouldForceActionFollowThrough(display_text))
                 {
-                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.allocator.dupe(u8, display_text) }, &[_]ParsedToolCall{}, null);
+                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.allocator.dupe(u8, display_text) });
                     try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
                         "Do it in this turn by issuing the appropriate tool call(s). " ++
-                        "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.") }, &[_]ParsedToolCall{}, null);
+                        "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.") });
                     self.trimHistory();
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
@@ -2555,10 +2190,10 @@ pub const Agent = struct {
                 errdefer self.allocator.free(final_text);
 
                 // Dupe from display_text directly (not from final_text) to avoid double-dupe
-                try self.appendOwnedHistoryMessage(.{
+                try self.history.append(self.allocator, .{
                     .role = .assistant,
                     .content = try self.allocator.dupe(u8, display_text),
-                }, &[_]ParsedToolCall{}, null);
+                });
 
                 // Auto-compaction before hard trimming to preserve context
                 self.last_turn_compacted = self.autoCompactHistory() catch false;
@@ -2636,13 +2271,7 @@ pub const Agent = struct {
             } else try self.allocator.dupe(u8, assistant_history_content);
 
             // Once appended, history owns the buffer.
-            // Use parsed_calls (which includes XML-parsed tool calls), not response.tool_calls (native only).
-            // Pass display_text for clean logging body (tool calls go in frontmatter only).
-            try self.appendOwnedHistoryMessage(
-                .{ .role = .assistant, .content = assistant_content },
-                parsed_calls,
-                if (parsed_calls.len > 0) display_text else null,
-            );
+            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = assistant_content });
 
             // Execute each tool call
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
@@ -2737,10 +2366,10 @@ pub const Agent = struct {
                     "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up.",
                 .{scrubbed_results},
             );
-            try self.appendOwnedHistoryMessage(.{
+            try self.history.append(self.allocator, .{
                 .role = .user,
                 .content = try self.allocator.dupe(u8, with_reflection),
-            }, &[_]ParsedToolCall{}, null);
+            });
 
             self.trimHistory();
 
@@ -2756,12 +2385,12 @@ pub const Agent = struct {
         log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
 
         // Append a pseudo-user message forcing a text-only summary
-        try self.appendOwnedHistoryMessage(.{
+        try self.history.append(self.allocator, .{
             .role = .user,
             .content = try self.allocator.dupe(u8, "SYSTEM: You have reached the maximum number of tool iterations. " ++
                 "You MUST NOT call any more tools. Summarize what you have accomplished " ++
                 "so far and what remains to be done. Respond in the same language the user used."),
-        }, &[_]ParsedToolCall{}, null);
+        });
 
         // Build messages for the summary call
         const summary_messages = self.buildMessageSlice() catch {
@@ -2830,10 +2459,10 @@ pub const Agent = struct {
         errdefer self.allocator.free(prefixed);
 
         // Store in history (dupe the raw summary, not the prefixed version)
-        try self.appendOwnedHistoryMessage(.{
+        try self.history.append(self.allocator, .{
             .role = .assistant,
             .content = try self.allocator.dupe(u8, summary_text),
-        }, &[_]ParsedToolCall{}, null);
+        });
 
         // Compact/trim history so the next turn doesn't start with bloated context
         self.last_turn_compacted = self.autoCompactHistory() catch false;

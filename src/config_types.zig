@@ -242,11 +242,6 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
-    /// When true, on agent startup, attempt to reconstruct conversation history
-    /// from previously saved message logs in workspace/messages/.
-    warm_start: bool = false,
-    /// Maximum number of messages to load during warm start (default: 30).
-    warm_start_max_messages: u32 = 30,
 
     pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
         if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;
@@ -1066,7 +1061,6 @@ pub const MemoryConfig = struct {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "markdown";
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
                 if (!self.search.query.hybrid.temporal_decay.enabled) self.search.query.hybrid.temporal_decay.enabled = true;
-                if (self.search.query.hybrid.temporal_decay.half_life_days == 0) self.search.query.hybrid.temporal_decay.half_life_days = 30;
                 if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .postgres_keyword => {
@@ -1940,4 +1934,38 @@ test "ProviderEntry.max_streaming_prompt_bytes defaults to null" {
 test "ProviderEntry.api_mode defaults to chat_completions" {
     const pe = ProviderEntry{ .name = "test" };
     try std.testing.expectEqual(ProviderEntry.ApiMode.chat_completions, pe.api_mode);
+}
+
+test "markdown_only profile enables markdown retrieval defaults" {
+    var cfg = MemoryConfig{
+        .profile = "markdown_only",
+    };
+
+    cfg.applyProfileDefaults();
+
+    try std.testing.expectEqualStrings("markdown", cfg.backend);
+    try std.testing.expect(cfg.search.query.hybrid.enabled);
+    try std.testing.expect(cfg.search.query.hybrid.temporal_decay.enabled);
+    try std.testing.expectEqual(@as(u32, 30), cfg.search.query.hybrid.temporal_decay.half_life_days);
+    try std.testing.expectEqualStrings("on", cfg.reliability.rollout_mode);
+}
+
+test "markdown_only profile preserves explicit half-life override" {
+    var cfg = MemoryConfig{
+        .profile = "markdown_only",
+        .search = .{
+            .query = .{
+                .hybrid = .{
+                    .temporal_decay = .{
+                        .half_life_days = 0,
+                    },
+                },
+            },
+        },
+    };
+
+    cfg.applyProfileDefaults();
+
+    // Regression: markdown_only should not clobber an explicit half-life override.
+    try std.testing.expectEqual(@as(u32, 0), cfg.search.query.hybrid.temporal_decay.half_life_days);
 }
