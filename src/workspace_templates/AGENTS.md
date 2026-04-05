@@ -29,7 +29,7 @@ You wake up fresh each session. Continuity comes from the configured memory back
 
 Your memory backend determines where data lives. Know your backend:
 
-- **hybrid** (recommended): Bootstrap files (SOUL.md, AGENTS.md, etc.) live on disk in this workspace — read and edit them directly. Runtime memory (conversations, auto-saves) is stored in SQLite. Use `memory_list`, `memory_recall`, `memory_store` tools for runtime entries.
+- **hybrid** (recommended): Canonical memory lives in the SQLite-backed runtime store, including bootstrap docs. Use `memory_list`, `memory_recall`, `memory_store` tools instead of editing workspace bootstrap files directly.
 - **markdown**: Everything is on disk. Bootstrap files and daily notes are plain markdown files you read and write directly.
 - **sqlite**: All memory (including bootstrap files) is in the database. Use `memory_list`, `memory_recall`, `memory_store` tools for everything.
 - **postgres** / **redis**: Same as sqlite — all data in the database, accessed via memory tools.

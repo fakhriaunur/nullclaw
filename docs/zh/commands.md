@@ -124,10 +124,17 @@
 | `nullclaw memory count` | 查看总条目数 |
 | `nullclaw memory reindex` | 重建向量索引 |
 | `nullclaw memory search "query" --limit 10` | 执行检索 |
-| `nullclaw memory get <key>` | 查看单条 memory |
-| `nullclaw memory list --category task --limit 20` | 按分类列出 memory |
+| `nullclaw memory get <key> --session-id sess-a` | 查看单条 memory，也可限定 session 作用域 |
+| `nullclaw memory list --category task --session-id sess-a --limit 20` | 按分类和可选 session 作用域列出 memory |
+| `nullclaw memory put <key> <content>` | 写入或更新一条 memory |
+| `nullclaw memory merge-object <key> '{"theme":"dark"}'` | 以确定性方式把 JSON 对象合并进 memory |
+| `nullclaw memory merge-set <key> concise` | 以确定性方式把单值或 JSON 数组合并进字符串集合 memory |
+| `nullclaw memory delete <key> --session-id sess-a` | 删除一条 memory，可限定全局或单个 session |
+| `nullclaw memory events --after 42 --limit 10 --json` | 查看确定性的 memory event feed |
+| `nullclaw memory checkpoint` | 导出当前 memory checkpoint（NDJSON） |
+| `nullclaw memory apply checkpoint.ndjson` | 从文件或 stdin 应用 checkpoint / event feed |
+| `nullclaw memory compact` | checkpoint 后压缩确定性的 memory event feed |
 | `nullclaw memory drain-outbox` | 清空 durable vector outbox 队列 |
-| `nullclaw memory forget <key>` | 删除一条 memory |
 
 ### Workspace / Capabilities / Models / Migrate
 
@@ -147,8 +154,8 @@
 
 说明：
 
-- `workspace edit` 只适用于 file-based backend（如 `markdown`、`hybrid`）。
-- 如果当前 memory backend 把 bootstrap 数据放在数据库里，CLI 会提示改用 agent 的 `memory_store` 工具，或切回 file-based backend。
+- `workspace edit` 只适用于 `markdown` backend。
+- 如果当前 bootstrap 数据保存在 backend-native memory store 里，CLI 会提示改用 agent 的 `memory_store` 工具。
 
 ## 硬件与自动化集成
 

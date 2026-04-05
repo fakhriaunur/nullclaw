@@ -138,10 +138,17 @@ Notes:
 | `nullclaw memory count` | Show total number of memory entries |
 | `nullclaw memory reindex` | Rebuild the vector index |
 | `nullclaw memory search "query" --limit 10` | Run retrieval against memory |
-| `nullclaw memory get <key>` | Show one memory entry |
-| `nullclaw memory list --category task --limit 20` | List memory entries by category |
+| `nullclaw memory get <key> --session-id sess-a` | Show one memory entry, optionally within a session scope |
+| `nullclaw memory list --category task --session-id sess-a --limit 20` | List memory entries by category and optional session scope |
+| `nullclaw memory put <key> <content>` | Store or update one memory entry |
+| `nullclaw memory merge-object <key> '{"theme":"dark"}'` | Deterministically merge a JSON object into memory |
+| `nullclaw memory merge-set <key> concise` | Deterministically union a value or JSON array into a string-set memory |
+| `nullclaw memory delete <key> --session-id sess-a` | Delete one memory entry, globally or in one session scope |
+| `nullclaw memory events --after 42 --limit 10 --json` | Inspect the deterministic memory event feed |
+| `nullclaw memory checkpoint` | Export the current memory checkpoint as NDJSON |
+| `nullclaw memory apply checkpoint.ndjson` | Apply a checkpoint or event feed from a file or stdin |
+| `nullclaw memory compact` | Compact the deterministic memory event feed after checkpointing |
 | `nullclaw memory drain-outbox` | Drain the durable vector outbox queue |
-| `nullclaw memory forget <key>` | Delete one memory entry |
 
 ### `workspace`, `capabilities`, `models`, `migrate`
 
@@ -161,8 +168,8 @@ Notes:
 
 Notes:
 
-- `workspace edit` works only with file-based backends such as `markdown` and `hybrid`.
-- If bootstrap data is stored in the database backend, the CLI will tell you to use the agent's `memory_store` tool instead.
+- `workspace edit` works only with the `markdown` backend.
+- If bootstrap data is stored in a backend-native memory store, the CLI will tell you to use the agent's `memory_store` tool instead.
 
 ## Hardware and automation-facing entry points
 

@@ -43,8 +43,76 @@ pub const MarkdownProjectionMemory = struct {
         self.allocator.free(self.workspace_dir);
     }
 
+    // Parse timestamp from filename (e.g., "2024-03-04-1243.md") or return 0.
+    // Supports YYYY-MM-DD, YYYY-MM-DD-HHMM, YYYY-MM-DD-HHMMSS.
+    fn parseTimestamp(filename: []const u8) i64 {
+        // Skip evergreen names
+        if (std.mem.eql(u8, filename, "MEMORY.md") or std.mem.eql(u8, filename, "memory.md")) {
+            return 0;
+        }
+
+        // Remove .md extension if present
+        const name = if (std.mem.endsWith(u8, filename, ".md"))
+            filename[0 .. filename.len - 3]
+        else
+            filename;
+
+        // Parse YYYY-MM-DD[-HHMM[SS]]
+        var parts = std.mem.splitScalar(u8, name, '-');
+        const year_str = parts.next() orelse return 0;
+        const month_str = parts.next() orelse return 0;
+        const day_str = parts.next() orelse return 0;
+        const time_str = parts.next(); // optional: HHMM or HHMMSS
+
+        const year = std.fmt.parseInt(i16, year_str, 10) catch return 0;
+        const month = std.fmt.parseInt(u8, month_str, 10) catch return 0;
+        const day = std.fmt.parseInt(u8, day_str, 10) catch return 0;
+
+        // Basic validation
+        if (month < 1 or month > 12) return 0;
+        if (day < 1 or day > 31) return 0;
+
+        const epoch_day = ymdToEpochDays(year, month, day);
+        var total_seconds: i64 = epoch_day * 86400;
+
+        // If time part exists, add hours, minutes, and optional seconds
+        if (time_str) |t| {
+            if (t.len >= 4) {
+                const hour = std.fmt.parseInt(u8, t[0..2], 10) catch 0;
+                const minute = std.fmt.parseInt(u8, t[2..4], 10) catch 0;
+                total_seconds += @as(i64, @intCast(hour)) * 3600 + @as(i64, @intCast(minute)) * 60;
+                if (t.len >= 6) {
+                    const second = std.fmt.parseInt(u8, t[4..6], 10) catch 0;
+                    total_seconds += @as(i64, @intCast(second));
+                }
+            }
+        }
+
+        return total_seconds;
+    }
+
+    // Convert Gregorian Y-M-D to days since 1970-01-01 (epoch day 0) using Julian Day Number.
+    fn ymdToEpochDays(year: i16, month: u8, day: u8) i64 {
+        var y = @as(i32, @intCast(year));
+        var m = @as(i32, @intCast(month));
+        if (m <= 2) {
+            y -= 1;
+            m += 12;
+        }
+        const era = if (y >= 0) @divTrunc(y, 400) else @divTrunc(y - 399, 400);
+        const yoe = @as(u32, @intCast(y - era * 400)); // [0, 399]
+        const doy = @as(u32, @intCast(@divTrunc(153 * @as(i32, m - 3) + 2, 5))) + @as(u32, @intCast(day)) - 1; // [0, 365]
+        const doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+        const days = era * 146097 + @as(i64, @intCast(doe)) - 719468;
+        return days;
+    }
+
     fn corePath(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{self.workspace_dir});
+    }
+
+    fn rootPath(self: *const Self, allocator: std.mem.Allocator, filename: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.workspace_dir, filename });
     }
 
     fn memoryDir(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
@@ -243,12 +311,17 @@ pub const MarkdownProjectionMemory = struct {
         }
     }
 
-    fn parseEntries(text: []const u8, filename: []const u8, category: MemoryCategory, allocator: std.mem.Allocator) ![]MemoryEntry {
+    // Modified: now receives file_timestamp as argument (computed from filename or mtime)
+    fn parseEntries(text: []const u8, filename: []const u8, category: MemoryCategory, allocator: std.mem.Allocator, file_timestamp: i64) ![]MemoryEntry {
         var entries: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
             for (entries.items) |*e| e.deinit(allocator);
             entries.deinit(allocator);
         }
+
+        // Convert file_timestamp to string; if file_timestamp is 0, that's fine (unknown)
+        const timestamp_str = try std.fmt.allocPrint(allocator, "{d}", .{file_timestamp});
+        errdefer allocator.free(timestamp_str);
 
         var line_idx: usize = 0;
         var iter = std.mem.splitScalar(u8, text, '\n');
@@ -305,7 +378,7 @@ pub const MarkdownProjectionMemory = struct {
             errdefer allocator.free(key);
             const content_dup = try allocator.dupe(u8, value_slice);
             errdefer allocator.free(content_dup);
-            const timestamp = try allocator.dupe(u8, filename);
+            const timestamp = try allocator.dupe(u8, timestamp_str);
             errdefer allocator.free(timestamp);
 
             try entries.append(allocator, MemoryEntry{
@@ -321,6 +394,9 @@ pub const MarkdownProjectionMemory = struct {
             line_idx += 1;
         }
 
+        // Free the template timestamp string; each entry has its own copy.
+        allocator.free(timestamp_str);
+
         return entries.toOwnedSlice(allocator);
     }
 
@@ -331,14 +407,55 @@ pub const MarkdownProjectionMemory = struct {
             all.deinit(allocator);
         }
 
-        const root_path = try self.corePath(allocator);
-        defer allocator.free(root_path);
-        if (fs_compat.readFileAlloc(std.fs.cwd(), allocator, root_path, 1024 * 1024)) |content| {
+        var seen_root_paths: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var key_it = seen_root_paths.keyIterator();
+            while (key_it.next()) |key| allocator.free(key.*);
+            seen_root_paths.deinit(allocator);
+        }
+
+        const root_candidates = [_]struct {
+            filename: []const u8,
+            label: []const u8,
+        }{
+            .{ .filename = "MEMORY.md", .label = "MEMORY" },
+            .{ .filename = "memory.md", .label = "memory" },
+        };
+
+        for (root_candidates) |candidate| {
+            const root_path = try self.rootPath(allocator, candidate.filename);
+            defer allocator.free(root_path);
+
+            // Open file, get its stat, then read content in one go.
+            const file = std.fs.cwd().openFile(root_path, .{}) catch continue;
+            defer file.close();
+            const stat = fs_compat.stat(file) catch continue;
+            const content = file.readToEndAlloc(allocator, 1024 * 1024) catch continue;
             defer allocator.free(content);
-            const entries = try parseEntries(content, "MEMORY", .core, allocator);
+
+            const canonical = std.fs.realpathAlloc(allocator, root_path) catch
+                try allocator.dupe(u8, root_path);
+            errdefer allocator.free(canonical);
+            if (seen_root_paths.contains(canonical)) {
+                allocator.free(canonical);
+                continue;
+            }
+            try seen_root_paths.put(allocator, canonical, {});
+
+            // Resolve timestamp: parse from filename, else use file mtime (converted to seconds).
+            const file_timestamp = blk: {
+                const parsed = parseTimestamp(candidate.filename);
+                if (parsed != 0) {
+                    break :blk parsed;
+                } else {
+                    break :blk @as(i64, @intCast(@divTrunc(stat.mtime, std.time.ns_per_s)));
+                }
+            };
+
+            const entries = try parseEntries(content, candidate.label, .core, allocator, file_timestamp);
             defer allocator.free(entries);
             for (entries) |e| try all.append(allocator, e);
-        } else |_| {}
+        }
 
         const md = try self.memoryDir(allocator);
         defer allocator.free(md);
@@ -350,14 +467,29 @@ pub const MarkdownProjectionMemory = struct {
                 if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
                 const fpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ md, entry.name });
                 defer allocator.free(fpath);
-                if (fs_compat.readFileAlloc(std.fs.cwd(), allocator, fpath, 1024 * 1024)) |content| {
-                    defer allocator.free(content);
-                    const fname = entry.name[0 .. entry.name.len - 3];
-                    const inferred_category = MemoryCategory.fromString(fname);
-                    const entries = try parseEntries(content, fname, inferred_category, allocator);
-                    defer allocator.free(entries);
-                    for (entries) |e| try all.append(allocator, e);
-                } else |_| {}
+
+                const file = std.fs.cwd().openFile(fpath, .{}) catch continue;
+                defer file.close();
+                const stat = fs_compat.stat(file) catch continue;
+                const content = file.readToEndAlloc(allocator, 1024 * 1024) catch continue;
+                defer allocator.free(content);
+
+                const fname = entry.name[0 .. entry.name.len - 3];
+                const file_timestamp = blk: {
+                    const parsed = parseTimestamp(entry.name);
+                    if (parsed != 0) {
+                        break :blk parsed;
+                    } else {
+                        break :blk @as(i64, @intCast(@divTrunc(stat.mtime, std.time.ns_per_s)));
+                    }
+                };
+                const inferred_category = if (parseTimestamp(entry.name) != 0)
+                    MemoryCategory.daily
+                else
+                    MemoryCategory.fromString(fname);
+                const entries = try parseEntries(content, fname, inferred_category, allocator, file_timestamp);
+                defer allocator.free(entries);
+                for (entries) |e| try all.append(allocator, e);
             }
         } else |_| {}
 
@@ -876,8 +1008,18 @@ pub const MarkdownMemory = struct {
         return self.memory().list(allocator, null, null);
     }
 
-    pub fn parseEntries(text: []const u8, filename: []const u8, category: MemoryCategory, allocator: std.mem.Allocator) ![]MemoryEntry {
-        return MarkdownProjectionMemory.parseEntries(text, filename, category, allocator);
+    pub fn parseTimestamp(filename: []const u8) i64 {
+        return MarkdownProjectionMemory.parseTimestamp(filename);
+    }
+
+    pub fn parseEntries(
+        text: []const u8,
+        filename: []const u8,
+        category: MemoryCategory,
+        allocator: std.mem.Allocator,
+        file_timestamp: i64,
+    ) ![]MemoryEntry {
+        return MarkdownProjectionMemory.parseEntries(text, filename, category, allocator, file_timestamp);
     }
 
     fn projectionMemory(self: *Self) Memory {
@@ -2234,7 +2376,7 @@ test "markdown forget removes matching entry" {
 
 test "markdown parseEntries skips empty lines" {
     const text = "line one\n\n\nline two\n";
-    const entries = try MarkdownMemory.parseEntries(text, "test", .core, std.testing.allocator);
+    const entries = try MarkdownMemory.parseEntries(text, "test", .core, std.testing.allocator, 0);
     defer {
         for (entries) |*e| e.deinit(std.testing.allocator);
         std.testing.allocator.free(entries);
@@ -2246,7 +2388,7 @@ test "markdown parseEntries skips empty lines" {
 
 test "markdown parseEntries skips headings" {
     const text = "# Heading\nContent under heading\n## Sub\nMore content";
-    const entries = try MarkdownMemory.parseEntries(text, "test", .core, std.testing.allocator);
+    const entries = try MarkdownMemory.parseEntries(text, "test", .core, std.testing.allocator, 0);
     defer {
         for (entries) |*e| e.deinit(std.testing.allocator);
         std.testing.allocator.free(entries);
@@ -2258,7 +2400,7 @@ test "markdown parseEntries skips headings" {
 
 test "markdown parseEntries strips bullet prefix" {
     const text = "- Item one\n- Item two\nPlain line";
-    const entries = try MarkdownMemory.parseEntries(text, "test", .core, std.testing.allocator);
+    const entries = try MarkdownMemory.parseEntries(text, "test", .core, std.testing.allocator, 0);
     defer {
         for (entries) |*e| e.deinit(std.testing.allocator);
         std.testing.allocator.free(entries);
@@ -2271,7 +2413,7 @@ test "markdown parseEntries strips bullet prefix" {
 
 test "markdown parseEntries generates sequential ids" {
     const text = "a\nb\nc";
-    const entries = try MarkdownMemory.parseEntries(text, "myfile", .core, std.testing.allocator);
+    const entries = try MarkdownMemory.parseEntries(text, "myfile", .core, std.testing.allocator, 0);
     defer {
         for (entries) |*e| e.deinit(std.testing.allocator);
         std.testing.allocator.free(entries);
@@ -2283,21 +2425,21 @@ test "markdown parseEntries generates sequential ids" {
 }
 
 test "markdown parseEntries empty text returns empty" {
-    const entries = try MarkdownMemory.parseEntries("", "test", .core, std.testing.allocator);
+    const entries = try MarkdownMemory.parseEntries("", "test", .core, std.testing.allocator, 0);
     defer std.testing.allocator.free(entries);
     try std.testing.expectEqual(@as(usize, 0), entries.len);
 }
 
 test "markdown parseEntries only headings returns empty" {
     const text = "# Heading\n## Another\n### Third";
-    const entries = try MarkdownMemory.parseEntries(text, "test", .core, std.testing.allocator);
+    const entries = try MarkdownMemory.parseEntries(text, "test", .core, std.testing.allocator, 0);
     defer std.testing.allocator.free(entries);
     try std.testing.expectEqual(@as(usize, 0), entries.len);
 }
 
 test "markdown parseEntries preserves category" {
     const text = "content";
-    const entries = try MarkdownMemory.parseEntries(text, "test", .daily, std.testing.allocator);
+    const entries = try MarkdownMemory.parseEntries(text, "test", .daily, std.testing.allocator, 0);
     defer {
         for (entries) |*e| e.deinit(std.testing.allocator);
         std.testing.allocator.free(entries);
@@ -2562,4 +2704,31 @@ test "markdown compaction enforces cursor floor and survives reopen" {
         defer root.freeEvents(std.testing.allocator, tail);
         try std.testing.expectEqual(@as(usize, 0), tail.len);
     }
+}
+
+// ── Additional timestamp tests ──────────────────────────────────────
+
+test "markdown parseTimestamp parses YYYY-MM-DD" {
+    const ts = MarkdownMemory.parseTimestamp("2024-03-04.md");
+    try std.testing.expect(ts > 0);
+}
+
+test "markdown parseTimestamp parses YYYY-MM-DD-HHMM" {
+    const ts = MarkdownMemory.parseTimestamp("2024-03-04-1243.md");
+    try std.testing.expect(ts > 0);
+}
+
+test "markdown parseTimestamp parses YYYY-MM-DD-HHMMSS" {
+    const ts = MarkdownMemory.parseTimestamp("2024-03-04-124530.md");
+    try std.testing.expect(ts > 0);
+}
+
+test "markdown parseTimestamp returns 0 for MEMORY.md" {
+    try std.testing.expectEqual(@as(i64, 0), MarkdownMemory.parseTimestamp("MEMORY.md"));
+    try std.testing.expectEqual(@as(i64, 0), MarkdownMemory.parseTimestamp("memory.md"));
+}
+
+test "markdown parseTimestamp returns 0 for malformed" {
+    try std.testing.expectEqual(@as(i64, 0), MarkdownMemory.parseTimestamp("not-a-date.md"));
+    try std.testing.expectEqual(@as(i64, 0), MarkdownMemory.parseTimestamp("2024-13-01.md"));
 }
