@@ -4,9 +4,11 @@
 	.dependencies = .{},
 	.fingerprint = 0x42ce80b97512f264,
 	.paths = .{
+		"LICENSE",
 		"readme.md",
 		"build.zig",
 		"build.zig.zon",
 		"src",
+		"test_runner.zig",
 	},
 }
