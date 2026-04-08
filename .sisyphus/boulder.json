@@ -1,0 +1,48 @@
+{
+  "active_plan": "/home/pahri/workspace/fork/nullclaw/.sisyphus/plans/upstream-contribution-prep.md",
+  "started_at": "2026-04-08T10:38:38.691Z",
+  "session_ids": [
+    "ses_295b2dc02ffeOZADWWGYwSTnLN",
+    "ses_29339dbafffeX5f51f4BzpWExW",
+    "ses_29339d139ffe2MvlDlKP85HY04",
+    "ses_29339c6abffe7wcHqqYmDXSxAr"
+  ],
+  "session_origins": {
+    "ses_295b2dc02ffeOZADWWGYwSTnLN": "direct",
+    "ses_29339dbafffeX5f51f4BzpWExW": "appended",
+    "ses_29339d139ffe2MvlDlKP85HY04": "appended",
+    "ses_29339c6abffe7wcHqqYmDXSxAr": "appended"
+  },
+  "plan_name": "upstream-contribution-prep",
+  "agent": "atlas",
+  "worktree_path": "/home/pahri/workspace/fork/nullclaw-contribution-sprint",
+  "task_sessions": {
+    "todo:10": {
+      "task_key": "todo:10",
+      "task_label": "10",
+      "task_title": "Study Calculator Precision Fix Pattern",
+      "session_id": "ses_29339c6abffe7wcHqqYmDXSxAr",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-low",
+      "updated_at": "2026-04-08T11:11:21.792Z"
+    },
+    "todo:13": {
+      "task_key": "todo:13",
+      "task_label": "13",
+      "task_title": "Cross-Reference Patterns with Untested Files → Select Candidate",
+      "session_id": "ses_2932cb027ffeyBsOGPhKNk6h8q",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-low",
+      "updated_at": "2026-04-08T11:28:16.102Z"
+    },
+    "todo:14": {
+      "task_key": "todo:14",
+      "task_label": "14",
+      "task_title": "Write FAILING Regression Test (TDD: RED Step)",
+      "session_id": "ses_293256fd0ffex92DA2X64B2orV",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-low",
+      "updated_at": "2026-04-08T11:59:17.421Z"
+    }
+  }
+}
