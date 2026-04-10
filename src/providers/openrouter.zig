@@ -84,7 +84,7 @@ pub const OpenRouterProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
-            if (choices.array.items.len > 0) {
+            if (choices == .array and choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
                     if (msg.object.get("content")) |content| {
                         if (content == .string) {
@@ -115,7 +115,7 @@ pub const OpenRouterProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
-            if (choices.array.items.len > 0) {
+            if (choices == .array and choices.array.items.len > 0) {
                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
                 const msg_obj = msg.object;
 
@@ -162,7 +162,9 @@ pub const OpenRouterProvider = struct {
                     tool_calls_list.deinit(allocator);
                 }
 
-                if (msg_obj.get("tool_calls")) |tc_arr| {
+                // Regression: some OpenAI-compatible backends return `"tool_calls": null`
+                // instead of omitting the key or returning an empty array.
+                if (msg_obj.get("tool_calls")) |tc_arr| if (tc_arr == .array) {
                     for (tc_arr.array.items) |tc| {
                         const tc_obj = tc.object;
                         const id = if (tc_obj.get("id")) |i| (if (i == .string) try allocator.dupe(u8, i.string) else try allocator.dupe(u8, "unknown")) else try allocator.dupe(u8, "unknown");
@@ -179,7 +181,7 @@ pub const OpenRouterProvider = struct {
                             });
                         }
                     }
-                }
+                };
 
                 var usage = TokenUsage{};
                 if (root_obj.get("usage")) |usage_obj| {
@@ -625,6 +627,14 @@ test "parseTextResponse empty choices" {
     try std.testing.expectError(error.NoResponseContent, OpenRouterProvider.parseTextResponse(std.testing.allocator, body));
 }
 
+test "parseTextResponse null choices fails" {
+    // Regression: OpenAI-compatible providers can return `"choices": null`.
+    const body =
+        \\{"choices":null}
+    ;
+    try std.testing.expectError(error.NoResponseContent, OpenRouterProvider.parseTextResponse(std.testing.allocator, body));
+}
+
 test "parseTextResponse classifies context errors" {
     const body =
         \\{"error":{"message":"maximum context length exceeded","type":"invalid_request_error"}}
@@ -978,4 +988,21 @@ test "parseNativeResponse no think tags leaves reasoning_content null" {
     }
     try std.testing.expectEqualStrings("Plain response", response.content.?);
     try std.testing.expect(response.reasoning_content == null);
+}
+
+test "parseNativeResponse tool_calls null does not crash" {
+    // Regression: some OpenAI-compatible providers emit `"tool_calls": null`.
+    const body =
+        \\{"choices":[{"message":{"content":"pong","tool_calls":null}}],"model":"openrouter/test","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try OpenRouterProvider.parseNativeResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expectEqualStrings("pong", response.content.?);
+    try std.testing.expectEqual(@as(usize, 0), response.tool_calls.len);
 }

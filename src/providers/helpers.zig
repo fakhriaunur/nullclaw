@@ -608,7 +608,7 @@ pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u
 
     // OpenAI/OpenRouter format: choices[0].message.content
     if (root_obj.get("choices")) |choices| {
-        if (choices.array.items.len > 0) {
+        if (choices == .array and choices.array.items.len > 0) {
             if (choices.array.items[0].object.get("message")) |msg| {
                 if (msg.object.get("content")) |content| {
                     if (content == .string) return try allocator.dupe(u8, content.string);
@@ -619,7 +619,7 @@ pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u
 
     // Anthropic format: content[0].text
     if (root_obj.get("content")) |content| {
-        if (content.array.items.len > 0) {
+        if (content == .array and content.array.items.len > 0) {
             if (content.array.items[0].object.get("text")) |text| {
                 if (text == .string) return try allocator.dupe(u8, text.string);
             }
@@ -747,6 +747,25 @@ test "extractContent parses Anthropic format" {
     const result = try extractContent(allocator, body);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Hello from Claude", result);
+}
+
+test "extractContent skips null choices and parses Anthropic format" {
+    // Regression: some OpenAI-compatible providers return `"choices": null`.
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"choices":null,"content":[{"type":"text","text":"Hello from Claude"}]}
+    ;
+    const result = try extractContent(allocator, body);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello from Claude", result);
+}
+
+test "extractContent null content fails cleanly" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"content":null}
+    ;
+    try std.testing.expectError(error.UnexpectedResponse, extractContent(allocator, body));
 }
 
 test "buildRequestBody escapes double quotes in prompt" {
