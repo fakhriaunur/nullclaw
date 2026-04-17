@@ -9,13 +9,5 @@ pub const exa = @import("exa.zig");
 pub const jina = @import("jina.zig");
 
 test {
-    _ = common;
-    _ = brave;
-    _ = searxng;
-    _ = duckduckgo;
-    _ = firecrawl;
-    _ = tavily;
-    _ = perplexity;
-    _ = exa;
-    _ = jina;
+    @import("std").testing.refAllDecls(@This());
 }

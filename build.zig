@@ -40,10 +40,15 @@ fn hashWithCanonicalLineEndings(bytes: []const u8) [std.crypto.hash.sha2.Sha256.
     return digest;
 }
 
-fn readFileAllocCompat(dir: std.fs.Dir, allocator: std.mem.Allocator, sub_path: []const u8, max_bytes: usize) ![]u8 {
-    const file = try dir.openFile(sub_path, .{});
+// Compatibility shim for Zig 0.15 and 0.16 build APIs.
+fn readFileAllocCompat(b: *std.Build, sub_path: []const u8, max_bytes: usize) ![]u8 {
+    if (@hasField(std.Build, "graph")) {
+        return std.Io.Dir.cwd().readFileAlloc(b.graph.io, sub_path, b.allocator, .limited(max_bytes));
+    }
+
+    const file = try std.fs.cwd().openFile(sub_path, .{});
     defer file.close();
-    return try file.readToEndAlloc(allocator, max_bytes);
+    return try file.readToEndAlloc(b.allocator, max_bytes);
 }
 
 fn verifyVendoredSqliteHashes(b: *std.Build) !void {
@@ -52,7 +57,7 @@ fn verifyVendoredSqliteHashes(b: *std.Build) !void {
         const file_path = b.pathFromRoot(entry.path);
         defer b.allocator.free(file_path);
 
-        const bytes = readFileAllocCompat(std.fs.cwd(), b.allocator, file_path, max_vendor_file_size) catch |err| {
+        const bytes = readFileAllocCompat(b, file_path, max_vendor_file_size) catch |err| {
             std.log.err("failed to read {s}: {s}", .{ file_path, @errorName(err) });
             return err;
         };
@@ -338,21 +343,25 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
     return selection;
 }
 
-fn envExists(name: []const u8) bool {
+fn envExists(b: *std.Build, name: []const u8) bool {
+    if (@hasField(std.Build, "graph")) {
+        return b.graph.environ_map.contains(name);
+    }
+
     const value = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return false;
     std.heap.page_allocator.free(value);
     return true;
 }
 
 fn ensureAndroidBuildEnvironment(b: *std.Build) void {
-    if (envExists("TERMUX_VERSION")) return;
+    if (envExists(b, "TERMUX_VERSION")) return;
     if (b.libc_file != null) return;
 
     const has_android_sdk_or_ndk =
-        envExists("ANDROID_NDK_HOME") or
-        envExists("ANDROID_NDK_ROOT") or
-        envExists("ANDROID_HOME") or
-        envExists("ANDROID_SDK_ROOT");
+        envExists(b, "ANDROID_NDK_HOME") or
+        envExists(b, "ANDROID_NDK_ROOT") or
+        envExists(b, "ANDROID_HOME") or
+        envExists(b, "ANDROID_SDK_ROOT");
 
     std.log.err("Android cross-builds need a Zig libc/sysroot file passed via --libc (or ZIG_LIBC).", .{});
     if (has_android_sdk_or_ndk) {
@@ -363,6 +372,15 @@ fn ensureAndroidBuildEnvironment(b: *std.Build) void {
     std.log.err("For native builds, run the build inside Termux without -Dtarget.", .{});
     std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.15.2.", .{});
     std.process.exit(1);
+}
+
+fn linkLibraryCompat(compile: *std.Build.Step.Compile, library: *std.Build.Step.Compile) void {
+    if (@hasDecl(std.Build.Step.Compile, "linkLibrary")) {
+        compile.linkLibrary(library);
+        return;
+    }
+
+    compile.root_module.linkLibrary(library);
 }
 
 fn addEmbeddedWasm3(module: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
@@ -559,7 +577,7 @@ pub fn build(b: *std.Build) void {
     // Link SQLite on the compile step (not the module)
     if (!is_wasi) {
         if (sqlite3) |lib| {
-            exe.linkLibrary(lib);
+            linkLibraryCompat(exe, lib);
         }
         if (enable_postgres) {
             exe.root_module.linkSystemLibrary("pq", .{});
@@ -599,7 +617,7 @@ pub fn build(b: *std.Build) void {
     if (!is_wasi) {
         const lib_tests = b.addTest(.{ .root_module = lib_mod.? });
         if (sqlite3) |lib| {
-            lib_tests.linkLibrary(lib);
+            linkLibraryCompat(lib_tests, lib);
         }
         if (enable_postgres) {
             lib_tests.root_module.linkSystemLibrary("pq", .{});
