@@ -5,6 +5,7 @@
 /// Returns JSON to stdout:
 ///   {"channel":"telegram","account":"default","live_ok":false,"reason":"missing_bot_token"}
 const std = @import("std");
+const std_compat = @import("compat");
 const config_mod = @import("config.zig");
 const config_types = @import("config_types.zig");
 const channel_catalog = @import("channel_catalog.zig");
@@ -170,6 +171,10 @@ fn trimTrailingSlash(value: []const u8) []const u8 {
     return out;
 }
 
+fn matrixApiBase(cfg: std.json.ObjectMap, homeserver: []const u8) []const u8 {
+    return trimTrailingSlash(optionalString(cfg, "pantalaimon_proxy_url") orelse homeserver);
+}
+
 fn timeoutString(buf: []u8, timeout_secs: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}", .{timeout_secs}) catch "10";
 }
@@ -261,54 +266,28 @@ fn oneBotResponseLooksHealthy(allocator: std.mem.Allocator, response: []const u8
     return true;
 }
 
-fn timeoutPollMs(timeout_secs: u64) i32 {
+fn timeoutSeconds(timeout_secs: u64) i64 {
     const effective_secs = if (timeout_secs == 0) 10 else timeout_secs;
-    const max_secs: u64 = @intCast(@divFloor(std.math.maxInt(i32), 1000));
-    if (effective_secs >= max_secs) return std.math.maxInt(i32);
-    const ms = effective_secs * 1000;
-    return @intCast(ms);
+    return if (effective_secs >= std.math.maxInt(i64)) std.math.maxInt(i64) else @intCast(effective_secs);
 }
 
 fn tcpReachableWithTimeout(allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_secs: u64) !void {
-    const addresses = try std.net.getAddressList(allocator, host, port);
+    const addresses = try std_compat.net.getAddressList(allocator, host, port);
     defer addresses.deinit();
     if (addresses.addrs.len == 0) return error.DnsResolutionFailed;
 
-    const poll_ms = timeoutPollMs(timeout_secs);
+    const timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = std.Io.Duration.fromSeconds(timeoutSeconds(timeout_secs)),
+        .clock = .awake,
+    } };
 
     for (addresses.addrs) |addr| {
-        const sockfd = std.posix.socket(
-            addr.any.family,
-            std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
-            std.posix.IPPROTO.TCP,
-        ) catch continue;
-        defer std.posix.close(sockfd);
-
-        std.posix.connect(sockfd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-            error.WouldBlock, error.ConnectionPending => {
-                var poll_fds = [_]std.posix.pollfd{
-                    .{
-                        .fd = sockfd,
-                        .events = std.posix.POLL.OUT,
-                        .revents = 0,
-                    },
-                };
-
-                const events = std.posix.poll(&poll_fds, poll_ms) catch continue;
-                if (events == 0) continue; // timeout on this address
-
-                const revents = poll_fds[0].revents;
-                if ((revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL | std.posix.POLL.OUT)) == 0) {
-                    continue;
-                }
-
-                std.posix.getsockoptError(sockfd) catch continue;
-                return;
-            },
-            else => continue,
-        };
-
-        // Connected immediately.
+        const current = addr.toCurrent();
+        const stream = current.connect(std_compat.io(), .{
+            .mode = .stream,
+            .timeout = timeout,
+        }) catch continue;
+        stream.close(std_compat.io());
         return;
     }
 
@@ -422,7 +401,7 @@ fn probeMatrix(
     _ = nonEmptyString(cfg, "room_id") orelse return fail(channel, account, "missing_room_id");
     const access_token = nonEmptyString(cfg, "access_token") orelse return fail(channel, account, "missing_access_token");
 
-    const base = trimTrailingSlash(homeserver);
+    const base = matrixApiBase(cfg, homeserver);
     const url = std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/account/whoami", .{base}) catch {
         return fail(channel, account, "probe_setup_failed");
     };
@@ -1020,7 +999,7 @@ fn readChannelsObject(allocator: std.mem.Allocator) ReadConfigError!ParsedChanne
     var cfg = config_mod.Config.load(allocator) catch return error.ConfigLoadFailed;
     defer cfg.deinit();
 
-    const file = std.fs.openFileAbsolute(cfg.config_path, .{}) catch return error.ConfigReadFailed;
+    const file = std_compat.fs.openFileAbsolute(cfg.config_path, .{}) catch return error.ConfigReadFailed;
     defer file.close();
 
     const content = file.readToEndAlloc(allocator, 1024 * 512) catch return error.ConfigReadFailed;
@@ -1049,7 +1028,7 @@ fn readChannelsObject(allocator: std.mem.Allocator) ReadConfigError!ParsedChanne
 
 fn writeResult(result: ProbeResult) !void {
     var buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writer(&buf);
     const out = &bw.interface;
 
     try out.writeAll("{\"channel\":");
@@ -1196,6 +1175,26 @@ test "allocOneBotApiBase normalizes websocket schemes" {
     const wss_base = try allocOneBotApiBase(allocator, "wss://onebot.example/ws");
     defer allocator.free(wss_base);
     try std.testing.expectEqualStrings("https://onebot.example/ws", wss_base);
+}
+
+test "matrixApiBase uses pantalaimon proxy when configured" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{
+        \\  "homeserver": "https://matrix.example/",
+        \\  "pantalaimon_proxy_url": "http://127.0.0.1:8008/"
+        \\}
+    ;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    // Regression: Matrix channel health probes must route through Pantalaimon
+    // instead of bypassing E2EE via the homeserver URL.
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:8008",
+        matrixApiBase(parsed.value.object, "https://matrix.example/"),
+    );
 }
 
 test "oneBotResponseLooksHealthy validates retcode and status" {

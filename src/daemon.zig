@@ -7,13 +7,17 @@
 //!   - Ctrl+C graceful shutdown
 
 const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
 const cron = @import("cron.zig");
+const agent_runner = @import("agent_runner.zig");
 const bus_mod = @import("bus.zig");
 const channels_mod = @import("channels/root.zig");
 const dispatch = @import("channels/dispatch.zig");
+const channel_outbox = @import("channels/outbox.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
 const agent_routing = @import("agent_routing.zig");
@@ -23,6 +27,7 @@ const heartbeat_mod = @import("heartbeat.zig");
 const inbound_debounce = @import("inbound_debounce.zig");
 const interaction_choices = @import("interactions/choices.zig");
 const memory_mod = @import("memory/root.zig");
+const outbound = @import("outbound.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
@@ -37,6 +42,11 @@ const log = std.log.scoped(.daemon);
 
 /// How often the daemon state file is flushed (seconds).
 const STATUS_FLUSH_SECONDS: u64 = 5;
+
+/// Default heartbeat prompt sent to the agent when HEARTBEAT.md has tasks.
+const DEFAULT_HEARTBEAT_PROMPT =
+    "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. " ++
+    "Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.";
 
 /// Daemon heartbeat initializes memory/bootstrap runtime state before it
 /// settles into its periodic loop, so it needs the session-turn budget.
@@ -100,10 +110,17 @@ pub const DaemonState = struct {
 /// Compute the path to daemon_state.json from config.
 pub fn stateFilePath(allocator: std.mem.Allocator, config: *const Config) ![]u8 {
     // Use config directory (parent of config_path)
-    if (std.fs.path.dirname(config.config_path)) |dir| {
-        return std.fs.path.join(allocator, &.{ dir, "daemon_state.json" });
+    if (std_compat.fs.path.dirname(config.config_path)) |dir| {
+        return std_compat.fs.path.join(allocator, &.{ dir, "daemon_state.json" });
     }
     return allocator.dupe(u8, "daemon_state.json");
+}
+
+pub fn outboundDeliveryPath(allocator: std.mem.Allocator, config: *const Config) ![]u8 {
+    if (std_compat.fs.path.dirname(config.config_path)) |dir| {
+        return std_compat.fs.path.join(allocator, &.{ dir, "state", "outbound_delivery.json" });
+    }
+    return allocator.dupe(u8, "outbound_delivery.json");
 }
 
 /// Write daemon state to disk as JSON.
@@ -113,12 +130,12 @@ pub fn writeStateFile(allocator: std.mem.Allocator, path: []const u8, state: *co
 
     try buf.appendSlice(allocator, "{\n");
     try buf.appendSlice(allocator, "  \"status\": \"running\",\n");
-    try std.fmt.format(buf.writer(allocator), "  \"gateway\": \"{s}:{d}\",\n", .{ state.gateway_host, state.gateway_port });
+    try buf.print(allocator, "  \"gateway\": \"{s}:{d}\",\n", .{ state.gateway_host, state.gateway_port });
 
     // Tunnel info
-    try std.fmt.format(buf.writer(allocator), "  \"tunnel_provider\": \"{s}\",\n", .{state.tunnel_provider});
+    try buf.print(allocator, "  \"tunnel_provider\": \"{s}\",\n", .{state.tunnel_provider});
     if (state.tunnel_url) |url| {
-        try std.fmt.format(buf.writer(allocator), "  \"tunnel_url\": \"{s}\",\n", .{url});
+        try buf.print(allocator, "  \"tunnel_url\": \"{s}\",\n", .{url});
     } else {
         try buf.appendSlice(allocator, "  \"tunnel_url\": null,\n");
     }
@@ -130,14 +147,14 @@ pub fn writeStateFile(allocator: std.mem.Allocator, path: []const u8, state: *co
         if (comp_opt) |comp| {
             if (!first) try buf.appendSlice(allocator, ",\n");
             first = false;
-            try std.fmt.format(buf.writer(allocator),
+            try buf.print(allocator,
                 \\    {{"name": "{s}", "running": {}, "restart_count": {d}}}
             , .{ comp.name, comp.running, comp.restart_count });
         }
     }
     try buf.appendSlice(allocator, "\n  ]\n}\n");
 
-    const file = try std.fs.createFileAbsolute(path, .{});
+    const file = try std_compat.fs.createFileAbsolute(path, .{});
     defer file.close();
     try file.writeAll(buf.items);
 }
@@ -166,6 +183,37 @@ pub fn isShutdownRequested() bool {
     return shutdown_requested.load(.acquire);
 }
 
+fn heartbeatDeliveryConfig(config: *const Config) ?cron.DeliveryConfig {
+    if (config.heartbeat.delivery_mode == null and
+        config.heartbeat.delivery_channel == null and
+        config.heartbeat.delivery_to == null and
+        config.heartbeat.delivery_account_id == null and
+        config.heartbeat.delivery_peer_kind == null and
+        config.heartbeat.delivery_peer_id == null and
+        config.heartbeat.delivery_thread_id == null and
+        config.heartbeat.delivery_best_effort)
+    {
+        return null;
+    }
+
+    return cron.enrichDeliveryRouting(.{
+        .mode = if (config.heartbeat.delivery_mode) |raw|
+            cron.DeliveryMode.parse(raw)
+        else
+            .none,
+        .channel = config.heartbeat.delivery_channel,
+        .account_id = config.heartbeat.delivery_account_id,
+        .to = config.heartbeat.delivery_to,
+        .peer_kind = if (config.heartbeat.delivery_peer_kind) |raw|
+            channel_adapters.parsePeerKind(raw)
+        else
+            null,
+        .peer_id = config.heartbeat.delivery_peer_id,
+        .thread_id = config.heartbeat.delivery_thread_id,
+        .best_effort = config.heartbeat.delivery_best_effort,
+    });
+}
+
 fn recordGatewayFailure(err: anyerror, state: *DaemonState) void {
     requestShutdown();
     state.markError("gateway", @errorName(err));
@@ -177,6 +225,9 @@ fn logGatewayFailure(err: anyerror, port: u16) void {
         error.AddressInUse => {
             log.err("Gateway failed to start: port {d} is already in use. Is another nullclaw instance running?", .{port});
         },
+        error.PublicBindRequiresTunnel => {
+            log.err("Gateway failed to start: public bind requires an active tunnel or gateway.allow_public_bind=true.", .{});
+        },
         else => {
             log.err("Gateway failed to start: {}", .{err});
         },
@@ -187,7 +238,7 @@ fn logGatewayFailure(err: anyerror, port: u16) void {
 /// Gateway thread entry point.
 fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const gateway = @import("gateway.zig");
-    gateway.run(allocator, host, port, config, event_bus) catch |err| {
+    gateway.run(allocator, host, port, config, event_bus, state.tunnel_url) catch |err| {
         logGatewayFailure(err, port);
         recordGatewayFailure(err, state);
         return;
@@ -196,7 +247,7 @@ fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []co
 
 /// Heartbeat thread — periodically writes state file, checks health, and
 /// runs HEARTBEAT.md polling ticks on the configured heartbeat interval.
-fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState) void {
+fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const state_path = stateFilePath(allocator, config) catch return;
     defer allocator.free(state_path);
 
@@ -222,29 +273,53 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     defer if (heartbeat_engine.bootstrap_provider) |bp| bp.deinit();
 
     const heartbeat_interval_ns: i128 = @as(i128, @intCast(heartbeat_engine.interval_minutes)) * 60 * std.time.ns_per_s;
-    var next_heartbeat_tick_at_ns: i128 = std.time.nanoTimestamp() + heartbeat_interval_ns;
+    var next_heartbeat_tick_at_ns: i128 = std_compat.time.nanoTimestamp() + heartbeat_interval_ns;
 
     while (!isShutdownRequested()) {
         writeStateFile(allocator, state_path, state) catch {};
         health.markComponentOk("heartbeat");
 
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = std_compat.time.nanoTimestamp();
         if (heartbeat_engine.enabled and now_ns >= next_heartbeat_tick_at_ns) {
             const tick_result = heartbeat_engine.tick(allocator) catch |err| {
                 log.warn("heartbeat tick failed: {s}", .{@errorName(err)});
                 next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
-                std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+                std_compat.thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
                 continue;
             };
             switch (tick_result.outcome) {
-                .processed => log.info("heartbeat tick loaded {d} task(s) from HEARTBEAT.md", .{tick_result.task_count}),
+                .processed => {
+                    log.info("heartbeat tick loaded {d} task(s), dispatching agent", .{tick_result.task_count});
+                    if (builtin.is_test) {
+                        log.info("heartbeat: test mode, skipping agent dispatch", .{});
+                    } else {
+                        const delivery = heartbeatDeliveryConfig(config);
+                        const prompt = config.heartbeat.prompt orelse DEFAULT_HEARTBEAT_PROMPT;
+                        const result = agent_runner.run(allocator, config.workspace_dir, prompt, config.heartbeat.model, config.heartbeat.timeout_secs) catch |err| {
+                            log.warn("heartbeat agent dispatch failed: {s}", .{@errorName(err)});
+                            if (delivery) |cfg| {
+                                const failure_output = std.fmt.allocPrint(allocator, "heartbeat agent dispatch failed: {s}", .{@errorName(err)}) catch null;
+                                defer if (failure_output) |msg| allocator.free(msg);
+                                _ = cron.deliverResult(allocator, cfg, failure_output orelse "heartbeat agent dispatch failed", false, event_bus) catch {};
+                            }
+                            next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
+                            std_compat.thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+                            continue;
+                        };
+                        defer allocator.free(result.output);
+                        log.info("heartbeat agent completed (success={}, output_len={})", .{ result.success, result.output.len });
+                        if (delivery) |cfg| {
+                            _ = cron.deliverResult(allocator, cfg, result.output, result.success, event_bus) catch {};
+                        }
+                    }
+                },
                 .skipped_empty_file => log.debug("heartbeat tick skipped: HEARTBEAT.md has no actionable content", .{}),
                 .skipped_missing_file => log.debug("heartbeat tick skipped: HEARTBEAT.md is missing", .{}),
             }
             next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
         }
 
-        std.Thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+        std_compat.thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
     }
 }
 
@@ -491,7 +566,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
             };
 
             if (snapshot_ok) {
-                const changed = scheduler.tick(std.time.timestamp(), event_bus);
+                const changed = scheduler.tick(std_compat.time.timestamp(), event_bus);
                 if (changed) {
                     mergeSchedulerTickChangesAndSave(allocator, &scheduler, &before_tick) catch |err| {
                         log.warn("scheduler merge-save failed: {}", .{err});
@@ -505,7 +580,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         if (!snapshot_ok) {
             var snapshot_sleep: u64 = 0;
             while (snapshot_sleep < poll_secs and !isShutdownRequested()) : (snapshot_sleep += 1) {
-                std.Thread.sleep(std.time.ns_per_s);
+                std_compat.thread.sleep(std.time.ns_per_s);
             }
             continue;
         }
@@ -515,7 +590,7 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
 
         var slept: u64 = 0;
         while (slept < poll_secs and !isShutdownRequested()) : (slept += 1) {
-            std.Thread.sleep(std.time.ns_per_s);
+            std_compat.thread.sleep(std.time.ns_per_s);
         }
     }
 }
@@ -596,6 +671,9 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         }
         if (pm.value.object.get("message_id")) |v| {
             if (v == .string and v.string.len > 0) parsed.fields.message_id = v.string;
+        }
+        if (pm.value.object.get("replace_message")) |v| {
+            if (v == .bool) parsed.fields.replace_message = v.bool;
         }
         if (pm.value.object.get("guild_id")) |v| {
             if (v == .string) parsed.fields.guild_id = v.string;
@@ -802,6 +880,47 @@ fn resolveInboundRouteSessionKey(
     return resolveInboundRouteSessionKeyWithMetadata(allocator, config, msg, parsed_meta.fields);
 }
 
+const InboundRoutingPlan = struct {
+    session_key: []const u8,
+    session_key_owned: bool,
+    outbound_channel: []const u8,
+    outbound_account_id: ?[]const u8,
+    outbound_chat_id: []const u8,
+    conversation_context: ?ConversationContext,
+
+    fn deinit(self: *InboundRoutingPlan, allocator: std.mem.Allocator) void {
+        if (self.session_key_owned) allocator.free(self.session_key);
+    }
+};
+
+fn buildInboundRoutingPlan(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) InboundRoutingPlan {
+    const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        meta,
+    ) orelse resolveInboundRouteSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        meta,
+    );
+
+    return .{
+        .session_key = routed_session_key orelse msg.session_key,
+        .session_key_owned = routed_session_key != null,
+        .outbound_channel = msg.channel,
+        .outbound_account_id = meta.account_id,
+        .outbound_chat_id = msg.chat_id,
+        .conversation_context = buildInboundConversationContext(msg, meta),
+    };
+}
+
 const SlackStatusTarget = struct {
     channel_id: []const u8,
     thread_ts: []const u8,
@@ -983,6 +1102,62 @@ fn makeAssistantReplyOutbound(
     return msg;
 }
 
+const AssistantReplyPayload = struct {
+    text: []u8,
+    choices: []outbound.Choice,
+
+    fn deinit(self: *AssistantReplyPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        for (self.choices) |choice| choice.deinit(allocator);
+        allocator.free(self.choices);
+    }
+
+    fn payload(self: *const AssistantReplyPayload) outbound.Payload {
+        return .{
+            .text = self.text,
+            .choices = self.choices,
+        };
+    }
+};
+
+fn makeAssistantReplyPayload(allocator: std.mem.Allocator, reply: []const u8) !AssistantReplyPayload {
+    if (std.mem.indexOf(u8, reply, interaction_choices.START_TAG) == null) {
+        return .{
+            .text = try allocator.dupe(u8, reply),
+            .choices = try allocator.alloc(outbound.Choice, 0),
+        };
+    }
+
+    var parsed = try interaction_choices.parseAssistantChoices(allocator, reply);
+    defer parsed.deinit(allocator);
+
+    const choices = if (parsed.choices) |choices| blk: {
+        const duped = try allocator.alloc(outbound.Choice, choices.options.len);
+        var i: usize = 0;
+        errdefer {
+            for (duped[0..i]) |choice| choice.deinit(allocator);
+            allocator.free(duped);
+        }
+        while (i < choices.options.len) : (i += 1) {
+            duped[i] = .{
+                .id = try allocator.dupe(u8, choices.options[i].id),
+                .label = try allocator.dupe(u8, choices.options[i].label),
+                .submit_text = try allocator.dupe(u8, choices.options[i].submit_text),
+            };
+        }
+        break :blk duped;
+    } else try allocator.alloc(outbound.Choice, 0);
+    errdefer {
+        for (choices) |choice| choice.deinit(allocator);
+        allocator.free(choices);
+    }
+
+    return .{
+        .text = try allocator.dupe(u8, parsed.visible_text),
+        .choices = choices,
+    };
+}
+
 fn makeStreamingSinkForChannel(
     streaming_supported: bool,
     raw_sink: streaming.Sink,
@@ -998,6 +1173,65 @@ const DebouncedInboundPollResult = enum {
     ready,
     closed,
 };
+
+const INBOUND_DISPATCH_QUEUE_CAPACITY: usize = 256;
+const INBOUND_DISPATCH_WORKER_COUNT: usize = if (builtin.is_test) 2 else 4;
+const EVICT_IDLE_DISPATCH_INTERVAL: u32 = 100;
+
+const InboundDispatchQueue = bus_mod.BoundedQueue(bus_mod.InboundMessage, INBOUND_DISPATCH_QUEUE_CAPACITY);
+
+const InboundWorkerCtx = struct {
+    allocator: std.mem.Allocator,
+    queue: *InboundDispatchQueue,
+    event_bus: *bus_mod.Bus,
+    registry: *const dispatch.ChannelRegistry,
+    runtime: *channel_loop.ChannelRuntime,
+    evict_counter: *Atomic(u32),
+};
+
+fn shouldRunInboundIdleEviction(dispatch_count: u32) bool {
+    return dispatch_count != 0 and (dispatch_count % EVICT_IDLE_DISPATCH_INTERVAL) == 0;
+}
+
+fn inboundDispatchShardIndex(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    msg: *const bus_mod.InboundMessage,
+    worker_count: usize,
+) usize {
+    if (worker_count == 0) return 0;
+
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+
+    const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        parsed_meta.fields,
+    ) orelse resolveInboundRouteSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        parsed_meta.fields,
+    );
+    defer if (routed_session_key) |key| allocator.free(key);
+
+    const session_key = routed_session_key orelse msg.session_key;
+    const shard_count: u64 = @intCast(worker_count);
+    return @intCast(std.hash.Wyhash.hash(0, session_key) % shard_count);
+}
+
+fn publishInboundToWorkerQueue(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    worker_queues: []InboundDispatchQueue,
+    msg: bus_mod.InboundMessage,
+) error{Closed}!void {
+    std.debug.assert(worker_queues.len > 0);
+    const shard_index = inboundDispatchShardIndex(allocator, config, &msg, worker_queues.len);
+    try worker_queues[shard_index].publish(msg);
+}
 
 fn pollDebouncedInbound(
     _: std.mem.Allocator,
@@ -1027,17 +1261,223 @@ fn pollDebouncedInbound(
     return if (ready_messages.items.len > 0) .ready else .closed;
 }
 
+fn processInboundMessage(
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    registry: *const dispatch.ChannelRegistry,
+    runtime: *channel_loop.ChannelRuntime,
+    evict_counter: *Atomic(u32),
+    msg: *const bus_mod.InboundMessage,
+) void {
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+
+    var routing_plan = buildInboundRoutingPlan(allocator, runtime.config, msg, parsed_meta.fields);
+    defer routing_plan.deinit(allocator);
+
+    const outbound_channel = resolveOutboundChannel(registry, routing_plan.outbound_channel, routing_plan.outbound_account_id);
+    if (outbound_channel) |channel| {
+        markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
+    }
+
+    if (runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) == .skip) return;
+
+    const typing_recipient = sendInboundProcessingIndicator(
+        allocator,
+        registry,
+        routing_plan.outbound_channel,
+        routing_plan.outbound_account_id,
+        routing_plan.outbound_chat_id,
+        parsed_meta.fields,
+    );
+    defer clearInboundProcessingIndicator(
+        allocator,
+        registry,
+        routing_plan.outbound_channel,
+        routing_plan.outbound_account_id,
+        typing_recipient,
+    );
+
+    const use_tracked_draft_outbound = if (outbound_channel) |channel|
+        !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
+    else
+        false;
+    const use_streaming_outbound = if (outbound_channel) |channel|
+        channel.supportsStreamingOutbound() or dispatch.supportsDraftStreaming(channel)
+    else
+        false;
+    const outbound_draft_id: u64 = if (use_tracked_draft_outbound) nextOutboundDraftId() else 0;
+    var streaming_ctx = StreamingOutboundCtx{
+        .allocator = allocator,
+        .event_bus = event_bus,
+        .channel = routing_plan.outbound_channel,
+        .account_id = routing_plan.outbound_account_id,
+        .chat_id = routing_plan.outbound_chat_id,
+        .draft_id = outbound_draft_id,
+    };
+    var stream_sink: ?streaming.Sink = null;
+    var outbound_tag_filter: streaming.TagFilter = undefined;
+    if (use_streaming_outbound) {
+        const raw_sink = streaming.Sink{
+            .callback = publishStreamingChunk,
+            .ctx = @ptrCast(&streaming_ctx),
+        };
+        stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
+    }
+
+    if (std.mem.eql(u8, msg.channel, "max")) {
+        channels_mod.max.setInteractiveOwnerContext(msg.sender_id);
+        defer channels_mod.max.setInteractiveOwnerContext(null);
+    }
+
+    const reply = runtime.session_mgr.processMessageStreaming(
+        routing_plan.session_key,
+        msg.content,
+        routing_plan.conversation_context,
+        stream_sink,
+        null,
+    ) catch |err| {
+        log.warn("inbound dispatch process failed: {}", .{err});
+
+        // Send user-visible error reply back to the originating channel
+        const err_msg: []const u8 = switch (err) {
+            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+            error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+            error.NoResponseContent => "Model returned an empty response. Please try again.",
+            error.OutOfMemory => "Out of memory.",
+            else => "An error occurred. Try again.",
+        };
+        var err_out = if (routing_plan.outbound_account_id) |aid|
+            bus_mod.makeOutboundWithAccount(allocator, routing_plan.outbound_channel, aid, routing_plan.outbound_chat_id, err_msg) catch return
+        else
+            bus_mod.makeOutbound(allocator, routing_plan.outbound_channel, routing_plan.outbound_chat_id, err_msg) catch return;
+        err_out.draft_id = outbound_draft_id;
+        event_bus.publishOutbound(err_out) catch {
+            err_out.deinit(allocator);
+        };
+        return;
+    };
+    defer allocator.free(reply);
+
+    if ((parsed_meta.fields.replace_message orelse false) and parsed_meta.fields.message_id != null) {
+        if (outbound_channel) |channel| {
+            var payload = makeAssistantReplyPayload(allocator, reply) catch |err| {
+                log.warn("failed to build edit payload: {}", .{err});
+                const out = makeAssistantReplyOutbound(
+                    allocator,
+                    routing_plan.outbound_channel,
+                    routing_plan.outbound_account_id,
+                    routing_plan.outbound_chat_id,
+                    reply,
+                    outbound_draft_id,
+                ) catch return;
+                event_bus.publishOutbound(out) catch |publish_err| {
+                    out.deinit(allocator);
+                    log.err("inbound dispatch publishOutbound failed: {}", .{publish_err});
+                };
+                return;
+            };
+            defer payload.deinit(allocator);
+
+            if (channel.editMessage(.{
+                .target = msg.chat_id,
+                .message_id = parsed_meta.fields.message_id.?,
+                .payload = payload.payload(),
+            })) |_| {
+                return;
+            } else |err| {
+                log.warn("editMessage failed; falling back to normal outbound: {}", .{err});
+            }
+        }
+    }
+
+    const out = makeAssistantReplyOutbound(
+        allocator,
+        routing_plan.outbound_channel,
+        routing_plan.outbound_account_id,
+        routing_plan.outbound_chat_id,
+        reply,
+        outbound_draft_id,
+    ) catch |err| {
+        log.err("inbound dispatch makeOutbound failed: {}", .{err});
+        return;
+    };
+
+    event_bus.publishOutbound(out) catch |err| {
+        out.deinit(allocator);
+        if (err != error.Closed) {
+            log.err("inbound dispatch publishOutbound failed: {}", .{err});
+        }
+        return;
+    };
+
+    health.markComponentOk("inbound_dispatcher");
+    const dispatch_count = evict_counter.fetchAdd(1, .monotonic) + 1;
+    if (shouldRunInboundIdleEviction(dispatch_count)) {
+        _ = runtime.session_mgr.evictIdle(runtime.config.agent.session_idle_timeout_secs);
+    }
+}
+
+fn inboundWorkerThread(ctx: *InboundWorkerCtx) void {
+    while (ctx.queue.consume()) |msg| {
+        var inbound_msg = msg;
+        defer inbound_msg.deinit(ctx.allocator);
+        processInboundMessage(
+            ctx.allocator,
+            ctx.event_bus,
+            ctx.registry,
+            ctx.runtime,
+            ctx.evict_counter,
+            &inbound_msg,
+        );
+    }
+}
+
 fn inboundDispatcherThread(
     allocator: std.mem.Allocator,
     event_bus: *bus_mod.Bus,
     registry: *const dispatch.ChannelRegistry,
     runtime: *channel_loop.ChannelRuntime,
-    state: *DaemonState,
+    _: *DaemonState,
 ) void {
-    var evict_counter: u32 = 0;
+    var evict_counter = Atomic(u32).init(0);
     var debouncer = inbound_debounce.InboundDebouncer.init(allocator, runtime.config.messages.inbound.debounce_ms);
     defer debouncer.deinit();
     var ready_messages: std.ArrayListUnmanaged(bus_mod.InboundMessage) = .empty;
+
+    var worker_queues: [INBOUND_DISPATCH_WORKER_COUNT]InboundDispatchQueue = undefined;
+    var worker_ctxs: [INBOUND_DISPATCH_WORKER_COUNT]InboundWorkerCtx = undefined;
+    var worker_threads: [INBOUND_DISPATCH_WORKER_COUNT]?std.Thread = .{null} ** INBOUND_DISPATCH_WORKER_COUNT;
+    var worker_count: usize = 0;
+    while (worker_count < INBOUND_DISPATCH_WORKER_COUNT) : (worker_count += 1) {
+        worker_queues[worker_count] = InboundDispatchQueue.init();
+        worker_ctxs[worker_count] = .{
+            .allocator = allocator,
+            .queue = &worker_queues[worker_count],
+            .event_bus = event_bus,
+            .registry = registry,
+            .runtime = runtime,
+            .evict_counter = &evict_counter,
+        };
+        worker_threads[worker_count] = std.Thread.spawn(
+            .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+            inboundWorkerThread,
+            .{&worker_ctxs[worker_count]},
+        ) catch |err| {
+            log.warn("inbound worker spawn failed: {}", .{err});
+            break;
+        };
+    }
+    defer {
+        for (worker_queues[0..worker_count]) |*queue| {
+            queue.close();
+        }
+        var i: usize = 0;
+        while (i < worker_count) : (i += 1) {
+            if (worker_threads[i]) |thread| thread.join();
+        }
+    }
+
     defer {
         for (ready_messages.items) |msg| msg.deinit(allocator);
         ready_messages.deinit(allocator);
@@ -1060,135 +1500,15 @@ fn inboundDispatcherThread(
 
         while (ready_messages.items.len > 0) {
             var msg = ready_messages.orderedRemove(0);
-            defer msg.deinit(allocator);
-
-            var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
-            defer parsed_meta.deinit();
-
-            const outbound_account_id = parsed_meta.fields.account_id;
-            const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
-                allocator,
-                runtime.config,
-                &msg,
-                parsed_meta.fields,
-            ) orelse resolveInboundRouteSessionKeyWithMetadata(
-                allocator,
-                runtime.config,
-                &msg,
-                parsed_meta.fields,
-            );
-            defer if (routed_session_key) |key| allocator.free(key);
-            const session_key = routed_session_key orelse msg.session_key;
-
-            const typing_recipient = sendInboundProcessingIndicator(
-                allocator,
-                registry,
-                msg.channel,
-                outbound_account_id,
-                msg.chat_id,
-                parsed_meta.fields,
-            );
-            defer clearInboundProcessingIndicator(
-                allocator,
-                registry,
-                msg.channel,
-                outbound_account_id,
-                typing_recipient,
-            );
-
-            const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
-            if (outbound_channel) |channel| {
-                markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
-            }
-            const use_tracked_draft_outbound = if (outbound_channel) |channel|
-                !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
-            else
-                false;
-            const use_streaming_outbound = if (outbound_channel) |channel|
-                channel.supportsStreamingOutbound() or dispatch.supportsDraftStreaming(channel)
-            else
-                false;
-            const outbound_draft_id: u64 = if (use_tracked_draft_outbound) nextOutboundDraftId() else 0;
-            var streaming_ctx = StreamingOutboundCtx{
-                .allocator = allocator,
-                .event_bus = event_bus,
-                .channel = msg.channel,
-                .account_id = outbound_account_id,
-                .chat_id = msg.chat_id,
-                .draft_id = outbound_draft_id,
-            };
-            var stream_sink: ?streaming.Sink = null;
-            var outbound_tag_filter: streaming.TagFilter = undefined;
-            if (use_streaming_outbound) {
-                const raw_sink = streaming.Sink{
-                    .callback = publishStreamingChunk,
-                    .ctx = @ptrCast(&streaming_ctx),
+            if (worker_count > 0) {
+                publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch |err| {
+                    msg.deinit(allocator);
+                    if (err == error.Closed) break;
+                    continue;
                 };
-                stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
-            }
-
-            if (std.mem.eql(u8, msg.channel, "max")) {
-                channels_mod.max.setInteractiveOwnerContext(msg.sender_id);
-                defer channels_mod.max.setInteractiveOwnerContext(null);
-            }
-
-            const conversation_context = buildInboundConversationContext(&msg, parsed_meta.fields);
-
-            const reply = runtime.session_mgr.processMessageStreaming(
-                session_key,
-                msg.content,
-                conversation_context,
-                stream_sink,
-            ) catch |err| {
-                log.warn("inbound dispatch process failed: {}", .{err});
-
-                // Send user-visible error reply back to the originating channel
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
-                var err_out = if (outbound_account_id) |aid|
-                    bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch continue
-                else
-                    bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch continue;
-                err_out.draft_id = outbound_draft_id;
-                event_bus.publishOutbound(err_out) catch {
-                    err_out.deinit(allocator);
-                };
-                continue;
-            };
-            defer allocator.free(reply);
-
-            const out = makeAssistantReplyOutbound(
-                allocator,
-                msg.channel,
-                outbound_account_id,
-                msg.chat_id,
-                reply,
-                outbound_draft_id,
-            ) catch |err| {
-                log.err("inbound dispatch makeOutbound failed: {}", .{err});
-                continue;
-            };
-
-            event_bus.publishOutbound(out) catch |err| {
-                out.deinit(allocator);
-                if (err == error.Closed) break;
-                log.err("inbound dispatch publishOutbound failed: {}", .{err});
-                continue;
-            };
-
-            state.markRunning("inbound_dispatcher");
-            health.markComponentOk("inbound_dispatcher");
-
-            // Periodic session eviction for bus-based channels
-            evict_counter += 1;
-            if (evict_counter >= 100) {
-                evict_counter = 0;
-                _ = runtime.session_mgr.evictIdle(runtime.config.agent.session_idle_timeout_secs);
+            } else {
+                processInboundMessage(allocator, event_bus, registry, runtime, &evict_counter, &msg);
+                msg.deinit(allocator);
             }
         }
     }
@@ -1196,7 +1516,14 @@ fn inboundDispatcherThread(
     debouncer.flushAll(&ready_messages) catch {};
     while (ready_messages.items.len > 0) {
         var msg = ready_messages.orderedRemove(0);
-        msg.deinit(allocator);
+        if (worker_count > 0) {
+            publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch {
+                msg.deinit(allocator);
+            };
+        } else {
+            processInboundMessage(allocator, event_bus, registry, runtime, &evict_counter, &msg);
+            msg.deinit(allocator);
+        }
     }
 }
 
@@ -1277,7 +1604,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var tunnel = startConfiguredTunnel(allocator, config, host, port, &state);
 
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.print("nullclaw gateway runtime started\n", .{});
     try stdout.print("  Gateway:  http://{s}:{d}\n", .{ state.gateway_host, state.gateway_port });
@@ -1312,7 +1639,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = HEARTBEAT_THREAD_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = HEARTBEAT_THREAD_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state, &event_bus })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -1389,12 +1716,23 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     }
 
     var dispatch_stats = dispatch.DispatchStats{};
+    const delivery_path = try outboundDeliveryPath(allocator, config);
+    defer allocator.free(delivery_path);
+    if (std_compat.fs.path.dirname(delivery_path)) |delivery_dir| {
+        std_compat.fs.makeDirAbsolute(delivery_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    var delivery_outbox = try channel_outbox.DeliveryOutbox.init(allocator, delivery_path);
+    defer delivery_outbox.deinit();
 
     state.addComponent("outbound_dispatcher");
+    state.addComponent("outbound_delivery");
 
     var dispatcher_thread: ?std.Thread = null;
-    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runOutboundDispatcher, .{
-        allocator, &event_bus, &channel_registry, &dispatch_stats,
+    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runOutboundDispatcherWithOutbox, .{
+        allocator, &event_bus, &channel_registry, &dispatch_stats, &delivery_outbox,
     })) |thread| {
         dispatcher_thread = thread;
         state.markRunning("outbound_dispatcher");
@@ -1404,15 +1742,28 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
         stdout.print("Warning: outbound dispatcher thread failed: {}\n", .{err}) catch {};
     }
 
+    var delivery_thread: ?std.Thread = null;
+    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runDurableOutboundWorker, .{
+        allocator, &delivery_outbox, &channel_registry,
+    })) |thread| {
+        delivery_thread = thread;
+        state.markRunning("outbound_delivery");
+        health.markComponentOk("outbound_delivery");
+    } else |err| {
+        state.markError("outbound_delivery", @errorName(err));
+        stdout.print("Warning: outbound delivery thread failed: {}\n", .{err}) catch {};
+    }
+
     // Main thread: wait for shutdown signal (poll-based)
     while (!isShutdownRequested()) {
-        std.Thread.sleep(1 * std.time.ns_per_s);
+        std_compat.thread.sleep(1 * std.time.ns_per_s);
     }
 
     try stdout.print("\nShutting down...\n", .{});
 
     // Close bus to signal dispatcher to exit
     event_bus.close();
+    delivery_outbox.close();
 
     // Write final state
     state.markError("gateway", "shutting down");
@@ -1421,6 +1772,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Wait for threads
     if (inbound_thread) |t| t.join();
     if (dispatcher_thread) |t| t.join();
+    if (delivery_thread) |t| t.join();
     if (chan_thread) |t| t.join();
     if (sched_thread) |t| t.join();
     if (hb_thread) |t| t.join();
@@ -1590,6 +1942,63 @@ test "pollDebouncedInbound merge out-of-memory does not double free" {
         pollDebouncedInbound(allocator, &event_bus, &debouncer, &ready_messages),
     );
     try std.testing.expectEqual(@as(usize, 0), ready_messages.items.len);
+}
+
+test "shouldRunInboundIdleEviction only triggers at configured interval" {
+    try std.testing.expect(!shouldRunInboundIdleEviction(0));
+    try std.testing.expect(!shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL - 1));
+    try std.testing.expect(shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL));
+    try std.testing.expect(shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL * 2));
+    try std.testing.expect(!shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL + 1));
+}
+
+test "inboundDispatchShardIndex keeps routed session on same worker" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "tg-ops",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "backup",
+                .peer = .{ .kind = .group, .id = "-100123:thread:77" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .telegram = &[_]@import("config_types.zig").TelegramConfig{
+                .{ .account_id = "backup", .bot_token = "token" },
+            },
+        },
+    };
+    const first = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "system:cron",
+        .chat_id = "chat-42",
+        .content = "first",
+        .session_key = "raw:first",
+        .metadata_json = "{\"account_id\":\"backup\",\"peer_kind\":\"group\",\"peer_id\":\"-100123\",\"thread_id\":\"77\"}",
+    };
+    const second = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "system:cron",
+        .chat_id = "chat-42",
+        .content = "second",
+        .session_key = "raw:second",
+        .metadata_json = "{\"account_id\":\"backup\",\"peer_kind\":\"group\",\"peer_id\":\"-100123\",\"thread_id\":\"77\"}",
+    };
+
+    const worker_count = INBOUND_DISPATCH_WORKER_COUNT;
+    const shard_count: u64 = @intCast(worker_count);
+    const expected_shard: usize = @intCast(std.hash.Wyhash.hash(0, "agent:tg-ops:main") % shard_count);
+
+    // Regression (#855): same resolved session must stay on one FIFO worker queue.
+    try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &first, worker_count));
+    try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &second, worker_count));
 }
 
 test "hasSupervisedChannels false for defaults" {
@@ -2383,6 +2792,17 @@ test "parseInboundMetadata extracts message_id and thread_id" {
     try std.testing.expectEqualStrings("1700.0", parsed.fields.thread_id.?);
 }
 
+test "parseInboundMetadata extracts replace_message flag" {
+    var parsed = parseInboundMetadata(
+        std.testing.allocator,
+        "{\"message_id\":\"42\",\"replace_message\":true}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("42", parsed.fields.message_id.?);
+    try std.testing.expectEqual(true, parsed.fields.replace_message.?);
+}
+
 test "parseInboundMetadata extracts discord sender identity fields" {
     var parsed = parseInboundMetadata(
         std.testing.allocator,
@@ -2528,6 +2948,57 @@ test "makeAssistantReplyOutbound extracts structured choices from assistant repl
     try std.testing.expectEqual(@as(u64, 17), msg.draft_id);
 }
 
+test "buildInboundRoutingPlan keeps inbound origin through outbound planning" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "custom-agent",
+            .match = .{
+                .channel = "custom",
+                .account_id = "custom-main",
+                .peer = .{ .kind = .direct, .id = "user-7" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+    const inbound = bus_mod.InboundMessage{
+        .channel = "custom",
+        .sender_id = "sender-1",
+        .chat_id = "delivery-chat",
+        .content = "hello",
+        .session_key = "custom:legacy",
+        .metadata_json = "{\"account_id\":\"custom-main\",\"peer_kind\":\"direct\",\"peer_id\":\"user-7\",\"sender_username\":\"alice\",\"sender_display_name\":\"Alice\"}",
+    };
+    var parsed_meta = parseInboundMetadata(allocator, inbound.metadata_json);
+    defer parsed_meta.deinit();
+
+    var plan = buildInboundRoutingPlan(allocator, &config, &inbound, parsed_meta.fields);
+    defer plan.deinit(allocator);
+
+    try std.testing.expect(plan.session_key_owned);
+    try std.testing.expectEqualStrings("agent:custom-agent:custom:direct:user-7", plan.session_key);
+    try std.testing.expectEqualStrings("custom", plan.outbound_channel);
+    try std.testing.expectEqualStrings("custom-main", plan.outbound_account_id.?);
+    try std.testing.expectEqualStrings("delivery-chat", plan.outbound_chat_id);
+
+    const context = plan.conversation_context orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom", context.channel.?);
+    try std.testing.expectEqualStrings("custom-main", context.account_id.?);
+    try std.testing.expectEqualStrings("sender-1", context.sender_id.?);
+    try std.testing.expectEqualStrings("alice", context.sender_username.?);
+    try std.testing.expectEqualStrings("Alice", context.sender_display_name.?);
+    try std.testing.expectEqualStrings("delivery-chat", context.delivery_chat_id.?);
+    try std.testing.expectEqualStrings("user-7", context.peer_id.?);
+    try std.testing.expect(context.is_group != null);
+    try std.testing.expect(!context.is_group.?);
+    try std.testing.expect(context.group_id == null);
+}
+
 test "nextOutboundDraftId stays unique across concurrent callers" {
     const Worker = struct {
         fn run(out: *u64) void {
@@ -2652,7 +3123,7 @@ test "stateFilePath derives from config_path" {
     };
     const path = try stateFilePath(std.testing.allocator, &config);
     defer std.testing.allocator.free(path);
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/home/user/.nullclaw", "daemon_state.json" });
+    const expected = try std_compat.fs.path.join(std.testing.allocator, &.{ "/home/user/.nullclaw", "daemon_state.json" });
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, path);
 }
@@ -2682,9 +3153,39 @@ test "scheduler backoff progression" {
 }
 
 test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
     const allocator = std.testing.allocator;
     const cmd_runtime = "echo merge_runtime_keep_7d1c";
     const cmd_external = "echo merge_external_add_9a42";
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
 
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
@@ -2710,7 +3211,7 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     _ = try external.addJob("*/5 * * * *", cmd_external);
     try cron.saveJobs(&external);
 
-    _ = loaded.tick(std.time.timestamp(), null);
+    _ = loaded.tick(std_compat.time.timestamp(), null);
     try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
 
     var merged = CronScheduler.init(allocator, 64, true);
@@ -2731,8 +3232,64 @@ test "daemon heartbeat thread stack matches session turn budget" {
     try std.testing.expectEqual(thread_stacks.SESSION_TURN_STACK_SIZE, HEARTBEAT_THREAD_STACK_SIZE);
 }
 
+test "heartbeatDeliveryConfig enriches routing" {
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .heartbeat = .{
+            .delivery_mode = "always",
+            .delivery_channel = "telegram",
+            .delivery_account_id = "backup",
+            .delivery_to = "-100123:thread:77",
+            .delivery_thread_id = "77",
+            .delivery_best_effort = false,
+        },
+    };
+
+    const delivery = heartbeatDeliveryConfig(&config) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cron.DeliveryMode.always, delivery.mode);
+    try std.testing.expectEqualStrings("telegram", delivery.channel.?);
+    try std.testing.expectEqualStrings("backup", delivery.account_id.?);
+    try std.testing.expectEqualStrings("-100123:thread:77", delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, delivery.peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", delivery.peer_id.?);
+    try std.testing.expectEqualStrings("77", delivery.thread_id.?);
+    try std.testing.expect(!delivery.best_effort);
+}
+
 test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
     const allocator = std.testing.allocator;
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
 
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
@@ -2766,7 +3323,7 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
     defer external.deinit();
     try cron.saveJobs(&external);
 
-    _ = loaded.tick(std.time.timestamp(), null);
+    _ = loaded.tick(std_compat.time.timestamp(), null);
     try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
 
     var merged = CronScheduler.init(allocator, 32, true);
@@ -2934,15 +3491,15 @@ test "writeStateFile produces valid content" {
     // Write to a temp path
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
     defer std.testing.allocator.free(path);
 
     try writeStateFile(std.testing.allocator, path, &state);
 
     // Read back and verify
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(std.testing.allocator, 4096);
     defer std.testing.allocator.free(content);
@@ -2965,14 +3522,14 @@ test "writeStateFile includes tunnel fields" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
     defer std.testing.allocator.free(path);
 
     try writeStateFile(std.testing.allocator, path, &state);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(std.testing.allocator, 4096);
     defer std.testing.allocator.free(content);
@@ -2992,14 +3549,14 @@ test "writeStateFile handles null tunnel_url" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(dir);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
     defer std.testing.allocator.free(path);
 
     try writeStateFile(std.testing.allocator, path, &state);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(std.testing.allocator, 4096);
     defer std.testing.allocator.free(content);

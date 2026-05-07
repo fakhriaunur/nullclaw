@@ -18,6 +18,7 @@ pub const ChannelId = enum {
     dingtalk,
     wechat,
     wecom,
+    weixin,
     signal,
     email,
     line,
@@ -62,6 +63,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .dingtalk, .key = "dingtalk", .label = "DingTalk", .configured_message = "DingTalk configured", .listener_mode = .gateway_loop },
     .{ .id = .wechat, .key = "wechat", .label = "WeChat", .configured_message = "WeChat configured", .listener_mode = .webhook_only },
     .{ .id = .wecom, .key = "wecom", .label = "WeCom", .configured_message = "WeCom configured", .listener_mode = .webhook_only },
+    .{ .id = .weixin, .key = "weixin", .label = "Weixin", .configured_message = "Weixin (iLink) configured", .listener_mode = .polling },
     .{ .id = .signal, .key = "signal", .label = "Signal", .configured_message = "Signal configured", .listener_mode = .polling },
     .{ .id = .email, .key = "email", .label = "Email", .configured_message = "Email configured", .listener_mode = .send_only },
     .{ .id = .line, .key = "line", .label = "Line", .configured_message = "Line configured", .listener_mode = .webhook_only },
@@ -91,6 +93,7 @@ pub fn isBuildEnabled(channel_id: ChannelId) bool {
         .dingtalk => build_options.enable_channel_dingtalk,
         .wechat => build_options.enable_channel_wechat,
         .wecom => build_options.enable_channel_wecom,
+        .weixin => build_options.enable_channel_wechat,
         .signal => build_options.enable_channel_signal,
         .email => build_options.enable_channel_email,
         .line => build_options.enable_channel_line,
@@ -120,6 +123,7 @@ pub fn isBuildEnabledByKey(comptime key: []const u8) bool {
     if (comptime std.mem.eql(u8, key, "dingtalk")) return build_options.enable_channel_dingtalk;
     if (comptime std.mem.eql(u8, key, "wechat")) return build_options.enable_channel_wechat;
     if (comptime std.mem.eql(u8, key, "wecom")) return build_options.enable_channel_wecom;
+    if (comptime std.mem.eql(u8, key, "weixin")) return build_options.enable_channel_wechat;
     if (comptime std.mem.eql(u8, key, "signal")) return build_options.enable_channel_signal;
     if (comptime std.mem.eql(u8, key, "email")) return build_options.enable_channel_email;
     if (comptime std.mem.eql(u8, key, "line")) return build_options.enable_channel_line;
@@ -150,6 +154,7 @@ pub fn configuredCount(cfg: *const Config, channel_id: ChannelId) usize {
         .dingtalk => cfg.channels.dingtalk.len,
         .wechat => cfg.channels.wechat.len,
         .wecom => cfg.channels.wecom.len,
+        .weixin => cfg.channels.weixin.len,
         .signal => cfg.channels.signal.len,
         .email => cfg.channels.email.len,
         .line => cfg.channels.line.len,
@@ -337,4 +342,54 @@ test "findByKey finds known channels" {
     try std.testing.expect(mattermost != null);
     try std.testing.expectEqual(ChannelId.mattermost, mattermost.?.id);
     try std.testing.expect(findByKey("unknown") == null);
+}
+
+test "every known_channel has non-empty unique key and label" {
+    var seen = std.StringHashMap(void).init(std.testing.allocator);
+    defer seen.deinit();
+
+    for (known_channels) |meta| {
+        try std.testing.expect(meta.key.len > 0);
+        try std.testing.expect(meta.label.len > 0);
+        try std.testing.expect(meta.configured_message.len > 0);
+
+        const gop = try seen.getOrPut(meta.key);
+        try std.testing.expect(!gop.found_existing);
+    }
+}
+
+test "every enabled channel has non-empty configured_message text" {
+    for (known_channels) |meta| {
+        if (!isBuildEnabled(meta.id)) continue;
+        try std.testing.expect(meta.configured_message.len > 0);
+        const has_label = std.ascii.indexOfIgnoreCase(meta.configured_message, meta.label) != null;
+        const has_configured = std.ascii.indexOfIgnoreCase(meta.configured_message, "configured") != null or
+            std.ascii.indexOfIgnoreCase(meta.configured_message, "enabled") != null;
+        try std.testing.expect(has_label or has_configured);
+    }
+}
+
+test "channel listener modes preserve daemon lifecycle semantics" {
+    // CLI and the generic webhook endpoint do not need the channel supervisor
+    // or an agent runtime.
+    try std.testing.expect(!contributesToDaemonSupervision(.cli));
+    try std.testing.expect(!requiresRuntime(.cli));
+    try std.testing.expect(!contributesToDaemonSupervision(.webhook));
+    try std.testing.expect(!requiresRuntime(.webhook));
+
+    // Send-only channels still need supervisor registration for outbound
+    // delivery, but must not force provider credentials or agent sessions.
+    try std.testing.expect(contributesToDaemonSupervision(.email));
+    try std.testing.expect(!requiresRuntime(.email));
+    try std.testing.expect(contributesToDaemonSupervision(.maixcam));
+    try std.testing.expect(!requiresRuntime(.maixcam));
+
+    // Inbound channels, regardless of transport style, require an agent runtime
+    // so inbound messages can be routed into sessions.
+    try std.testing.expect(contributesToDaemonSupervision(.signal));
+    try std.testing.expect(requiresRuntime(.signal));
+    try std.testing.expect(contributesToDaemonSupervision(.discord));
+    try std.testing.expect(requiresRuntime(.discord));
+    try std.testing.expect(contributesToDaemonSupervision(.line));
+    try std.testing.expect(requiresRuntime(.line));
 }

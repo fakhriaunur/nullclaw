@@ -29,6 +29,8 @@
 | `nullclaw onboard --api-key ... --provider ... --model ... --memory ...` | 一次性指定 provider、model、memory backend |
 | `nullclaw onboard --channels-only` | 只重配 channel / allowlist |
 | `nullclaw agent -m "..."` | 单条消息模式 |
+| `nullclaw agent --workspace /path/to/workspace -m "..."` | 本次进程使用指定 workspace 运行 agent |
+| `nullclaw agent --skill news-digest -m "..."` | 在指定 skill 激活的状态下执行单条消息 |
 | `nullclaw agent` | 交互会话模式 |
 
 ### 交互式模型路由
@@ -42,6 +44,7 @@
 - `/model auto` 会清除这个用户 pin，把会话恢复到配置里的默认模型，并让后续回合重新使用 `model_routes`。
 - 如果没有配置 `model_routes`，`/model auto` 仍然会清除 pin，并把会话切回配置里的默认模型。
 - 通过 `--model` 或 `--provider` 启动 `nullclaw agent` 时，也会把该次运行 pin 到显式模型，从而绕过 `model_routes`。
+- 通过 `--skill <name>` 启动 `nullclaw agent` 时，会在第一条消息或 REPL 轮次前激活该 skill。
 
 ## 运行与运维
 
@@ -50,13 +53,14 @@
 | `nullclaw gateway` | 启动长期运行 runtime，默认读取配置中的 host/port |
 | `nullclaw gateway --port 8080` | 用 CLI 覆盖网关端口 |
 | `nullclaw gateway --host 0.0.0.0 --port 8080` | 用 CLI 覆盖监听地址与端口 |
+| `nullclaw gateway --workspace /path/to/workspace` | 本次 gateway 进程使用指定 workspace |
 | `nullclaw service install` | 安装后台服务 |
 | `nullclaw service start` | 启动后台服务 |
 | `nullclaw service stop` | 停止后台服务 |
 | `nullclaw service restart` | 重启后台服务 |
 | `nullclaw service status` | 查看后台服务状态 |
 | `nullclaw service uninstall` | 卸载后台服务 |
-| `nullclaw status` | 查看全局状态总览 |
+| `nullclaw status [--json]` | 查看全局状态总览，或输出 machine-readable runtime snapshot |
 | `nullclaw doctor` | 执行系统诊断 |
 | `nullclaw update --check` | 仅检查是否有更新 |
 | `nullclaw update --yes` | 自动确认并安装更新 |
@@ -69,6 +73,7 @@
 
 - `auth` 目前只支持 `openai-codex`。
 - `gateway` 只是覆盖 host/port，其他安全策略仍以配置文件为准。
+- `agent --workspace` 和 `gateway --workspace` 只覆盖当前进程解析到的 workspace，效果等同于设置 `NULLCLAW_WORKSPACE`。
 
 ## 渠道、任务与扩展
 
@@ -76,10 +81,11 @@
 
 | 命令 | 说明 |
 |---|---|
-| `nullclaw channel list` | 列出已知 / 已配置渠道 |
+| `nullclaw channel list [--json]` | 列出已知 / 已配置渠道 |
 | `nullclaw channel start` | 启动默认可用渠道 |
 | `nullclaw channel start telegram` | 启动指定渠道 |
 | `nullclaw channel status` | 查看渠道健康状态 |
+| `nullclaw channel info <type> [--json]` | 查看某类渠道的已配置账号 |
 | `nullclaw channel add <type>` | 提示如何往配置里添加某类渠道 |
 | `nullclaw channel remove <name>` | 提示如何从配置里移除渠道 |
 
@@ -87,7 +93,8 @@
 
 | 命令 | 说明 |
 |---|---|
-| `nullclaw cron list` | 查看所有计划任务 |
+| `nullclaw cron list [--json]` | 查看所有计划任务 |
+| `nullclaw cron status [--json]` | 查看 scheduler 层状态与任务计数 |
 | `nullclaw cron add "0 * * * *" "command"` | 新增周期性 shell 任务 |
 | `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | 新增周期性 agent 任务 |
 | `nullclaw cron once 10m "command"` | 新增一次性延迟任务 |
@@ -103,7 +110,8 @@
 | 命令 | 说明 |
 |---|---|
 | `nullclaw skills list` | 列出已安装 skill |
-| `nullclaw skills install <source>` | 从 GitHub URL 或本地路径安装 skill |
+| `nullclaw skills install <source>` | 从 Git URL、本地路径或 HTTPS well-known skill 端点安装 skill |
+| `nullclaw skills install --name <query>` | 在 skill registry 中搜索并安装最匹配的 skill |
 | `nullclaw skills remove <name>` | 移除 skill |
 | `nullclaw skills info <name>` | 查看 skill 元信息 |
 
@@ -138,8 +146,11 @@
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | 重置 bundled markdown，并可附带清理 bootstrap / memory 文件 |
 | `nullclaw capabilities` | 输出运行时能力摘要 |
 | `nullclaw capabilities --json` | 输出 JSON manifest |
+| `nullclaw config show [--json]` | 输出完整的磁盘配置 |
+| `nullclaw config get <path> [--json]` | 读取一条 dotted config 值 |
 | `nullclaw models list` | 列出 provider 与默认模型 |
 | `nullclaw models info <model>` | 查看模型说明 |
+| `nullclaw models summary [--json]` | 输出供集成侧使用的 provider/key-safe 管理摘要 |
 | `nullclaw models benchmark` | 运行模型延迟基准 |
 | `nullclaw models refresh` | 刷新模型目录 |
 | `nullclaw migrate openclaw --dry-run` | 预演迁移 OpenClaw |
@@ -149,6 +160,7 @@
 
 - `workspace edit` 只适用于 file-based backend（如 `markdown`、`hybrid`）。
 - 如果当前 memory backend 把 bootstrap 数据放在数据库里，CLI 会提示改用 agent 的 `memory_store` 工具，或切回 file-based backend。
+- 这些带 `--json` 的 read-side 命令主要用于自动化集成，以及 NullHub 对 managed instance 的 admin API 边界。
 
 ## 硬件与自动化集成
 

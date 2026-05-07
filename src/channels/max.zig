@@ -5,6 +5,7 @@
 //! message editing, typing indicators, and attachment forwarding.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -295,7 +296,7 @@ const CallbackSelection = union(enum) {
 };
 
 threadlocal var tls_interaction_owner_identity: ?[]const u8 = null;
-var shared_interactions_mu: std.Thread.Mutex = .{};
+var shared_interactions_mu: std_compat.sync.Mutex = .{};
 var shared_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty;
 var shared_interaction_seq: Atomic(u64) = Atomic(u64).init(1);
 
@@ -327,7 +328,7 @@ fn typingLoop(task: *TypingTask) void {
 
         var elapsed: u64 = 0;
         while (elapsed < TYPING_INTERVAL_NS and !task.stop_requested.load(.acquire)) {
-            std.Thread.sleep(TYPING_SLEEP_STEP_NS);
+            std_compat.thread.sleep(TYPING_SLEEP_STEP_NS);
             elapsed += TYPING_SLEEP_STEP_NS;
         }
     }
@@ -357,10 +358,10 @@ pub const MaxChannel = struct {
     marker: ?[]u8 = null,
     running: bool = false,
 
-    typing_mu: std.Thread.Mutex = .{},
+    typing_mu: std_compat.sync.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
 
-    draft_mu: std.Thread.Mutex = .{},
+    draft_mu: std_compat.sync.Mutex = .{},
     draft_buffers: std.StringHashMapUnmanaged(DraftState) = .empty,
 
     // ── Construction ─────────────────────────────────────────────────
@@ -548,7 +549,7 @@ pub const MaxChannel = struct {
             if (attempt >= 4) return error.AttachmentNotReady;
 
             attempt += 1;
-            if (!builtin.is_test) std.Thread.sleep(500 * std.time.ns_per_ms);
+            if (!builtin.is_test) std_compat.thread.sleep(500 * std.time.ns_per_ms);
         }
     }
 
@@ -855,7 +856,7 @@ pub const MaxChannel = struct {
     fn handleSendEventChunk(self: *MaxChannel, target: []const u8, message: []const u8) !void {
         if (message.len == 0) return;
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
 
         self.draft_mu.lock();
         defer self.draft_mu.unlock();
@@ -2216,6 +2217,34 @@ test "parseCallbackPayload parses token and option index" {
     try std.testing.expectEqualStrings("abc123", parsed.token);
     try std.testing.expectEqual(@as(usize, 7), parsed.option_index);
     try std.testing.expect(parseCallbackPayload("plain") == null);
+}
+
+test "MaxChannel create + healthCheck + stop leaks zero bytes" {
+    // MaxChannel holds no heap allocations at init-time.  No deinit needed.
+    // healthCheck() returns true in test mode (builtin.is_test guard).
+    var ch_struct = MaxChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-bot-token",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "MaxChannel start + stop under is_test leaks zero bytes" {
+    // In .polling mode (default), vtableStart skips the unsubscribe call
+    // (!builtin.is_test guard) and fetchBotIdentity returns early
+    // (comptime builtin.is_test guard) — no network I/O, no thread.
+    // Double stop must be idempotent per Channel contract.
+    var ch_struct = MaxChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-bot-token",
+    });
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
 }
 
 test {

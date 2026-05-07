@@ -8,12 +8,14 @@
 //! Task state machine: submitted -> working -> completed | failed | canceled | rejected | input-required | auth-required
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const Config = @import("config.zig").Config;
 const gateway = @import("gateway.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const streaming = @import("streaming.zig");
+const agent_mod = @import("agent/root.zig");
 
 const log = std.log.scoped(.a2a);
 
@@ -125,7 +127,7 @@ fn sortTaskSnapshotsByRecency(tasks: []TaskSnapshot) void {
 
 pub const TaskRegistry = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std_compat.sync.Mutex = .{},
     tasks: std.StringHashMapUnmanaged(*TaskRecord) = .empty,
     next_id: u64 = 1,
 
@@ -177,7 +179,7 @@ pub const TaskRegistry = struct {
         const empty_agent = try self.allocator.dupe(u8, "");
         errdefer self.allocator.free(empty_agent);
 
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
 
         const task = try self.allocator.create(TaskRecord);
         errdefer self.allocator.destroy(task);
@@ -222,7 +224,7 @@ pub const TaskRegistry = struct {
         const task = self.tasks.get(task_id) orelse return false;
         if (isTerminalState(task.state) and task.state != new_state) return false;
         task.state = new_state;
-        task.updated_at = std.time.timestamp();
+        task.updated_at = std_compat.time.timestamp();
         return true;
     }
 
@@ -249,7 +251,7 @@ pub const TaskRegistry = struct {
         }
 
         task.state = final_state;
-        task.updated_at = std.time.timestamp();
+        task.updated_at = std_compat.time.timestamp();
         return try self.snapshotLocked(allocator, task);
     }
 
@@ -260,7 +262,7 @@ pub const TaskRegistry = struct {
         const task = self.tasks.get(task_id) orelse return null;
         if (!isTerminalState(task.state)) {
             task.state = .canceled;
-            task.updated_at = std.time.timestamp();
+            task.updated_at = std_compat.time.timestamp();
         }
         return try self.snapshotLocked(allocator, task);
     }
@@ -391,7 +393,8 @@ pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config, vision_
     const endpoint_url = buildEndpointUrl(allocator, cfg.a2a.url) catch return errorResponse();
     defer allocator.free(endpoint_url);
 
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     w.writeAll("{\"name\":\"") catch return errorResponse();
     gateway.jsonEscapeInto(w, cfg.a2a.name) catch return errorResponse();
     w.writeAll("\",\"description\":\"") catch return errorResponse();
@@ -430,6 +433,7 @@ pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config, vision_
     w.writeAll(",\"skills\":[{\"id\":\"chat\",\"name\":\"General Chat\",\"description\":\"General-purpose AI assistant\",\"tags\":[\"chat\",\"general\"]}]") catch return errorResponse();
     w.writeAll("}") catch return errorResponse();
 
+    buf = buf_writer.toArrayList();
     const body = buf.toOwnedSlice(allocator) catch return errorResponse();
     return .{ .body = body };
 }
@@ -497,7 +501,7 @@ pub fn isStreamingMethod(body: []const u8) bool {
 
 /// SSE Sink context — writes JSON-RPC SSE events to a raw TCP stream.
 pub const SseStreamCtx = struct {
-    stream: *std.net.Stream,
+    stream: *std_compat.net.Stream,
     allocator: std.mem.Allocator,
     request_id: []const u8,
     task_id: []const u8,
@@ -538,13 +542,62 @@ pub const SseStreamCtx = struct {
     }
 };
 
+const StatusMessage = struct {
+    prefix: []const u8 = "",
+    text: []const u8,
+};
+
+/// Context for forwarding agent progress hints as intermediate SSE status-update events.
+const A2aProgressCtx = struct {
+    sse_ctx: *SseStreamCtx,
+
+    fn progressCallback(ctx: *anyopaque, hint: agent_mod.ProgressHint) void {
+        const self: *A2aProgressCtx = @ptrCast(@alignCast(ctx));
+        const data = buildProgressHintEvent(
+            self.sse_ctx.allocator,
+            self.sse_ctx.request_id,
+            self.sse_ctx.task_id,
+            self.sse_ctx.context_id,
+            std_compat.time.timestamp(),
+            hint.text,
+        ) catch return;
+        defer self.sse_ctx.allocator.free(data);
+        self.sse_ctx.writeSseEvent(data);
+    }
+
+    pub fn makeSink(self: *A2aProgressCtx) agent_mod.ProgressSink {
+        return .{ .callback = progressCallback, .ctx = @ptrCast(self) };
+    }
+};
+
+/// Build a TaskStatusUpdateEvent with state=working and a progress message.
+fn buildProgressHintEvent(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    task_id: []const u8,
+    context_id: []const u8,
+    updated_at: i64,
+    tool_name: []const u8,
+) ![]u8 {
+    return buildStatusUpdateEvent(
+        allocator,
+        request_id,
+        task_id,
+        context_id,
+        .working,
+        updated_at,
+        .{ .prefix = "Calling tool: ", .text = tool_name },
+        false,
+    );
+}
+
 /// Handle a streaming JSON-RPC request by writing SSE events directly to the TCP stream.
 /// This bypasses the normal request/response cycle and writes directly.
 /// The caller must NOT call writeJsonResponse after this.
 pub fn handleStreamingRpc(
     allocator: std.mem.Allocator,
     body: []const u8,
-    stream: *std.net.Stream,
+    stream: *std_compat.net.Stream,
     registry: *TaskRegistry,
     session_mgr: anytype,
 ) void {
@@ -594,7 +647,7 @@ pub fn handleStreamingRpc(
         defer if (current_task) |*snapshot| snapshot.deinit(allocator);
         const current_snapshot = current_task orelse return;
         if (current_snapshot.state == .canceled) {
-            const final_event = buildStatusUpdateEvent(allocator, request_id, current_snapshot.id, current_snapshot.context_id, current_snapshot.state, current_snapshot.updated_at, true) catch return;
+            const final_event = buildStatusUpdateEvent(allocator, request_id, current_snapshot.id, current_snapshot.context_id, current_snapshot.state, current_snapshot.updated_at, null, true) catch return;
             defer allocator.free(final_event);
             stream.writeAll("data: ") catch return;
             stream.writeAll(final_event) catch return;
@@ -612,15 +665,17 @@ pub fn handleStreamingRpc(
         .context_id = task.context_id,
     };
     const sink = sse_ctx.makeSink();
+    var progress_ctx = A2aProgressCtx{ .sse_ctx = &sse_ctx };
+    const progress_sink = progress_ctx.makeSink();
 
     const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
-    const response = session_mgr.processMessageStreaming(task.session_key, text, context, sink) catch |err| {
+    const response = session_mgr.processInboundMessageStreaming(task.session_key, text, context, sink, progress_sink) catch |err| {
         log.err("streaming turn failed task={s} err={s}", .{ task.id, @errorName(err) });
         var failed_task = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         defer if (failed_task) |*snapshot| snapshot.deinit(allocator);
         if (failed_task) |snapshot| {
             if (snapshot.state == .canceled) {
-                const final_event = buildStatusUpdateEvent(allocator, request_id, snapshot.id, snapshot.context_id, snapshot.state, snapshot.updated_at, true) catch return;
+                const final_event = buildStatusUpdateEvent(allocator, request_id, snapshot.id, snapshot.context_id, snapshot.state, snapshot.updated_at, null, true) catch return;
                 defer allocator.free(final_event);
                 sse_ctx.writeSseEvent(final_event);
             } else {
@@ -631,13 +686,13 @@ pub fn handleStreamingRpc(
         }
         return;
     };
-    defer freeSessionResponse(session_mgr, response);
+    defer if (response) |r| freeSessionResponse(session_mgr, r);
 
     var final_task = registry.finalizeTask(allocator, task.id, .completed, response) catch return;
     defer if (final_task) |*snapshot| snapshot.deinit(allocator);
     const final_snapshot = final_task orelse return;
 
-    const final_event = buildStatusUpdateEvent(allocator, request_id, final_snapshot.id, final_snapshot.context_id, final_snapshot.state, final_snapshot.updated_at, true) catch return;
+    const final_event = buildStatusUpdateEvent(allocator, request_id, final_snapshot.id, final_snapshot.context_id, final_snapshot.state, final_snapshot.updated_at, null, true) catch return;
     defer allocator.free(final_event);
     sse_ctx.writeSseEvent(final_event);
 }
@@ -646,7 +701,7 @@ pub fn handleStreamingRpc(
 fn handleResubscribeStreaming(
     allocator: std.mem.Allocator,
     body: []const u8,
-    stream: *std.net.Stream,
+    stream: *std_compat.net.Stream,
     request_id: []const u8,
     registry: *TaskRegistry,
 ) void {
@@ -684,7 +739,7 @@ fn writeSseErrorEvent(allocator: std.mem.Allocator, sse_ctx: *SseStreamCtx, code
 }
 
 /// Write SSE headers and a single error event for pre-streaming failures.
-fn writeSseError(allocator: std.mem.Allocator, stream: *std.net.Stream, request_id: []const u8, code: i32, message: []const u8) void {
+fn writeSseError(allocator: std.mem.Allocator, stream: *std_compat.net.Stream, request_id: []const u8, code: i32, message: []const u8) void {
     stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch return;
     const err_json = buildJsonRpcError(allocator, request_id, code, message) catch return;
     defer allocator.free(err_json);
@@ -747,14 +802,14 @@ fn handleSendMessage(
     _ = registry.setTaskState(task.id, .working);
 
     const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
-    const response = session_mgr.processMessage(task.session_key, text, context) catch |err| {
+    const response = session_mgr.processInboundMessage(task.session_key, text, context) catch |err| {
         log.err("turn failed task={s} err={s}", .{ task.id, @errorName(err) });
         _ = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Agent processing failed") catch
             return errorResponse();
         return .{ .body = err_body };
     };
-    defer freeSessionResponse(session_mgr, response);
+    defer if (response) |r| freeSessionResponse(session_mgr, r);
 
     var completed_task = registry.finalizeTask(allocator, task.id, .completed, response) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Out of memory") catch
@@ -946,7 +1001,8 @@ fn handleListTasks(
     // Build result JSON: {"tasks":[...], "nextPageToken":"", "pageSize":N, "totalSize":N}
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     w.writeAll("{\"tasks\":[") catch return errorResponse();
     for (tasks, 0..) |*task, i| {
@@ -956,11 +1012,12 @@ fn handleListTasks(
         w.writeAll(task_json) catch return errorResponse();
     }
     w.writeAll("],\"nextPageToken\":\"\",\"pageSize\":") catch return errorResponse();
-    std.fmt.format(w, "{d}", .{page_size}) catch return errorResponse();
+    w.print("{d}", .{page_size}) catch return errorResponse();
     w.writeAll(",\"totalSize\":") catch return errorResponse();
-    std.fmt.format(w, "{d}", .{registry.taskCount()}) catch return errorResponse();
+    w.print("{d}", .{registry.taskCount()}) catch return errorResponse();
     w.writeByte('}') catch return errorResponse();
 
+    buf = buf_writer.toArrayList();
     const list_json = buf.toOwnedSlice(allocator) catch return errorResponse();
     defer allocator.free(list_json);
 
@@ -975,7 +1032,8 @@ fn handleListTasks(
 fn buildJsonRpcResult(allocator: std.mem.Allocator, request_id: []const u8, result_json: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try w.writeAll(request_id);
@@ -983,6 +1041,7 @@ fn buildJsonRpcResult(allocator: std.mem.Allocator, request_id: []const u8, resu
     try w.writeAll(result_json);
     try w.writeByte('}');
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -990,23 +1049,26 @@ fn buildJsonRpcResult(allocator: std.mem.Allocator, request_id: []const u8, resu
 fn buildJsonRpcError(allocator: std.mem.Allocator, request_id: []const u8, code: i32, message: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try w.writeAll(request_id);
     try w.writeAll(",\"error\":{\"code\":");
-    try std.fmt.format(w, "{d}", .{code});
+    try w.print("{d}", .{code});
     try w.writeAll(",\"message\":\"");
     try gateway.jsonEscapeInto(w, message);
     try w.writeAll("\"}}");
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
 fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot, max_history: ?i64) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     // Format timestamp as ISO 8601 from unix epoch seconds.
     var ts_buf: [32]u8 = undefined;
@@ -1068,6 +1130,7 @@ fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot, max_hi
 
     try w.writeByte('}');
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1324,7 +1387,7 @@ fn extractMessageContent(allocator: std.mem.Allocator, body: []const u8) !?[]u8 
     const message = extractObjectObjectField(params, "message") orelse return null;
     const parts_json = extractObjectArrayField(message, "parts") orelse return null;
 
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(allocator);
 
     // Walk every element of the parts array.
@@ -1466,6 +1529,7 @@ fn buildResubscribeStatusEvent(
         context_id,
         state,
         updated_at,
+        null,
         isTerminalState(state),
     );
 }
@@ -1480,7 +1544,8 @@ fn buildArtifactUpdateEvent(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try w.writeAll(request_id);
@@ -1496,6 +1561,7 @@ fn buildArtifactUpdateEvent(
     try w.writeAll(if (last_chunk) "true" else "false");
     try w.writeAll("}}");
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1506,11 +1572,13 @@ fn buildStatusUpdateEvent(
     context_id: []const u8,
     state: TaskState,
     updated_at: i64,
+    message: ?StatusMessage,
     final: bool,
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     var ts_buf: [32]u8 = undefined;
     const timestamp = formatTimestamp(&ts_buf, updated_at);
 
@@ -1524,10 +1592,18 @@ fn buildStatusUpdateEvent(
     try w.writeAll(state.jsonName());
     try w.writeAll("\",\"timestamp\":\"");
     try w.writeAll(timestamp);
-    try w.writeAll("\"},\"final\":");
+    try w.writeAll("\"");
+    if (message) |msg| {
+        try w.writeAll(",\"message\":{\"role\":\"agent\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
+        try gateway.jsonEscapeInto(w, msg.prefix);
+        try gateway.jsonEscapeInto(w, msg.text);
+        try w.writeAll("\"}]}");
+    }
+    try w.writeAll("},\"final\":");
     try w.writeAll(if (final) "true" else "false");
     try w.writeAll("}}");
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1567,18 +1643,33 @@ const MockSessionManager = struct {
     response: []const u8 = "mock response",
     interrupt_tool: ?[]const u8 = null,
     allocator: std.mem.Allocator = testing.allocator,
+    inbound_calls: usize = 0,
+    inbound_streaming_calls: usize = 0,
+    skip_inbound: bool = false,
 
     pub fn processMessage(self: *MockSessionManager, _: []const u8, _: []const u8, _: anytype) ![]const u8 {
         return self.allocator.dupe(u8, self.response);
     }
 
-    pub fn processMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink) ![]const u8 {
+    pub fn processInboundMessage(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype) !?[]const u8 {
+        self.inbound_calls += 1;
+        if (self.skip_inbound) return null;
+        return try self.processMessage(session_key, content, conversation_context);
+    }
+
+    pub fn processMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink, _: ?agent_mod.ProgressSink) ![]const u8 {
         // Emit chunks if a sink is provided.
         if (sink) |s| {
             s.emitChunk(self.response);
             s.emitFinal();
         }
         return self.processMessage(session_key, content, conversation_context);
+    }
+
+    pub fn processInboundMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink, progress_sink: ?agent_mod.ProgressSink) !?[]const u8 {
+        self.inbound_streaming_calls += 1;
+        if (self.skip_inbound) return null;
+        return try self.processMessageStreaming(session_key, content, conversation_context, sink, progress_sink);
     }
 
     pub fn requestTurnInterrupt(self: *MockSessionManager, _: []const u8) struct {
@@ -2438,6 +2529,26 @@ test "handleSendMessage accepts text/plain in acceptedOutputModes" {
     try testing.expectEqualStrings("200 OK", resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"result\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
+    try testing.expectEqual(@as(usize, 1), mock.inbound_calls);
+}
+
+test "handleSendMessage completes without artifact when inbound routing skips" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{ .skip_inbound = true };
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-skip","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hello"}]}}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    // Regression: A2A must honor queue_mode routing and accept injected/dropped
+    // inbound messages without starting a second turn.
+    try testing.expectEqualStrings("200 OK", resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"artifacts\"") == null);
+    try testing.expectEqual(@as(usize, 1), mock.inbound_calls);
 }
 
 test "handleSendMessage rejects negative historyLength" {
@@ -2629,4 +2740,37 @@ test "handleJsonRpc returns error for CreateTaskPushNotificationConfig alias" {
 
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "-32003") != null);
+}
+
+test "buildProgressHintEvent emits working status-update with tool name" {
+    // Regression: tool progress hints should reuse the normal status-update envelope.
+    const data = try buildProgressHintEvent(
+        testing.allocator,
+        "\"req-1\"",
+        "task-abc",
+        "ctx-xyz",
+        123,
+        "shell",
+    );
+    defer testing.allocator.free(data);
+
+    try testing.expect(std.mem.indexOf(u8, data, "\"state\":\"working\"") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"timestamp\":\"1970-01-01T00:02:03Z\"") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "Calling tool: shell") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"final\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "task-abc") != null);
+}
+
+test "buildProgressHintEvent escapes special chars in tool name" {
+    const data = try buildProgressHintEvent(
+        testing.allocator,
+        "\"req-2\"",
+        "task-1",
+        "ctx-1",
+        123,
+        "tool\"with\"quotes",
+    );
+    defer testing.allocator.free(data);
+
+    try testing.expect(std.mem.indexOf(u8, data, "tool\\\"with\\\"quotes") != null);
 }

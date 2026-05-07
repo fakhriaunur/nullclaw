@@ -9,11 +9,13 @@
 //! sessions are processed in parallel.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
 const fs_compat = @import("fs_compat.zig");
 const agent_routing = @import("agent_routing.zig");
 const agent_mod = @import("agent/root.zig");
+const turn_persistence = @import("agent/turn_persistence.zig");
 const Agent = agent_mod.Agent;
 const NamedAgentConfig = @import("config_types.zig").NamedAgentConfig;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
@@ -22,9 +24,11 @@ const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
 const memory_mod = @import("memory/root.zig");
 const Memory = memory_mod.Memory;
+const util = @import("util.zig");
 const onboard = @import("onboard.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
+const inbound_router = @import("inbound_router.zig");
 const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
 const cron_mod = @import("cron.zig");
@@ -35,6 +39,7 @@ const streaming = @import("streaming.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
+const MAX_POST_TURN_INJECTION_DRAINS: u32 = 8;
 const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
 const NS_PER_SEC: i128 = std.time.ns_per_s;
 const RUNTIME_COMMAND_ROLE = memory_mod.RUNTIME_COMMAND_ROLE;
@@ -70,10 +75,16 @@ const ClaimStateSnapshot = struct {
 };
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
-    if (text.len <= MESSAGE_LOG_MAX_BYTES) {
-        return .{ .slice = text, .truncated = false };
-    }
-    return .{ .slice = text[0..MESSAGE_LOG_MAX_BYTES], .truncated = true };
+    const preview = util.previewUtf8(text, MESSAGE_LOG_MAX_BYTES);
+    return .{ .slice = preview.slice, .truncated = preview.truncated };
+}
+
+test "messageLogPreview keeps UTF-8 intact when truncating" {
+    const prefix = "a" ** (MESSAGE_LOG_MAX_BYTES - 1);
+    const preview = messageLogPreview(prefix ++ "\xd0\x99tail");
+    try std.testing.expectEqualStrings(prefix, preview.slice);
+    try std.testing.expect(preview.truncated);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(preview.slice));
 }
 
 fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
@@ -83,13 +94,6 @@ fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
         total += agent_mod.estimate_text_tokens(entry.content);
     }
     return total;
-}
-
-fn persistedAssistantReply(agent: *const Agent, response: []const u8) []const u8 {
-    if (agent.history.items.len == 0) return response;
-    const last = agent.history.items[agent.history.items.len - 1];
-    if (last.role != .assistant) return response;
-    return last.content;
 }
 
 fn restorePersistedSessionState(session: *Session, entries: []const memory_mod.MessageEntry) void {
@@ -142,7 +146,7 @@ fn findProfileForSessionKey(config: *const Config, session_key: []const u8) ?con
 }
 
 const SessionProviderContext = struct {
-    provider: Provider,
+    provider: ?Provider = null,
     holder: ?providers.ProviderHolder = null,
     owned_api_key: ?[]u8 = null,
 
@@ -173,14 +177,64 @@ pub const Session = struct {
     session_key: []const u8, // owned copy
     turn_count: u64,
     turn_running: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
+    /// Protects injection_pending independently of the session turn mutex.
+    injection_mu: std_compat.sync.Mutex = .{},
+    /// Pending mid-turn message; owned by the SessionManager allocator.
+    injection_pending: ?[]u8 = null,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
         if (self.provider_holder) |*holder| holder.deinit();
         if (self.owned_provider_api_key) |key| allocator.free(key);
         if (self.owned_memory_session_id) |sid| allocator.free(sid);
+        if (self.injection_pending) |p| allocator.free(p);
         allocator.free(self.session_key);
+    }
+
+    /// Deposit text in the injection buffer (replaces any existing pending injection).
+    /// Must be called with the SM allocator, NOT while holding session.mutex.
+    pub fn injectMidTurn(self: *Session, allocator: Allocator, text: []const u8) !void {
+        const duped = try allocator.dupe(u8, text);
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        if (self.injection_pending) |old| allocator.free(old);
+        self.injection_pending = duped;
+    }
+
+    /// Deposit text only if a turn is still running after the injection lock is held.
+    pub fn injectMidTurnIfRunning(self: *Session, allocator: Allocator, text: []const u8) !bool {
+        if (!self.turn_running.load(.acquire)) return false;
+        const duped = try allocator.dupe(u8, text);
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        if (!self.turn_running.load(.acquire)) {
+            allocator.free(duped);
+            return false;
+        }
+        if (self.injection_pending) |old| allocator.free(old);
+        self.injection_pending = duped;
+        return true;
+    }
+
+    /// Returns true if there is a pending injection.
+    pub fn hasInjection(self: *Session) bool {
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        return self.injection_pending != null;
+    }
+
+    /// Drain and duplicate the pending injection into dst_allocator.
+    /// On allocation failure the pending message stays buffered for a later retry.
+    pub fn drainInjection(self: *Session, sm_allocator: Allocator, dst_allocator: Allocator) !?[]u8 {
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+
+        const pending = self.injection_pending orelse return null;
+        const duped = try dst_allocator.dupe(u8, pending);
+        sm_allocator.free(pending);
+        self.injection_pending = null;
+        return duped;
     }
 };
 
@@ -227,9 +281,9 @@ pub const SessionManager = struct {
     /// false = model rejected images (ProviderDoesNotSupportVision).
     vision_capable: ?bool = null,
 
-    mutex: std.Thread.Mutex,
-    usage_log_mutex: std.Thread.Mutex,
-    claim_state_io_mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
+    usage_log_mutex: std_compat.sync.Mutex,
+    claim_state_io_mutex: std_compat.sync.Mutex,
     usage_ledger_state_initialized: bool,
     usage_ledger_window_started_at: i64,
     usage_ledger_line_count: u64,
@@ -258,8 +312,8 @@ pub const SessionManager = struct {
         const claim_state_path = blk: {
             const secret = config.session.claim_secret orelse break :blk null;
             if (std.mem.trim(u8, secret, " \t\r\n").len == 0) break :blk null;
-            const config_dir = std.fs.path.dirname(config.config_path) orelse ".";
-            break :blk std.fs.path.join(allocator, &.{ config_dir, "state", CLAIM_STATE_FILENAME }) catch null;
+            const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
+            break :blk std_compat.fs.path.join(allocator, &.{ config_dir, "state", CLAIM_STATE_FILENAME }) catch null;
         };
 
         var manager: SessionManager = .{
@@ -740,7 +794,7 @@ pub const SessionManager = struct {
         self.claim_state_loaded = true;
         const path = self.claim_state_path orelse return;
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch return;
+        const file = std_compat.fs.openFileAbsolute(path, .{}) catch return;
         defer file.close();
         const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return;
         defer self.allocator.free(content);
@@ -750,7 +804,7 @@ pub const SessionManager = struct {
         if (parsed.value != .object) return;
         const root = parsed.value.object;
 
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
 
         if (root.get("bindings")) |bindings_val| {
             if (bindings_val == .array) {
@@ -830,12 +884,13 @@ pub const SessionManager = struct {
         if (self.claim_state_path == null) return null;
         if (self.claim_state_generation <= self.claim_state_persisted_generation) return null;
 
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         self.clearExpiredClaimNoncesLocked(now_ts);
 
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        const w = &buf_writer.writer;
 
         w.print("{{\"version\":{d},\"bindings\":[", .{CLAIM_STATE_VERSION}) catch return null;
 
@@ -895,6 +950,7 @@ pub const SessionManager = struct {
         }
 
         w.writeAll("]}") catch return null;
+        buf = buf_writer.toArrayList();
         const content = buf.toOwnedSlice(self.allocator) catch return null;
         return .{
             .generation = self.claim_state_generation,
@@ -916,8 +972,8 @@ pub const SessionManager = struct {
         self.mutex.unlock();
         if (is_stale) return;
 
-        if (std.fs.path.dirname(path)) |parent| {
-            std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+        if (std_compat.fs.path.dirname(path)) |parent| {
+            std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
                     fs_compat.makePath(parent) catch return;
@@ -928,17 +984,17 @@ pub const SessionManager = struct {
         const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path}) catch return;
         defer self.allocator.free(tmp_path);
 
-        var tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return;
+        var tmp_file = std_compat.fs.createFileAbsolute(tmp_path, .{}) catch return;
         tmp_file.writeAll(claim_snapshot.content) catch {
             tmp_file.close();
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
             return;
         };
         tmp_file.close();
 
-        std.fs.renameAbsolute(tmp_path, path) catch {
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
-            const file = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
+        std_compat.fs.renameAbsolute(tmp_path, path) catch {
+            std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+            const file = std_compat.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
             defer file.close();
             file.writeAll(claim_snapshot.content) catch return;
         };
@@ -980,7 +1036,7 @@ pub const SessionManager = struct {
         if (!std.mem.startsWith(u8, parseAgentIdFromSessionKey(session_key), "peer-")) return null;
 
         const direct_ctx = directContextForClaims(session_key, conversation_context) orelse return null;
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
 
         if (revokeSecretArg(content)) |provided_revoke_secret| {
             const admin_secret = self.claimAdminSecret() orelse {
@@ -1142,10 +1198,10 @@ pub const SessionManager = struct {
             }
         }
 
-        const config_dir = std.fs.path.dirname(self.config.config_path) orelse ".";
+        const config_dir = std_compat.fs.path.dirname(self.config.config_path) orelse ".";
         const normalized = try sanitizePathComponent(self.allocator, agent_id);
         defer self.allocator.free(normalized);
-        return std.fs.path.join(self.allocator, &.{ config_dir, "agents", normalized, "workspace" });
+        return std_compat.fs.path.join(self.allocator, &.{ config_dir, "agents", normalized, "workspace" });
     }
 
     fn makeAgentConfig(base: *const Config, workspace_dir: []const u8, named_agent: ?NamedAgentConfig) Config {
@@ -1289,7 +1345,7 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
 
         if (self.sessions.get(session_key)) |session| {
-            session.last_active = std.time.timestamp();
+            session.last_active = std_compat.time.timestamp();
             return session;
         }
 
@@ -1340,7 +1396,7 @@ pub const SessionManager = struct {
         const session_provider = if (session.provider_holder) |*holder|
             holder.provider()
         else
-            provider_ctx.provider;
+            provider_ctx.provider.?;
 
         var agent = try Agent.fromConfigWithProfile(
             self.allocator,
@@ -1378,8 +1434,8 @@ pub const SessionManager = struct {
             .provider_holder = session_provider_holder,
             .owned_provider_api_key = session_owned_provider_api_key,
             .owned_memory_session_id = owned_memory_session_id,
-            .created_at = std.time.timestamp(),
-            .last_active = std.time.timestamp(),
+            .created_at = std_compat.time.timestamp(),
+            .last_active = std_compat.time.timestamp(),
             .last_consolidated = 0,
             .session_key = owned_key,
             .turn_count = 0,
@@ -1427,7 +1483,7 @@ pub const SessionManager = struct {
             break :blk owned_api_key;
         };
 
-        var holder = providers.ProviderHolder.fromConfigWithApiMode(
+        const holder = providers.ProviderHolder.fromConfigWithApiMode(
             self.allocator,
             profile.provider,
             provider_api_key,
@@ -1437,9 +1493,9 @@ pub const SessionManager = struct {
             self.config.getProviderApiMode(profile.provider),
             self.config.getProviderMaxStreamingPromptBytes(profile.provider),
             self.config.getProviderChatTemplateEnableThinkingParam(profile.provider),
+            self.config.getProviderExtraBodyParams(profile.provider),
         );
         return .{
-            .provider = holder.provider(),
             .holder = holder,
             .owned_api_key = owned_api_key,
         };
@@ -1461,8 +1517,8 @@ pub const SessionManager = struct {
 
     fn usageLedgerPath(self: *SessionManager) ?[]u8 {
         if (!self.config.diagnostics.token_usage_ledger_enabled) return null;
-        const config_dir = std.fs.path.dirname(self.config.config_path) orelse return null;
-        return std.fs.path.join(self.allocator, &.{ config_dir, TOKEN_USAGE_LEDGER_FILENAME }) catch null;
+        const config_dir = std_compat.fs.path.dirname(self.config.config_path) orelse return null;
+        return std_compat.fs.path.join(self.allocator, &.{ config_dir, TOKEN_USAGE_LEDGER_FILENAME }) catch null;
     }
 
     fn usageWindowSeconds(self: *SessionManager) i64 {
@@ -1471,7 +1527,7 @@ pub const SessionManager = struct {
         return @as(i64, @intCast(hours)) * 60 * 60;
     }
 
-    fn countLedgerLines(file: *std.fs.File) !u64 {
+    fn countLedgerLines(file: *std_compat.fs.File) !u64 {
         try file.seekTo(0);
         var lines: u64 = 0;
         var saw_data = false;
@@ -1490,8 +1546,8 @@ pub const SessionManager = struct {
 
     fn initializeUsageLedgerState(
         self: *SessionManager,
-        file: *std.fs.File,
-        stat: std.fs.File.Stat,
+        file: *std_compat.fs.File,
+        stat: std_compat.fs.File.Stat,
         now_ts: i64,
     ) void {
         if (self.usage_ledger_state_initialized) return;
@@ -1512,7 +1568,7 @@ pub const SessionManager = struct {
 
     fn shouldResetUsageLedger(
         self: *SessionManager,
-        stat: std.fs.File.Stat,
+        stat: std_compat.fs.File.Stat,
         now_ts: i64,
         pending_bytes: usize,
         pending_lines: u64,
@@ -1542,14 +1598,11 @@ pub const SessionManager = struct {
         const ledger_path = self.usageLedgerPath() orelse return;
         defer self.allocator.free(ledger_path);
 
-        var file = std.fs.openFileAbsolute(ledger_path, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => std.fs.createFileAbsolute(ledger_path, .{ .truncate = false, .read = true }) catch return,
-            else => return,
-        };
+        var file = fs_compat.openPathForAppend(ledger_path) catch return;
         var file_needs_close = true;
         defer if (file_needs_close) file.close();
 
-        const now_ts = std.time.timestamp();
+        const now_ts = std_compat.time.timestamp();
         const stat = fs_compat.stat(file) catch return;
         self.initializeUsageLedgerState(&file, stat, now_ts);
 
@@ -1572,7 +1625,7 @@ pub const SessionManager = struct {
         if (self.shouldResetUsageLedger(stat, now_ts, pending_bytes, 1)) {
             file.close();
             file_needs_close = false;
-            file = std.fs.createFileAbsolute(ledger_path, .{ .truncate = true, .read = true }) catch return;
+            file = std_compat.fs.createFileAbsolute(ledger_path, .{ .truncate = true, .read = true }) catch return;
             file_needs_close = true;
             self.usage_ledger_state_initialized = true;
             self.usage_ledger_window_started_at = now_ts;
@@ -1595,10 +1648,76 @@ pub const SessionManager = struct {
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
-        return self.processMessageStreaming(session_key, content, conversation_context, null);
+        return self.processMessageStreaming(session_key, content, conversation_context, null, null);
     }
 
-    /// Process a message within a session context and optionally forward text deltas.
+    fn lockSessionForTurn(session: *Session) void {
+        session.mutex.lock();
+    }
+
+    /// Route and process an inbound message. Returns null when routing consumed
+    /// the message via drop/injection and the caller should not send a reply.
+    pub fn processInboundMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) !?[]const u8 {
+        if (self.routeInbound(session_key, content) == .skip) return null;
+        return try self.processMessage(session_key, content, conversation_context);
+    }
+
+    /// Streaming variant of processInboundMessage.
+    pub fn processInboundMessageStreaming(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+        stream_sink: ?streaming.Sink,
+        progress_sink: ?agent_mod.ProgressSink,
+    ) !?[]const u8 {
+        if (self.routeInbound(session_key, content) == .skip) return null;
+        return try self.processMessageStreaming(session_key, content, conversation_context, stream_sink, progress_sink);
+    }
+
+    /// Handle a slash command against the live session without invoking the LLM turn loop.
+    /// Used for transport-driven local UIs such as Telegram callback menus.
+    pub fn handleLocalSlashCommand(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+    ) !?[]const u8 {
+        const session = try self.getOrCreate(session_key);
+
+        lockSessionForTurn(session);
+        defer session.mutex.unlock();
+        session.turn_running.store(true, .release);
+        defer {
+            session.turn_running.store(false, .release);
+            session.agent.clearInterruptRequest();
+        }
+
+        session.agent.conversation_context = conversation_context;
+        defer session.agent.conversation_context = null;
+        setTurnToolContext(session.agent.tools, session_key, conversation_context);
+
+        const maybe_response = try session.agent.handleSlashCommand(content);
+        if (maybe_response == null) return null;
+
+        session.turn_count += 1;
+        session.last_active = std_compat.time.timestamp();
+
+        if (session.agent.session_store) |store| {
+            const turn_input = agent_mod.commands.planTurnInput(content);
+            if (turn_input.clear_session) {
+                store.clearMessages(session_key) catch {};
+                store.clearAutoSaved(session_key) catch {};
+            }
+            if (agent_mod.commands.persistedRuntimeCommand(content)) |runtime_command| {
+                store.saveMessage(session_key, RUNTIME_COMMAND_ROLE, runtime_command) catch {};
+            }
+        }
+
+        return maybe_response;
+    }
+
+    /// Process a message within a session context and optionally forward text deltas and progress hints.
     /// Deltas are only emitted when provider streaming is active.
     pub fn processMessageStreaming(
         self: *SessionManager,
@@ -1606,6 +1725,7 @@ pub const SessionManager = struct {
         content: []const u8,
         conversation_context: ?ConversationContext,
         stream_sink: ?streaming.Sink,
+        progress_sink: ?agent_mod.ProgressSink,
     ) ![]const u8 {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
@@ -1646,7 +1766,7 @@ pub const SessionManager = struct {
 
         const session = try self.getOrCreate(session_key);
 
-        session.mutex.lock();
+        lockSessionForTurn(session);
         defer session.mutex.unlock();
         session.turn_running.store(true, .release);
         defer {
@@ -1676,7 +1796,38 @@ pub const SessionManager = struct {
             session.agent.stream_ctx = null;
         }
 
-        const turn_input = agent_mod.commands.planTurnInput(content);
+        const prev_progress_callback = session.agent.progress_callback;
+        const prev_progress_ctx = session.agent.progress_ctx;
+        defer {
+            session.agent.progress_callback = prev_progress_callback;
+            session.agent.progress_ctx = prev_progress_ctx;
+        }
+        if (progress_sink) |ps| {
+            session.agent.progress_callback = ps.callback;
+            session.agent.progress_ctx = ps.ctx;
+        } else {
+            session.agent.progress_callback = null;
+            session.agent.progress_ctx = null;
+        }
+
+        const DrainCtx = struct {
+            session: *Session,
+            sm_allocator: Allocator,
+
+            fn callback(ctx: *anyopaque, agent_alloc: std.mem.Allocator) !?[]u8 {
+                const dc: *@This() = @ptrCast(@alignCast(ctx));
+                return dc.session.drainInjection(dc.sm_allocator, agent_alloc);
+            }
+        };
+        var drain_ctx = DrainCtx{ .session = session, .sm_allocator = self.allocator };
+        const prev_drain_cb = session.agent.drain_injection_cb;
+        const prev_drain_ctx_val = session.agent.drain_injection_ctx;
+        defer {
+            session.agent.drain_injection_cb = prev_drain_cb;
+            session.agent.drain_injection_ctx = prev_drain_ctx_val;
+        }
+        session.agent.drain_injection_cb = DrainCtx.callback;
+        session.agent.drain_injection_ctx = @ptrCast(&drain_ctx);
 
         // Record agent start event with channel attribution
         const start_event = @import("observability.zig").ObserverEvent{ .agent_start = .{
@@ -1687,45 +1838,40 @@ pub const SessionManager = struct {
         } };
         session.agent.observer.recordEvent(&start_event);
 
-        const response = try session.agent.turn(content);
-        session.turn_count += 1;
-        session.last_active = std.time.timestamp();
+        var response = try session.agent.turn(content);
+        var completed_turns: u64 = 1;
+
+        var late_drain_count: u32 = 0;
+        while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
+            const late_content = (try session.drainInjection(self.allocator, self.allocator)) orelse break;
+            defer self.allocator.free(late_content);
+
+            const previous_response = response;
+            response = session.agent.turn(late_content) catch |err| {
+                self.allocator.free(previous_response);
+                return err;
+            };
+            self.allocator.free(previous_response);
+            completed_turns += 1;
+        }
+        if (late_drain_count == MAX_POST_TURN_INJECTION_DRAINS and session.hasInjection()) {
+            log.warn("post-turn injection drain limit reached session=0x{x}", .{session_hash});
+        }
+
+        session.turn_count += completed_turns;
+        session.last_active = std_compat.time.timestamp();
 
         // Track consolidation timestamp
         if (session.agent.last_turn_compacted) {
-            session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
+            session.last_consolidated = @intCast(@max(0, std_compat.time.timestamp()));
         }
 
         // Persist messages via session store
         if (session.agent.session_store) |store| {
-            if (turn_input.clear_session) {
-                // Clear persisted messages on session reset
-                store.clearMessages(session_key) catch {};
-                // Clear stale auto-saved memories
-                store.clearAutoSaved(session_key) catch {};
-            }
-
-            if (agent_mod.commands.persistedRuntimeCommand(content)) |runtime_command| {
-                store.saveMessage(session_key, RUNTIME_COMMAND_ROLE, runtime_command) catch {};
-            }
-
-            if (turn_input.llm_user_message) |persisted_user| {
-                // Persist canonical conversation history.
-                // Local-only slash commands are skipped, but any input that
-                // reached the LLM must persist with the exact same routing
-                // decision used by Agent.turn().
-                // When the turn ends with an assistant history message, prefer
-                // that canonical text over the rendered reply so restored
-                // sessions do not replay /usage footers or reasoning blocks.
-                // Some degraded turns return a fallback response without
-                // appending a final assistant history entry; in that case we
-                // must persist the actual response instead of stale tool-step
-                // assistant text from earlier in the turn.
-                const persisted_assistant = persistedAssistantReply(&session.agent, response);
-                store.saveMessage(session_key, "user", persisted_user) catch {};
-                store.saveMessage(session_key, "assistant", persisted_assistant) catch {};
-                store.saveUsage(session_key, session.agent.total_tokens) catch {};
-            }
+            turn_persistence.persistTurn(store, .{
+                .history = session.agent.history.items,
+                .total_tokens = session.agent.total_tokens,
+            }, session_key, content, response);
         }
 
         if (self.config.diagnostics.log_message_payloads) {
@@ -1754,6 +1900,76 @@ pub const SessionManager = struct {
             self.active_tool = null;
         }
     };
+
+    /// Return the routing input for a session without acquiring the long turn mutex.
+    /// If the session does not exist yet, returns defaults (process, off, false).
+    pub fn routeInput(self: *SessionManager, session_key: []const u8) inbound_router.RouteInput {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session = self.sessions.get(session_key) orelse return .{
+            .turn_running = false,
+            .queue_mode = .off,
+            .has_pending_injection = false,
+        };
+        return .{
+            .turn_running = session.turn_running.load(.acquire),
+            .queue_mode = session.agent.queue_mode,
+            .has_pending_injection = session.hasInjection(),
+        };
+    }
+
+    /// Deposit a mid-turn injection for a running session.
+    /// Safe to call while the session turn is in progress — does not acquire session.mutex.
+    /// Replaces any existing pending injection.  No-op when session does not exist.
+    pub fn injectMidTurn(self: *SessionManager, session_key: []const u8, text: []const u8) !void {
+        const session = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk self.sessions.get(session_key) orelse return;
+        };
+        try session.injectMidTurn(self.allocator, text);
+    }
+
+    /// Deposit a mid-turn injection only if the session is still running.
+    fn injectMidTurnIfRunning(self: *SessionManager, session_key: []const u8, text: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session = self.sessions.get(session_key) orelse return false;
+        return try session.injectMidTurnIfRunning(self.allocator, text);
+    }
+
+    fn isSessionTurnRunning(self: *SessionManager, session_key: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session = self.sessions.get(session_key) orelse return false;
+        return session.turn_running.load(.acquire);
+    }
+
+    pub const InboundRouteAction = enum {
+        process,
+        skip,
+    };
+
+    /// Apply inbound routing side effects for a message.
+    /// Returns .skip when the caller should not start a new turn.
+    pub fn routeInbound(self: *SessionManager, session_key: []const u8, content: []const u8) InboundRouteAction {
+        const session_hash = std.hash.Wyhash.hash(0, session_key);
+        return switch (inbound_router.route(self.routeInput(session_key))) {
+            .inject, .replace_injection => blk: {
+                const injected = self.injectMidTurnIfRunning(session_key, content) catch |err| {
+                    log.warn("mid-turn inject failed session=0x{x} err={}", .{ session_hash, err });
+                    break :blk .process;
+                };
+                break :blk if (injected) .skip else .process;
+            },
+            .drop => blk: {
+                if (!self.isSessionTurnRunning(session_key)) break :blk .process;
+                log.info("dropping message: session busy queue_mode=off session=0x{x}", .{session_hash});
+                break :blk .skip;
+            },
+            .process, .queue => .process,
+        };
+    }
 
     pub const SessionSnapshot = struct {
         session_key: []u8,
@@ -1947,13 +2163,13 @@ pub const SessionManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         var evicted: usize = 0;
 
         // Collect keys to remove (can't modify map while iterating).
         // Active turns keep stale last_active until the turn finishes, so skip
         // any session that is currently executing.
-        var to_remove: std.ArrayListUnmanaged([]const u8) = .{};
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var it = self.sessions.iterator();
@@ -2070,6 +2286,146 @@ const MockProvider = struct {
     }
 
     fn mockDeinit(_: *anyopaque) void {}
+};
+
+const CaptureMessagesProvider = struct {
+    response: []const u8 = "ok",
+    chat_calls: usize = 0,
+    user_count: usize = 0,
+    user_lens: [4]usize = [_]usize{0} ** 4,
+    user_bufs: [4][128]u8 = undefined,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn provider(self: *CaptureMessagesProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatWithSystem(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *CaptureMessagesProvider = @ptrCast(@alignCast(ptr));
+        return allocator.dupe(u8, self.response);
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        request: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *CaptureMessagesProvider = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        self.user_count = 0;
+        for (request.messages) |message| {
+            if (message.role != .user or self.user_count >= self.user_bufs.len) continue;
+            const idx = self.user_count;
+            const len = @min(message.content.len, self.user_bufs[idx].len);
+            @memcpy(self.user_bufs[idx][0..len], message.content[0..len]);
+            self.user_lens[idx] = len;
+            self.user_count += 1;
+        }
+        return .{ .content = try allocator.dupe(u8, self.response) };
+    }
+
+    fn userMessage(self: *const CaptureMessagesProvider, idx: usize) []const u8 {
+        return self.user_bufs[idx][0..self.user_lens[idx]];
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "capture_messages";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+const LateInjectionProvider = struct {
+    session_mgr: *SessionManager,
+    session_key: []const u8,
+    chat_calls: usize = 0,
+    route_action: ?SessionManager.InboundRouteAction = null,
+    user_count: usize = 0,
+    user_lens: [4]usize = [_]usize{0} ** 4,
+    user_bufs: [4][128]u8 = undefined,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn provider(self: *LateInjectionProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatWithSystem(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *LateInjectionProvider = @ptrCast(@alignCast(ptr));
+        return allocator.dupe(u8, if (self.chat_calls == 0) "first response" else "final response");
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        request: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *LateInjectionProvider = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        self.user_count = 0;
+        for (request.messages) |message| {
+            if (message.role != .user or self.user_count >= self.user_bufs.len) continue;
+            const idx = self.user_count;
+            const len = @min(message.content.len, self.user_bufs[idx].len);
+            @memcpy(self.user_bufs[idx][0..len], message.content[0..len]);
+            self.user_lens[idx] = len;
+            self.user_count += 1;
+        }
+        if (self.chat_calls == 1) {
+            self.route_action = self.session_mgr.routeInbound(self.session_key, "late message");
+            return .{ .content = try allocator.dupe(u8, "first response") };
+        }
+        return .{ .content = try allocator.dupe(u8, "final response") };
+    }
+
+    fn userMessage(self: *const LateInjectionProvider, idx: usize) []const u8 {
+        return self.user_bufs[idx][0..self.user_lens[idx]];
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "late_injection";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
 };
 
 const CapturePromptProvider = struct {
@@ -2211,6 +2567,23 @@ const DeltaCollector = struct {
 
     fn deinit(self: *DeltaCollector) void {
         self.data.deinit(self.allocator);
+    }
+};
+
+const ProgressCollector = struct {
+    count: usize = 0,
+    last_text_buf: [64]u8 = undefined,
+    last_text_len: usize = 0,
+
+    fn onEvent(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
+        const self: *ProgressCollector = @ptrCast(@alignCast(ctx_ptr));
+        self.count += 1;
+        self.last_text_len = @min(hint.text.len, self.last_text_buf.len);
+        @memcpy(self.last_text_buf[0..self.last_text_len], hint.text[0..self.last_text_len]);
+    }
+
+    fn lastText(self: *const ProgressCollector) []const u8 {
+        return self.last_text_buf[0..self.last_text_len];
     }
 };
 
@@ -2424,7 +2797,7 @@ fn testClaimCommand(allocator: Allocator, token: []const u8) ![]u8 {
 
 fn toNativePathFragment(allocator: Allocator, unix_path_fragment: []const u8) ![]u8 {
     const native = try allocator.dupe(u8, unix_path_fragment);
-    if (std.fs.path.sep == '\\') {
+    if (std_compat.fs.path.sep == '\\') {
         for (native) |*ch| {
             if (ch.* == '/') ch.* = '\\';
         }
@@ -2463,7 +2836,7 @@ test "usage ledger appends records when retention limits are disabled" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2497,7 +2870,7 @@ test "usage ledger appends records when retention limits are disabled" {
         .success = true,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2511,7 +2884,7 @@ test "usage ledger resets when max line limit is reached" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2552,7 +2925,7 @@ test "usage ledger resets when max line limit is reached" {
         .success = true,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2567,7 +2940,7 @@ test "usage ledger resets when window expires" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2595,7 +2968,7 @@ test "usage ledger resets when window expires" {
     });
 
     sm.usage_ledger_state_initialized = true;
-    sm.usage_ledger_window_started_at = std.time.timestamp() - 2 * 60 * 60;
+    sm.usage_ledger_window_started_at = std_compat.time.timestamp() - 2 * 60 * 60;
 
     sm.appendUsageRecord(.{
         .ts = 11,
@@ -2605,7 +2978,7 @@ test "usage ledger resets when window expires" {
         .success = true,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2620,7 +2993,7 @@ test "usage ledger resets when byte limit would be exceeded" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2654,7 +3027,7 @@ test "usage ledger resets when byte limit would be exceeded" {
         .success = true,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2669,7 +3042,7 @@ test "usage ledger records failed response flag" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2696,7 +3069,7 @@ test "usage ledger records failed response flag" {
         .success = false,
     });
 
-    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(ledger_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
     defer testing.allocator.free(content);
@@ -2768,17 +3141,26 @@ test "getOrCreate stores named agent provider interface from session-owned holde
     var mock = MockProvider{ .response = "ok" };
     var cfg = testConfig();
     cfg.default_provider = "openrouter";
+    cfg.providers = &.{
+        .{
+            .name = "custom:dmr",
+            .base_url = "http://127.0.0.1:8080/v1",
+        },
+    };
     cfg.agents = &.{
         .{
             .name = "Coder Agent",
-            .provider = "ollama",
-            .model = "qwen2.5-coder:14b",
+            .provider = "custom:dmr",
+            .model = "smollm2",
+            .api_key = "placeholder",
         },
     };
 
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
+    // Regression: issue #811 requires holder-backed custom providers to bind
+    // Agent.provider to the session-owned holder rather than transient storage.
     const session = try sm.getOrCreate("agent:coder-agent:telegram:group:-100123");
     try testing.expect(session.provider_holder != null);
 
@@ -2786,17 +3168,23 @@ test "getOrCreate stores named agent provider interface from session-owned holde
     const holder_provider = holder.provider();
     try testing.expect(session.agent.provider.ptr == holder_provider.ptr);
     try testing.expect(session.agent.provider.vtable == holder_provider.vtable);
+    switch (session.provider_holder.?) {
+        .compatible => |*compatible_provider| {
+            try testing.expectEqual(@intFromPtr(compatible_provider), @intFromPtr(session.agent.provider.ptr));
+        },
+        else => unreachable,
+    }
 }
 
 test "getOrCreate uses named agent workspace namespace when workspace_path is set" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
-    const config_path = try std.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(testing.allocator, &.{ base, "config.json" });
     defer testing.allocator.free(config_path);
-    const expected_workspace = try std.fs.path.join(testing.allocator, &.{ base, "agents", "coder-agent" });
+    const expected_workspace = try std_compat.fs.path.join(testing.allocator, &.{ base, "agents", "coder-agent" });
     defer testing.allocator.free(expected_workspace);
 
     var mock = MockProvider{ .response = "ok" };
@@ -2825,9 +3213,9 @@ test "getOrCreate preserves named agent system prompt when workspace_path is set
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
-    const config_path = try std.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(testing.allocator, &.{ base, "config.json" });
     defer testing.allocator.free(config_path);
 
     const expected_prompt = "Focus on implementation and tests.";
@@ -2869,7 +3257,7 @@ test "getOrCreate auto-provisioned peer uses dedicated runtime workspace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2896,7 +3284,7 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2924,11 +3312,67 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
 }
 
+test "handleLocalSlashCommand activates interactive skill session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir = std_compat.fs.Dir.wrap(tmp.dir);
+
+    const base = try tmp_dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    try tmp_dir.makePath("skills/news-digest");
+    {
+        const f = try tmp_dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp_dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:main:telegram:group:-100123:thread:7";
+    const response = (try sm.handleLocalSlashCommand(session_key, "/iskill news-digest", .{
+        .channel = "telegram",
+        .account_id = "main",
+        .peer_id = "-100123:thread:7",
+        .group_id = "-100123",
+        .is_group = true,
+    })).?;
+    defer testing.allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "Active skill set to `news-digest`") != null);
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(session.agent.active_skill_name != null);
+    try testing.expectEqualStrings("news-digest", session.agent.active_skill_name.?);
+    try testing.expect(session.agent.active_skill_interactive);
+}
+
 test "claim gate blocks unverified peer when dm_scope is main" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -2960,7 +3404,7 @@ test "claim gate attempts are scoped by account_id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3011,7 +3455,7 @@ test "claim gate blocks unverified peer before session provisioning" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3039,7 +3483,7 @@ test "claim gate unlocks peer runtime after valid signed token" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3058,7 +3502,7 @@ test "claim gate unlocks peer runtime after valid signed token" {
     const token = try testBuildClaimToken(
         testing.allocator,
         cfg.session.claim_secret.?,
-        std.time.timestamp() + 600,
+        std_compat.time.timestamp() + 600,
         "void",
         "nonce-001",
     );
@@ -3081,7 +3525,7 @@ test "claim gate persists verified identity across manager restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3102,7 +3546,7 @@ test "claim gate persists verified identity across manager restart" {
         const token = try testBuildClaimToken(
             testing.allocator,
             cfg.session.claim_secret.?,
-            std.time.timestamp() + 600,
+            std_compat.time.timestamp() + 600,
             "void",
             "nonce-persist",
         );
@@ -3129,7 +3573,7 @@ test "claim gate rejects replayed nonce across peers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3147,7 +3591,7 @@ test "claim gate rejects replayed nonce across peers" {
     const token = try testBuildClaimToken(
         testing.allocator,
         cfg.session.claim_secret.?,
-        std.time.timestamp() + 600,
+        std_compat.time.timestamp() + 600,
         "void",
         "nonce-replay",
     );
@@ -3172,7 +3616,7 @@ test "claim gate locks out after max failed attempts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3210,7 +3654,7 @@ test "claim gate supports revoke and returns peer to quarantine mode" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -3230,7 +3674,7 @@ test "claim gate supports revoke and returns peer to quarantine mode" {
     const token = try testBuildClaimToken(
         testing.allocator,
         cfg.session.claim_secret.?,
-        std.time.timestamp() + 600,
+        std_compat.time.timestamp() + 600,
         "void",
         "nonce-revoke",
     );
@@ -3436,6 +3880,41 @@ test "session has correct initial state" {
     try testing.expectEqual(@as(usize, 0), s.agent.historyLen());
 }
 
+test "routeInbound handles active session routing side effects" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "route:active";
+    const session = try sm.getOrCreate(session_key);
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    session.agent.queue_mode = .latest;
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.skip,
+        sm.routeInbound(session_key, "latest message"),
+    );
+    try testing.expect(sm.routeInput(session_key).has_pending_injection);
+    const drained = (try session.drainInjection(sm.allocator, testing.allocator)).?;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("latest message", drained);
+
+    session.agent.queue_mode = .off;
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.skip,
+        sm.routeInbound(session_key, "drop message"),
+    );
+    try testing.expect(!sm.routeInput(session_key).has_pending_injection);
+
+    session.agent.queue_mode = .serial;
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.process,
+        sm.routeInbound(session_key, "queued message"),
+    );
+}
+
 test "requestTurnInterrupt signals only active sessions" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
@@ -3477,6 +3956,59 @@ test "requestTurnInterrupt returns active tool snapshot when available" {
     try testing.expectEqualStrings("shell", res.active_tool.?);
 }
 
+test "lockSessionForTurn waits without interrupting active serial turn" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("interrupt:contention");
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+    session.agent.clearInterruptRequest();
+
+    session.mutex.lock();
+    var session_unlocked = false;
+    defer if (!session_unlocked) session.mutex.unlock();
+
+    const Worker = struct {
+        const Ctx = struct {
+            session: *Session,
+            started: *std.atomic.Value(bool),
+        };
+
+        fn run(ctx: Ctx) void {
+            ctx.started.store(true, .release);
+            SessionManager.lockSessionForTurn(ctx.session);
+            ctx.session.mutex.unlock();
+        }
+    };
+
+    var worker_started = std.atomic.Value(bool).init(false);
+    const ctx = Worker.Ctx{ .session = session, .started = &worker_started };
+    var thread = try std.Thread.spawn(.{}, Worker.run, .{ctx});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+
+    var attempts: usize = 0;
+    while (attempts < 100 and !worker_started.load(.acquire)) : (attempts += 1) {
+        std_compat.thread.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expect(worker_started.load(.acquire));
+
+    attempts = 0;
+    while (attempts < 20) : (attempts += 1) {
+        std_compat.thread.sleep(2 * std.time.ns_per_ms);
+    }
+    // Regression (#832): serial queued turns must wait behind active turns without hard-stopping them.
+    try testing.expect(!session.agent.interrupt_requested.load(.acquire));
+
+    session.mutex.unlock();
+    session_unlocked = true;
+    thread.join();
+    thread_joined = true;
+}
+
 // ---------------------------------------------------------------------------
 // 2. processMessage tests
 // ---------------------------------------------------------------------------
@@ -3490,6 +4022,54 @@ test "processMessage returns mock response" {
     const resp = try sm.processMessage("user:1", "hi", null);
     defer testing.allocator.free(resp);
     try testing.expectEqualStrings("Hello from mock", resp);
+}
+
+test "routeInput reports pending mid-turn injection" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "inject:route";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    try testing.expectEqual(inbound_router.RoutingDecision.inject, inbound_router.route(sm.routeInput(session_key)));
+
+    // Regression: shells rely on has_pending_injection to replace latest-mode
+    // input instead of accumulating stale pending messages.
+    try sm.injectMidTurn(session_key, "first pending");
+    try testing.expectEqual(inbound_router.RoutingDecision.replace_injection, inbound_router.route(sm.routeInput(session_key)));
+}
+
+test "processMessageStreaming drains pending mid-turn injection into turn history" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "inject:drain";
+    _ = try sm.getOrCreate(session_key);
+    try sm.injectMidTurn(session_key, "mid-turn note");
+
+    const resp = try sm.processMessageStreaming(session_key, "hello", null, null, null);
+    defer testing.allocator.free(resp);
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(!sm.routeInput(session_key).has_pending_injection);
+    var saw_initial = false;
+    var saw_injected = false;
+    for (session.agent.history.items) |entry| {
+        if (entry.role != .user) continue;
+        if (std.mem.eql(u8, entry.content, "hello")) saw_initial = true;
+        if (std.mem.eql(u8, entry.content, "mid-turn note")) saw_injected = true;
+    }
+    // Regression: pending injections must be owned by the agent history after
+    // drain so Session.deinit has no stale buffer and the next turn cannot see it.
+    try testing.expect(saw_initial);
+    try testing.expect(saw_injected);
 }
 
 test "processMessageStreaming forwards provider deltas" {
@@ -3519,11 +4099,196 @@ test "processMessageStreaming forwards provider deltas" {
             .callback = DeltaCollector.onEvent,
             .ctx = @ptrCast(&collector),
         },
+        null,
     );
     defer testing.allocator.free(resp);
 
     try testing.expectEqualStrings("streaming reply", resp);
     try testing.expectEqualStrings("streaming reply", collector.data.items);
+}
+
+test "processMessageStreaming forwards tool progress hints" {
+    var provider = SummaryFailureProvider{};
+    var probe_tool = ProbeTool{};
+    const tools = [_]Tool{probe_tool.tool()};
+    const cfg = testConfig();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "progress:tool";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.max_tool_iterations = 1;
+
+    var collector = ProgressCollector{};
+    const resp = try sm.processMessageStreaming(
+        session_key,
+        "run probe",
+        null,
+        null,
+        .{
+            .callback = ProgressCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+    );
+    defer testing.allocator.free(resp);
+
+    // Regression: A2A streaming depends on this sink to observe tool-call starts.
+    try testing.expectEqual(@as(usize, 1), collector.count);
+    try testing.expectEqualStrings("probe", collector.lastText());
+}
+
+test "routeInput observes pending mid-turn injection" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "route:injection";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    try sm.injectMidTurn(session_key, "first");
+    try sm.injectMidTurn(session_key, "second");
+
+    const input = sm.routeInput(session_key);
+    try testing.expect(input.turn_running);
+    try testing.expectEqual(agent_mod.Agent.QueueMode.latest, input.queue_mode);
+    try testing.expect(input.has_pending_injection);
+    try testing.expectEqual(inbound_router.RoutingDecision.replace_injection, inbound_router.route(input));
+
+    const drained = (try session.drainInjection(testing.allocator, testing.allocator)) orelse return error.TestExpectedEqual;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("second", drained);
+    try testing.expect(!session.hasInjection());
+}
+
+test "drainInjection preserves pending message when target allocation fails" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("inject:oom");
+    try session.injectMidTurn(testing.allocator, "keep me");
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+
+    // Regression: a transient allocation failure in the agent allocator must not
+    // drop the pending injection before a later tool-loop boundary can retry it.
+    try testing.expectError(error.OutOfMemory, session.drainInjection(testing.allocator, failing.allocator()));
+    try testing.expect(session.hasInjection());
+
+    const drained = (try session.drainInjection(testing.allocator, testing.allocator)) orelse return error.TestExpectedEqual;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("keep me", drained);
+    try testing.expect(!session.hasInjection());
+}
+
+test "injectMidTurnIfRunning refuses stopped sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("inject:stopped");
+
+    // Regression: if routeInbound observed a running turn but the turn stopped
+    // before deposit, the message must fall back to normal processing.
+    try testing.expect(!try session.injectMidTurnIfRunning(testing.allocator, "stale"));
+    try testing.expect(!session.hasInjection());
+
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+    try testing.expect(try session.injectMidTurnIfRunning(testing.allocator, "active"));
+    const drained = (try session.drainInjection(testing.allocator, testing.allocator)) orelse return error.TestExpectedEqual;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("active", drained);
+}
+
+test "processMessageStreaming drains pending mid-turn injection into provider messages" {
+    var provider = CaptureMessagesProvider{};
+    const cfg = testConfig();
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "inject:provider";
+    _ = try sm.getOrCreate(session_key);
+    try sm.injectMidTurn(session_key, "mid turn");
+
+    const resp = try sm.processMessage(session_key, "initial", null);
+    defer testing.allocator.free(resp);
+
+    // Regression: pending injections must be folded into the active provider
+    // request as user history, not left stranded in the session buffer.
+    try testing.expectEqual(@as(usize, 1), provider.chat_calls);
+    try testing.expectEqual(@as(usize, 2), provider.user_count);
+    try testing.expectEqualStrings("initial", provider.userMessage(0));
+    try testing.expectEqualStrings("mid turn", provider.userMessage(1));
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(!session.hasInjection());
+}
+
+test "processMessageStreaming drains late injection before completing turn" {
+    const cfg = testConfig();
+    var noop = observability.NoopObserver{};
+    const session_key = "inject:late";
+    var provider = LateInjectionProvider{
+        .session_mgr = undefined,
+        .session_key = session_key,
+    };
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+    provider.session_mgr = &sm;
+
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+
+    const resp = try sm.processMessage(session_key, "initial", null);
+    defer testing.allocator.free(resp);
+
+    // Regression: injection arriving after the first provider request but before
+    // turn teardown must not stay pending for a future unrelated message.
+    try testing.expectEqualStrings("final response", resp);
+    try testing.expectEqual(SessionManager.InboundRouteAction.skip, provider.route_action.?);
+    try testing.expectEqual(@as(usize, 2), provider.chat_calls);
+    try testing.expectEqual(@as(usize, 2), provider.user_count);
+    try testing.expectEqualStrings("initial", provider.userMessage(0));
+    try testing.expectEqualStrings("late message", provider.userMessage(1));
+    try testing.expect(!session.hasInjection());
+    try testing.expectEqual(@as(u64, 1), session.turn_count);
 }
 
 test "processMessage refreshes system prompt when conversation context is cleared" {
@@ -3611,7 +4376,7 @@ test "processMessage updates last_active" {
     const before = session.last_active;
 
     // Small sleep so timestamp changes
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
 
     const resp = try sm.processMessage("user:2", "hello", null);
     defer testing.allocator.free(resp);
@@ -4308,7 +5073,7 @@ test "evictIdle removes old sessions" {
 
     const session = try sm.getOrCreate("old:1");
     // Force last_active to the past
-    session.last_active = std.time.timestamp() - 1000;
+    session.last_active = std_compat.time.timestamp() - 1000;
 
     const evicted = sm.evictIdle(500);
     try testing.expectEqual(@as(usize, 1), evicted);
@@ -4319,7 +5084,7 @@ test "evictIdle prunes unused dedicated agent runtimes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(base);
     const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
     defer testing.allocator.free(config_path);
@@ -4336,7 +5101,7 @@ test "evictIdle prunes unused dedicated agent runtimes" {
     const session = try sm.getOrCreate("agent:peer-0011223344556677:whatsapp_web:direct:5511");
     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
 
-    session.last_active = std.time.timestamp() - 1000;
+    session.last_active = std_compat.time.timestamp() - 1000;
     const evicted = sm.evictIdle(1);
     try testing.expectEqual(@as(usize, 1), evicted);
     try testing.expectEqual(@as(usize, 0), sm.sessionCount());
@@ -4368,8 +5133,8 @@ test "evictIdle returns correct count" {
     const s2 = try sm.getOrCreate("s2");
     _ = try sm.getOrCreate("s3");
 
-    s1.last_active = std.time.timestamp() - 2000;
-    s2.last_active = std.time.timestamp() - 2000;
+    s1.last_active = std_compat.time.timestamp() - 2000;
+    s2.last_active = std_compat.time.timestamp() - 2000;
     // s3 stays recent
 
     const evicted = sm.evictIdle(1000);
@@ -4393,7 +5158,7 @@ test "evictIdle preserves sessions with active turns" {
     defer sm.deinit();
 
     const session = try sm.getOrCreate("busy:1");
-    session.last_active = std.time.timestamp() - 1000;
+    session.last_active = std_compat.time.timestamp() - 1000;
     session.turn_running.store(true, .release);
     defer session.turn_running.store(false, .release);
 

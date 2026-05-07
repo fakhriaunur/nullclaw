@@ -7,6 +7,7 @@
 //!   - Prunes old conversation rows from SQLite
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const fs_compat = @import("../../fs_compat.zig");
 const root = @import("../root.zig");
@@ -48,7 +49,7 @@ pub const HygieneConfig = struct {
 /// Optional callback sink used to synchronize preserved chunks into vector storage.
 pub const PreserveSyncHook = struct {
     ptr: *anyopaque,
-    callback: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void,
+    callback: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, content: []const u8, session_id: ?[]const u8) void,
 };
 
 /// Run memory hygiene if the cadence window has elapsed.
@@ -85,7 +86,7 @@ pub fn runIfDue(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
 
     // Mark hygiene as completed
     if (mem) |m| {
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         var buf: [20]u8 = undefined;
         const ts = std.fmt.bufPrint(&buf, "{d}", .{now}) catch return report;
         m.store(LAST_HYGIENE_KEY, ts, .core, null) catch {};
@@ -107,7 +108,7 @@ fn shouldRunNow(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
         // Parse raw timestamps (sqlite-like) and markdown-encoded entries
         // (markdown backend stores as "**key**: value").
         const last_ts = parseLastHygieneTimestamp(e.content) orelse return true;
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         return (now - last_ts) >= HYGIENE_INTERVAL_SECS;
     }
 
@@ -126,18 +127,18 @@ fn parseLastHygieneTimestamp(content: []const u8) ?i64 {
 
 /// Archive old daily memory .md files from memory/ to memory/archive/.
 fn archiveOldFiles(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
-    const memory_dir_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory" });
+    const memory_dir_path = try std_compat.fs.path.join(allocator, &.{ config.workspace_dir, "memory" });
     defer allocator.free(memory_dir_path);
 
-    var memory_dir = std.fs.cwd().openDir(memory_dir_path, .{ .iterate = true }) catch return 0;
+    var memory_dir = fs_compat.openDirPath(memory_dir_path, .{ .iterate = true }) catch return 0;
     defer memory_dir.close();
 
-    const archive_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
+    const archive_path = try std_compat.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
     defer allocator.free(archive_path);
 
     fs_compat.makePath(archive_path) catch {};
 
-    const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(config.archive_after_days)) * 24 * 60 * 60;
+    const cutoff_secs = std_compat.time.timestamp() - @as(i64, @intCast(config.archive_after_days)) * 24 * 60 * 60;
     var moved: u64 = 0;
 
     var iter = memory_dir.iterate();
@@ -154,14 +155,14 @@ fn archiveOldFiles(allocator: std.mem.Allocator, config: HygieneConfig) !u64 {
         if (mtime_secs >= cutoff_secs) continue;
 
         // Build full source and destination paths, then rename
-        const src_path = std.fs.path.join(allocator, &.{ memory_dir_path, name }) catch continue;
+        const src_path = std_compat.fs.path.join(allocator, &.{ memory_dir_path, name }) catch continue;
         defer allocator.free(src_path);
-        const dst_path = std.fs.path.join(allocator, &.{ archive_path, name }) catch continue;
+        const dst_path = std_compat.fs.path.join(allocator, &.{ archive_path, name }) catch continue;
         defer allocator.free(dst_path);
 
-        std.fs.cwd().rename(src_path, dst_path) catch {
+        fs_compat.renamePath(src_path, dst_path) catch {
             // Fallback: try copy + delete
-            var dest_dir = std.fs.cwd().openDir(archive_path, .{}) catch continue;
+            var dest_dir = fs_compat.openDirPath(archive_path, .{}) catch continue;
             defer dest_dir.close();
             memory_dir.copyFile(name, dest_dir, name, .{}) catch continue;
             memory_dir.deleteFile(name) catch {};
@@ -179,13 +180,13 @@ fn purgeOldArchives(
     mem: ?Memory,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !u64 {
-    const archive_path = try std.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
+    const archive_path = try std_compat.fs.path.join(allocator, &.{ config.workspace_dir, "memory", "archive" });
     defer allocator.free(archive_path);
 
-    var archive_dir = std.fs.cwd().openDir(archive_path, .{ .iterate = true }) catch return 0;
+    var archive_dir = fs_compat.openDirPath(archive_path, .{ .iterate = true }) catch return 0;
     defer archive_dir.close();
 
-    const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(config.purge_after_days)) * 24 * 60 * 60;
+    const cutoff_secs = std_compat.time.timestamp() - @as(i64, @intCast(config.purge_after_days)) * 24 * 60 * 60;
     var removed: u64 = 0;
 
     var iter = archive_dir.iterate();
@@ -212,7 +213,7 @@ fn purgeOldArchives(
 
 fn preserveArchiveFile(
     allocator: std.mem.Allocator,
-    archive_dir: std.fs.Dir,
+    archive_dir: std_compat.fs.Dir,
     file_name: []const u8,
     mem: Memory,
     preserve_sync_hook: ?PreserveSyncHook,
@@ -236,7 +237,7 @@ fn preserveArchiveFile(
         defer allocator.free(wrapped);
         try mem.store(key, wrapped, ARCHIVE_CATEGORY, null);
         if (preserve_sync_hook) |hook| {
-            hook.callback(hook.ptr, allocator, key, wrapped);
+            hook.callback(hook.ptr, allocator, key, wrapped, null);
         }
     }
 }
@@ -246,6 +247,7 @@ fn preserveConversationEntry(
     mem: Memory,
     key_prefix: []const u8,
     content: []const u8,
+    session_id: ?[]const u8,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !void {
     const chunks = try chunker.chunkMarkdown(allocator, content, ARCHIVE_CHUNK_MAX_TOKENS);
@@ -261,9 +263,9 @@ fn preserveConversationEntry(
             .{ key_prefix, idx + 1, chunks.len, chunk.content },
         );
         defer allocator.free(wrapped);
-        try mem.store(archive_key, wrapped, ARCHIVE_CATEGORY, null);
+        try mem.store(archive_key, wrapped, ARCHIVE_CATEGORY, session_id);
         if (preserve_sync_hook) |hook| {
-            hook.callback(hook.ptr, allocator, archive_key, wrapped);
+            hook.callback(hook.ptr, allocator, archive_key, wrapped, session_id);
         }
     }
 }
@@ -281,7 +283,7 @@ fn pruneConversationRowsWithPreserve(
     preserve_before_forget: bool,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !u64 {
-    const cutoff_secs = std.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
+    const cutoff_secs = std_compat.time.timestamp() - @as(i64, @intCast(retention_days)) * 24 * 60 * 60;
 
     // List conversation-tagged entries directly so prune is independent of
     // message text content.
@@ -300,7 +302,7 @@ fn pruneConversationRowsWithPreserve(
             if (preserve_before_forget) {
                 const preserve_key_prefix = try std.fmt.allocPrint(allocator, "archive:conversation:{s}", .{entry.key});
                 defer allocator.free(preserve_key_prefix);
-                preserveConversationEntry(allocator, mem, preserve_key_prefix, entry.content, preserve_sync_hook) catch |err| {
+                preserveConversationEntry(allocator, mem, preserve_key_prefix, entry.content, entry.session_id, preserve_sync_hook) catch |err| {
                     log.warn("skipping prune for '{s}' because preservation failed: {}", .{ entry.key, err });
                     continue;
                 };
@@ -394,7 +396,7 @@ test "parseLastHygieneTimestamp supports markdown format" {
 test "runIfDue with markdown backend does not append hygiene marker twice inside interval" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var markdown_memory = try root.MarkdownMemory.init(std.testing.allocator, base);
@@ -483,14 +485,14 @@ test "runIfDue preserves archived markdown chunks before purge" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_dir);
 
-    const archive_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
+    const archive_path = try std_compat.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
     defer std.testing.allocator.free(archive_path);
     try fs_compat.makePath(archive_path);
 
-    var archive_dir = try std.fs.cwd().openDir(archive_path, .{});
+    var archive_dir = try fs_compat.openDirPath(archive_path, .{});
     defer archive_dir.close();
 
     var file = try archive_dir.createFile("old-memory.md", .{});
@@ -531,14 +533,14 @@ test "runIfDue deletes old archives when memory is unavailable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace_dir);
 
-    const archive_path = try std.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
+    const archive_path = try std_compat.fs.path.join(std.testing.allocator, &.{ workspace_dir, "memory", "archive" });
     defer std.testing.allocator.free(archive_path);
     try fs_compat.makePath(archive_path);
 
-    var archive_dir = try std.fs.cwd().openDir(archive_path, .{});
+    var archive_dir = try fs_compat.openDirPath(archive_path, .{});
     defer archive_dir.close();
 
     var file = try archive_dir.createFile("old-memory.md", .{});
@@ -595,4 +597,38 @@ test "runIfDue preserves conversation rows before prune when enabled" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "runIfDue preserves pruned conversation chunks under original session scope" {
+    if (!build_options.enable_sqlite) return;
+
+    var mem_impl = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    try mem.store("autosave_user_1700000000000000000", "scoped conversation message", .conversation, "sess-a");
+
+    const report = runIfDue(std.testing.allocator, .{
+        .hygiene_enabled = true,
+        .archive_after_days = 0,
+        .purge_after_days = 0,
+        .conversation_retention_days = 1,
+        .preserve_before_purge = true,
+        .workspace_dir = "/tmp",
+    }, mem, null);
+
+    try std.testing.expectEqual(@as(u64, 1), report.pruned_conversation_rows);
+
+    const scoped_preserved = try mem.list(std.testing.allocator, .{ .custom = "archive" }, "sess-a");
+    defer root.freeEntries(std.testing.allocator, scoped_preserved);
+    try std.testing.expect(scoped_preserved.len > 0);
+
+    for (scoped_preserved) |entry| {
+        try std.testing.expect(entry.session_id != null);
+        try std.testing.expectEqualStrings("sess-a", entry.session_id.?);
+    }
+
+    const other_scope = try mem.list(std.testing.allocator, .{ .custom = "archive" }, "sess-b");
+    defer root.freeEntries(std.testing.allocator, other_scope);
+    try std.testing.expectEqual(@as(usize, 0), other_scope.len);
 }

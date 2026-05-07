@@ -17,6 +17,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const std_compat = @import("compat");
 const streaming = @import("../streaming.zig");
 const outbound = @import("../outbound.zig");
 const log = std.log.scoped(.channels);
@@ -64,12 +65,17 @@ pub const ChannelMessage = struct {
     reply_target: ?[]const u8 = null,
     /// Platform message ID (e.g. Telegram message_id for reply-to).
     message_id: ?i64 = null,
+    /// Whether the reply should replace the originating platform message.
+    replace_message: bool = false,
     /// Whether this message resulted from an explicit user interaction (e.g. button click).
     is_interaction: bool = false,
     /// Sender's first name (for personalized greetings).
     first_name: ?[]const u8 = null,
     /// Whether the message came from a group chat.
     is_group: bool = false,
+    /// True when the inbound event originated from an interaction callback
+    /// (for example, a Telegram inline keyboard button press).
+    is_interaction_callback: bool = false,
     /// Sender UUID (Signal-specific: when user has privacy mode enabled).
     sender_uuid: ?[]const u8 = null,
     /// Group ID (Signal-specific: for group chats).
@@ -288,6 +294,7 @@ pub const lark = @import("lark.zig");
 pub const dingtalk = @import("dingtalk.zig");
 pub const wechat = @import("wechat.zig");
 pub const wecom = @import("wecom.zig");
+pub const weixin = @import("weixin.zig");
 pub const nostr = @import("nostr.zig");
 pub const line = @import("line.zig");
 pub const onebot = @import("onebot.zig");
@@ -492,7 +499,7 @@ pub fn isAllowedExactScoped(comptime scope: []const u8, allowed: []const []const
 
 /// Get current UNIX epoch seconds.
 pub fn nowEpochSecs() u64 {
-    const ns = std.time.nanoTimestamp();
+    const ns = std_compat.time.nanoTimestamp();
     if (ns < 0) return 0;
     return @intCast(@as(u128, @intCast(ns)) / 1_000_000_000);
 }
@@ -501,7 +508,7 @@ pub fn nowEpochSecs() u64 {
 // Shared Utilities (re-exported from top-level modules)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// HTTP POST via curl subprocess (safe on Zig 0.15, avoids std.http.Client segfaults).
+/// HTTP POST via curl subprocess with explicit timeout/error semantics.
 pub const http_util = @import("../http_util.zig");
 
 /// JSON string escaping (RFC 8259). appendJsonString adds enclosing quotes.

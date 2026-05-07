@@ -94,20 +94,19 @@ pub const ScheduleTool = struct {
             }
 
             var scheduler = loadScheduler(allocator) catch {
-                return ToolResult.ok("No scheduled jobs.");
+                return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No scheduled jobs.") };
             };
             defer scheduler.deinit();
 
             const jobs = scheduler.listJobs();
             if (jobs.len == 0) {
-                return ToolResult.ok("No scheduled jobs.");
+                return ToolResult{ .success = true, .output = try allocator.dupe(u8, "No scheduled jobs.") };
             }
 
             // Format job list
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(allocator);
-            const w = buf.writer(allocator);
-            try w.print("Scheduled jobs ({d}):\n", .{jobs.len});
+            try buf.print(allocator, "Scheduled jobs ({d}):\n", .{jobs.len});
             for (jobs) |job| {
                 const flags: []const u8 = blk: {
                     if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
@@ -116,7 +115,7 @@ pub const ScheduleTool = struct {
                     break :blk "";
                 };
                 const status = job.last_status orelse "pending";
-                try w.print("- {s} | {s} | status={s}{s} | cmd: {s}\n", .{
+                try buf.print(allocator, "- {s} | {s} | status={s}{s} | cmd: {s}\n", .{
                     job.id,
                     job.expression,
                     status,

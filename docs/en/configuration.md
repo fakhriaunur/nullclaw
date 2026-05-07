@@ -91,6 +91,7 @@ The example below is enough to run local CLI mode (replace API key):
 - Controls runtime diagnostics and observability output.
 - For OpenTelemetry, use the nested `diagnostics.otel` object.
 - OTEL spans are flushed at natural runtime boundaries such as turn completion and agent shutdown, with batch flushing still used as a fallback for longer-running flows.
+- `diagnostics.otel.endpoint` should use `https://...` for remote collectors. Plain `http://...` is accepted only for localhost/private collectors or container-local targets such as `host.docker.internal`, `host.containers.internal`, or single-label service names like `otel`.
 
 Example:
 
@@ -103,7 +104,7 @@ Example:
     "log_message_payloads": true,
     "log_llm_io": true,
     "otel": {
-      "endpoint": "http://otel:4318",
+      "endpoint": "https://otel.example.com:4318",
       "service_name": "nullclaw",
       "headers": {
         "Authorization": "Bearer example-token"
@@ -572,6 +573,7 @@ Minimal end-to-end example:
         "main": {
           "bot_token": "123456:ABCDEF",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
+          "draft_previews": false,
           "binding_commands_enabled": true,
           "topic_commands_enabled": true,
           "topic_map_command_enabled": true,
@@ -599,6 +601,12 @@ Operator flow:
 - `nullclaw` writes a new exact `bindings[]` entry to `~/.nullclaw/config.json` for that topic and Telegram account.
 - The next message in that topic uses the new routed agent profile.
 - `nullclaw` must have write access to `~/.nullclaw/config.json` for `/bind` to persist changes.
+
+About `draft_previews`:
+
+- `draft_previews=false` is the default and recommended setting.
+- When disabled, Telegram still shows activity/typing while the reply is being generated, but it does not use ephemeral `sendMessageDraft` previews.
+- Set `draft_previews=true` only if you explicitly want live partial previews and accept that Telegram may hide and replace those drafts before the final message lands.
 
 About `account_id`:
 
@@ -638,6 +646,7 @@ Practical rules:
 
 - Keep `listen = "127.0.0.1"` for the pairing-first local UX.
 - In local transport, unauthenticated WebSocket upgrade is allowed only on loopback. This is what lets a UI connect first and then send `pairing_request`.
+- Local loopback pairing no longer depends on a fixed shared code. `pairing_request` may omit `payload.pairing_code`, and legacy loopback clients that still send `123456` remain compatible.
 - If you change `listen` to `0.0.0.0` or another non-loopback address, the WebSocket upgrade must already include the channel token:
   - `ws://host:32123/ws?token=<auth_token>`
   - or `Authorization: Bearer <auth_token>`
@@ -681,6 +690,7 @@ Rules:
 
 - Empty `allow_from` behavior is channel-specific. Some channels, including WeChat and Discord, treat an omitted or empty list as "no filtering" rather than "deny all", so set explicit IDs/OpenIDs for a private bot.
 - `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
+- Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams[].webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
 
 Max example:
 
@@ -853,6 +863,8 @@ Recommended defaults:
 - `require_pairing = true`
 
 Avoid direct public exposure. Use tunnel when external access is required.
+On non-loopback binds, generic gateway endpoints such as `/webhook`, `/cron/*`, and `/a2a` still require a stored bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`.
+On non-loopback binds, `/pair` only accepts loopback clients; do the initial pairing locally or preconfigure `paired_tokens` before exposing the gateway.
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -907,10 +919,27 @@ Tunnel providers for exposing the gateway to the public internet. Required for w
 }
 ```
 
+**Example: Tailscale**
+
+```json
+{
+  "tunnel": {
+    "provider": "tailscale",
+    "tailscale": {
+      "funnel": true,
+      "hostname": "nullclaw.ts.net",
+      "auth_key": "tskey-auth-..."
+    }
+  }
+}
+```
+
 **Notes:**
 
 - Tunnel starts before gateway.
 - Public URL is printed on startup and written to `daemon_state.json`.
+- `tailscale.auth_key` is optional. Use it when the machine should auto-run `tailscale up` before starting `serve`/`funnel`.
+- Tunnel secrets such as `cloudflare.token`, `ngrok.auth_token`, and `tailscale.auth_key` are encrypted at rest when `secrets.encrypt = true`.
 
 ### `autonomy`
 
@@ -918,6 +947,10 @@ Tunnel providers for exposing the gateway to the public internet. Required for w
 - `level = "yolo"`: bypasses command policy checks; use only for trusted local debugging.
 - `workspace_only`: keep `true` to limit file access scope.
 - `max_actions_per_hour`: keep conservative limits first.
+- `block_high_risk_commands` (default: `true`): blocks destructive commands such as `rm`, `sudo`, `mkfs`, `dd`, `shutdown`, `ssh`.
+- `block_medium_risk_commands` (default: `true`): blocks medium-risk commands, including network/transfer commands such as `curl`, `wget`, `nc`, `scp`, `ftp`, `telnet` and state-changing commands such as `git commit`, `npm install`, `touch`, or `mkdir`. Set to `false` to allow these while still blocking high-risk commands.
+- `require_approval_for_medium_risk` (default: `true`): when `block_medium_risk_commands` is `false`, require explicit approval before running medium-risk commands in `supervised` mode.
+- `allowed_commands`: explicit list of allowed command basenames. Use `["*"]` for wildcard (full autonomy only). High-risk and medium-risk runtime gates still apply regardless of this list.
 
 ### `security`
 
@@ -942,6 +975,7 @@ Use only in controlled environments:
     "allowed_commands": ["*"],
     "allowed_paths": ["*"],
     "require_approval_for_medium_risk": false,
+    "block_medium_risk_commands": false,
     "block_high_risk_commands": false
   }
 }

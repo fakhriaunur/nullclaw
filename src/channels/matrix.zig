@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -23,6 +24,9 @@ pub const MatrixChannel = struct {
     dm_policy: []const u8,
     group_policy: []const u8,
     require_mention: bool = false,
+    /// Effective API endpoint: pantalaimon proxy URL when E2EE is enabled,
+    /// otherwise equals homeserver. All Matrix API requests use this.
+    effective_endpoint: []const u8 = "",
     running: bool = false,
 
     next_batch_buf: [1024]u8 = undefined,
@@ -38,9 +42,11 @@ pub const MatrixChannel = struct {
         room_id: []const u8,
         allow_from: []const []const u8,
     ) MatrixChannel {
+        const hs = stripTrailingSlashes(homeserver);
         return .{
             .allocator = allocator,
-            .homeserver = stripTrailingSlashes(homeserver),
+            .homeserver = hs,
+            .effective_endpoint = hs,
             .access_token = access_token,
             .room_id = room_id,
             .allow_from = allow_from,
@@ -58,6 +64,9 @@ pub const MatrixChannel = struct {
         ch.dm_policy = cfg.dm_policy;
         ch.group_policy = cfg.group_policy;
         ch.require_mention = cfg.require_mention;
+        if (cfg.pantalaimon_proxy_url) |proxy| {
+            ch.effective_endpoint = stripTrailingSlashes(proxy);
+        }
         return ch;
     }
 
@@ -82,62 +91,57 @@ pub const MatrixChannel = struct {
     }
 
     fn buildWhoAmIUrl(self: *const MatrixChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
-        try w.writeAll(self.homeserver);
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeAll(self.effective_endpoint);
         try w.writeAll("/_matrix/client/v3/account/whoami");
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn buildSyncUrl(self: *const MatrixChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
-        try w.writeAll(self.homeserver);
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeAll(self.effective_endpoint);
         try w.writeAll("/_matrix/client/v3/sync?timeout=30000");
         if (self.next_batch_len > 0) {
             try w.writeAll("&since=");
-            try appendUrlEncoded(w, self.nextBatch());
+            try appendUrlEncoded(&w, self.nextBatch());
         }
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn buildSendUrl(self: *const MatrixChannel, buf: []u8, room_id: []const u8, txn_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
-        try w.writeAll(self.homeserver);
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeAll(self.effective_endpoint);
         try w.writeAll("/_matrix/client/v3/rooms/");
-        try appendUrlEncoded(w, room_id);
+        try appendUrlEncoded(&w, room_id);
         try w.writeAll("/send/m.room.message/");
-        try appendUrlEncoded(w, txn_id);
-        return fbs.getWritten();
+        try appendUrlEncoded(&w, txn_id);
+        return w.buffered();
     }
 
     fn buildTypingUrl(self: *const MatrixChannel, buf: []u8, room_id: []const u8, user_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
-        try w.writeAll(self.homeserver);
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeAll(self.effective_endpoint);
         try w.writeAll("/_matrix/client/v3/rooms/");
-        try appendUrlEncoded(w, room_id);
+        try appendUrlEncoded(&w, room_id);
         try w.writeAll("/typing/");
-        try appendUrlEncoded(w, user_id);
-        return fbs.getWritten();
+        try appendUrlEncoded(&w, user_id);
+        return w.buffered();
     }
 
     fn buildJoinUrl(self: *const MatrixChannel, buf: []u8, room_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
-        try w.writeAll(self.homeserver);
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeAll(self.effective_endpoint);
         try w.writeAll("/_matrix/client/v3/rooms/");
-        try appendUrlEncoded(w, room_id);
+        try appendUrlEncoded(&w, room_id);
         try w.writeAll("/join");
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn nextTxnId(self: *MatrixChannel, buf: []u8) ![]const u8 {
         self.txn_counter += 1;
         return std.fmt.bufPrint(buf, "nullclaw-{s}-{d}-{d}", .{
             self.account_id,
-            std.time.timestamp(),
+            std_compat.time.timestamp(),
             self.txn_counter,
         });
     }
@@ -163,10 +167,12 @@ pub const MatrixChannel = struct {
 
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const w = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        const w = &body_writer.writer;
         try w.writeAll("{\"msgtype\":\"m.text\",\"body\":");
         try root.appendJsonStringW(w, chunk);
         try w.writeAll("}");
+        body_list = body_writer.toArrayList();
 
         const auth_header = try self.authHeader(self.allocator);
         defer self.allocator.free(auth_header);
@@ -748,7 +754,7 @@ fn stripTrailingSlashes(url: []const u8) []const u8 {
     return url[0..end];
 }
 
-fn appendUrlEncoded(writer: anytype, text: []const u8) !void {
+fn appendUrlEncoded(writer: *std.Io.Writer, text: []const u8) !void {
     try url_percent.appendPercentEncodedWriter(writer, text);
 }
 
@@ -786,6 +792,60 @@ test "MatrixChannel initFromConfig maps account and policy fields" {
     try std.testing.expect(ch.require_mention);
     try std.testing.expectEqual(@as(usize, 1), ch.allow_from.len);
     try std.testing.expectEqual(@as(usize, 1), ch.group_allow_from.len);
+    try std.testing.expectEqualStrings("https://matrix.example", ch.effective_endpoint);
+}
+
+test "MatrixChannel initFromConfig routes through pantalaimon when proxy is set" {
+    const cfg = config_types.MatrixConfig{
+        .homeserver = "https://matrix.example/",
+        .access_token = "tok",
+        .room_id = "!room:example",
+        .allow_from = &.{"*"},
+        .pantalaimon_proxy_url = "http://localhost:8008/",
+    };
+    const ch = MatrixChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqualStrings("https://matrix.example", ch.homeserver);
+    try std.testing.expectEqualStrings("http://localhost:8008", ch.effective_endpoint);
+}
+
+test "MatrixChannel initFromConfig falls back to homeserver when proxy is null" {
+    const cfg = config_types.MatrixConfig{
+        .homeserver = "https://matrix.example/",
+        .access_token = "tok",
+        .room_id = "!room:example",
+        .allow_from = &.{"*"},
+        .pantalaimon_proxy_url = null,
+    };
+    const ch = MatrixChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqualStrings("https://matrix.example", ch.effective_endpoint);
+}
+
+test "MatrixChannel URL builders use effective_endpoint" {
+    var ch = MatrixChannel.initFromConfig(std.testing.allocator, .{
+        .homeserver = "https://matrix.example/",
+        .access_token = "tok",
+        .room_id = "!room:example",
+        .allow_from = &.{"*"},
+        .pantalaimon_proxy_url = "http://localhost:8008",
+    });
+    var buf: [512]u8 = undefined;
+
+    // Regression: every Matrix Client-Server API URL must route through
+    // Pantalaimon when the proxy endpoint is configured.
+    const whoami_url = try ch.buildWhoAmIUrl(&buf);
+    try std.testing.expect(std.mem.startsWith(u8, whoami_url, "http://localhost:8008/_matrix/"));
+
+    const sync_url = try ch.buildSyncUrl(&buf);
+    try std.testing.expect(std.mem.startsWith(u8, sync_url, "http://localhost:8008/_matrix/"));
+
+    const send_url = try ch.buildSendUrl(&buf, "!room:example", "txn-1");
+    try std.testing.expect(std.mem.startsWith(u8, send_url, "http://localhost:8008/_matrix/"));
+
+    const typing_url = try ch.buildTypingUrl(&buf, "!room:example", "@bot:example");
+    try std.testing.expect(std.mem.startsWith(u8, typing_url, "http://localhost:8008/_matrix/"));
+
+    const join_url = try ch.buildJoinUrl(&buf, "!room:example");
+    try std.testing.expect(std.mem.startsWith(u8, join_url, "http://localhost:8008/_matrix/"));
 }
 
 test "MatrixChannel buildTypingUrl encodes room and user ids" {
@@ -1457,4 +1517,33 @@ test "MatrixChannel parseSyncResponse with empty room_id accepts multiple rooms"
     }
     try std.testing.expect(saw_a);
     try std.testing.expect(saw_b);
+}
+
+test "MatrixChannel create + healthCheck + stop leaks zero bytes" {
+    // MatrixChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = MatrixChannel.initFromConfig(std.testing.allocator, .{
+        .homeserver = "https://matrix.example.com",
+        .access_token = "test-access-token",
+        .room_id = "!test-room:example.com",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "MatrixChannel start + stop under is_test leaks zero bytes" {
+    // vtableStart sets self.running = true only — no I/O, no thread.
+    // Double stop must be idempotent per Channel contract.
+    var ch_struct = MatrixChannel.initFromConfig(std.testing.allocator, .{
+        .homeserver = "https://matrix.example.com",
+        .access_token = "test-access-token",
+        .room_id = "!test-room:example.com",
+    });
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
 }

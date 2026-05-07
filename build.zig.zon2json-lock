@@ -1,14 +1,14 @@
 {
-  "websocket-0.1.0-ZPISdXp4AwB5_c0jHAA9mZXqJFuOC_dtpVRRFPBbRaNO": {
+  "websocket-0.1.0-ZPISdfzRAwC17T0kY68upDzuwC2eBof_bgx_kIFIxxxx": {
     "name": "websocket",
-    "url": "git+https://github.com/nullclaw/websocket#4b2c70da94d2dd0cca93d8eecb771633f609424b",
-    "hash": "sha256-b9SJEK+5ssOrEoTbuoiR7pbA3kNQmYq0u2TqDt0846U=",
-    "rev": "4b2c70da94d2dd0cca93d8eecb771633f609424b"
+    "url": "git+https://github.com/nullclaw/websocket#9151f70b27024a072ea04425b9e7609eb6b1386c",
+    "hash": "sha256-gK+60/+8eCK+OkiBhmt80KrXMTrGeATKRaYUnA3VU1A=",
+    "rev": "9151f70b27024a072ea04425b9e7609eb6b1386c"
   },
   "wasm3-0.5.1-hrMdNS09BQAWSU0TI6mVS8KfW4hxexjFvyOQINgphwKu": {
     "name": "wasm3",
     "url": "git+https://github.com/nullclaw/wasm3#8a29b0080f1f65dbbe8b8f8c4d8148480feff377",
-    "hash": "sha256-np4DFGYqKd+IHbZnZzPfZdlKlvVJ9HMJGVUJp8PQ+C4=",
+    "hash": "sha256-3GFMnAqfNk6lDClNpgz1BqGCEJ2hJlhdecfunsgipPo=",
     "rev": "8a29b0080f1f65dbbe8b8f8c4d8148480feff377"
   }
 }

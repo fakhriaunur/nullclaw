@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
 const model_refs = @import("model_refs.zig");
@@ -17,17 +18,190 @@ const splitPrimaryModelRef = config_mod.splitPrimaryModelRef;
 /// Parse a JSON array of strings into an allocated slice.
 pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]const []const u8 {
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
+
     try list.ensureTotalCapacity(allocator, @intCast(arr.items.len));
     for (arr.items) |item| {
         if (item == .string) {
-            try list.append(allocator, try allocator.dupe(u8, item.string));
+            const owned = try allocator.dupe(u8, item.string);
+            var item_owned = true;
+            errdefer if (item_owned) allocator.free(owned);
+
+            try list.append(allocator, owned);
+            item_owned = false;
         }
     }
     return try list.toOwnedSlice(allocator);
 }
 
+fn freeToolCustomization(allocator: std.mem.Allocator, item: types.ToolCustomization) void {
+    allocator.free(item.name);
+    if (item.system_prompt) |p| allocator.free(p);
+    for (item.triggers) |t| allocator.free(t);
+    allocator.free(item.triggers);
+}
+
+fn freeToolCustomizationItems(allocator: std.mem.Allocator, items: []const types.ToolCustomization) void {
+    for (items) |item| freeToolCustomization(allocator, item);
+}
+
+fn freeToolCustomizationSlice(allocator: std.mem.Allocator, items: []const types.ToolCustomization) void {
+    freeToolCustomizationItems(allocator, items);
+    allocator.free(items);
+}
+
+fn parseToolCustomizationPriority(value: std.json.Value) u8 {
+    if (value != .integer) return 0;
+    if (value.integer <= 0) return 0;
+    if (value.integer >= 255) return 255;
+    return @intCast(value.integer);
+}
+
+fn parseToolCustomizationObject(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    obj: std.json.ObjectMap,
+) !types.ToolCustomization {
+    var cust = types.ToolCustomization{
+        .name = try allocator.dupe(u8, name),
+    };
+    errdefer freeToolCustomization(allocator, cust);
+
+    if (obj.get("system_prompt")) |v| {
+        if (v == .string) cust.system_prompt = try allocator.dupe(u8, v.string);
+    }
+    if (obj.get("triggers")) |v| {
+        if (v == .array) cust.triggers = try parseStringArray(allocator, v.array);
+    }
+    if (obj.get("priority")) |v| {
+        cust.priority = parseToolCustomizationPriority(v);
+    }
+    if (obj.get("enabled")) |v| {
+        if (v == .bool) cust.enabled = v.bool;
+    }
+
+    return cust;
+}
+
+fn parseToolCustomizationArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]const types.ToolCustomization {
+    var list: std.ArrayListUnmanaged(types.ToolCustomization) = .empty;
+    errdefer {
+        freeToolCustomizationItems(allocator, list.items);
+        list.deinit(allocator);
+    }
+
+    try list.ensureTotalCapacity(allocator, arr.items.len);
+    for (arr.items) |item| {
+        if (item != .object) continue;
+        const name_val = item.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+
+        const cust = try parseToolCustomizationObject(allocator, name_val.string, item.object);
+        var cust_owned = true;
+        errdefer if (cust_owned) freeToolCustomization(allocator, cust);
+
+        try list.append(allocator, cust);
+        cust_owned = false;
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn parseToolCustomizationObjectMap(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]const types.ToolCustomization {
+    var list: std.ArrayListUnmanaged(types.ToolCustomization) = .empty;
+    errdefer {
+        freeToolCustomizationItems(allocator, list.items);
+        list.deinit(allocator);
+    }
+
+    try list.ensureTotalCapacity(allocator, obj.count());
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+
+        const cust = try parseToolCustomizationObject(allocator, entry.key_ptr.*, entry.value_ptr.object);
+        var cust_owned = true;
+        errdefer if (cust_owned) freeToolCustomization(allocator, cust);
+
+        try list.append(allocator, cust);
+        cust_owned = false;
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn containsToolCustomizationName(items: []const types.ToolCustomization, name: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.name, name)) return true;
+    }
+    return false;
+}
+
+fn mergedToolCustomizationCount(
+    inline_customs: []const types.ToolCustomization,
+    external_customs: []const types.ToolCustomization,
+) usize {
+    var count = inline_customs.len;
+    for (external_customs, 0..) |custom, index| {
+        if (containsToolCustomizationName(inline_customs, custom.name)) continue;
+        if (containsToolCustomizationName(external_customs[0..index], custom.name)) continue;
+        count += 1;
+    }
+    return count;
+}
+
+pub fn mergeToolCustomizations(self: *Config, content: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+    defer parsed.deinit();
+
+    const external_customs = switch (parsed.value) {
+        .array => |arr| try parseToolCustomizationArray(self.allocator, arr),
+        .object => |obj| try parseToolCustomizationObjectMap(self.allocator, obj),
+        else => return error.InvalidJsonFormat,
+    };
+    errdefer freeToolCustomizationSlice(self.allocator, external_customs);
+
+    if (external_customs.len == 0) {
+        self.allocator.free(external_customs);
+        return;
+    }
+
+    const inline_customs = self.tools.tool_customizations;
+    const combined = try self.allocator.alloc(
+        types.ToolCustomization,
+        mergedToolCustomizationCount(inline_customs, external_customs),
+    );
+
+    var combined_len: usize = 0;
+    for (inline_customs) |custom| {
+        combined[combined_len] = custom;
+        combined_len += 1;
+    }
+
+    for (external_customs) |external| {
+        var replaced = false;
+        for (combined[0..combined_len]) |*custom| {
+            if (!std.mem.eql(u8, custom.name, external.name)) continue;
+            freeToolCustomization(self.allocator, custom.*);
+            custom.* = external;
+            replaced = true;
+            break;
+        }
+        if (!replaced) {
+            combined[combined_len] = external;
+            combined_len += 1;
+        }
+    }
+
+    std.debug.assert(combined_len == combined.len);
+    self.allocator.free(inline_customs);
+    self.allocator.free(external_customs);
+    self.tools.tool_customizations = combined;
+}
+
 fn decryptSecretField(allocator: std.mem.Allocator, config_path: []const u8, value: []const u8) ![]u8 {
-    const config_dir = std.fs.path.dirname(config_path) orelse ".";
+    const config_dir = std_compat.fs.path.dirname(config_path) orelse ".";
     const store = secrets.SecretStore.init(config_dir, true);
     return try store.decryptSecret(allocator, value);
 }
@@ -262,9 +436,9 @@ fn parseNamedAgentObject(
     if (item.object.get("system_prompt")) |sp| {
         if (sp == .string) {
             const val = sp.string;
-            if (std.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
+            if (std_compat.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
                 const file_content = blk: {
-                    const file = std.fs.openFileAbsolute(val, .{}) catch |err| {
+                    const file = std_compat.fs.openFileAbsolute(val, .{}) catch |err| {
                         std.log.warn("system_prompt looks like a file path but failed to open '{s}': {s}", .{ val, @errorName(err) });
                         break :blk null;
                     };
@@ -876,7 +1050,40 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                             // Explicit interval_minutes (our internal field)
                             if (hb.object.get("interval_minutes")) |v| {
-                                if (v == .integer) self.heartbeat.interval_minutes = @intCast(v.integer);
+                                if (v == .integer and v.integer >= 0) self.heartbeat.interval_minutes = @intCast(v.integer);
+                            }
+                            if (hb.object.get("prompt")) |v| {
+                                if (v == .string) self.heartbeat.prompt = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("model")) |v| {
+                                if (v == .string) self.heartbeat.model = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("timeout_secs")) |v| {
+                                if (v == .integer and v.integer >= 0) self.heartbeat.timeout_secs = @intCast(v.integer);
+                            }
+                            if (hb.object.get("delivery_mode")) |v| {
+                                if (v == .string) self.heartbeat.delivery_mode = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_channel")) |v| {
+                                if (v == .string) self.heartbeat.delivery_channel = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_to")) |v| {
+                                if (v == .string) self.heartbeat.delivery_to = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_account_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_account_id = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_peer_kind")) |v| {
+                                if (v == .string) self.heartbeat.delivery_peer_kind = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_peer_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_peer_id = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_thread_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_thread_id = try self.allocator.dupe(u8, v.string);
+                            }
+                            if (hb.object.get("delivery_best_effort")) |v| {
+                                if (v == .bool) self.heartbeat.delivery_best_effort = v.bool;
                             }
                         }
                     }
@@ -1140,6 +1347,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (aut.object.get("block_high_risk_commands")) |v| {
                 if (v == .bool) self.autonomy.block_high_risk_commands = v.bool;
             }
+            if (aut.object.get("block_medium_risk_commands")) |v| {
+                if (v == .bool) self.autonomy.block_medium_risk_commands = v.bool;
+            }
             if (aut.object.get("level")) |v| {
                 if (v == .string) {
                     if (types.AutonomyLevel.fromString(v.string)) |lvl| {
@@ -1390,6 +1600,18 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("path_env_vars")) |v| {
                 if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
+            }
+            if (tl.object.get("tool_customizations")) |v| {
+                if (v == .array) self.tools.tool_customizations = try parseToolCustomizationArray(self.allocator, v.array);
+            }
+            if (tl.object.get("tool_customizations_file")) |v| {
+                if (v == .string) self.tools.tool_customizations_file = try self.allocator.dupe(u8, v.string);
+            }
+            if (tl.object.get("trigger_modifiers")) |v| {
+                if (v == .array) self.tools.trigger_modifiers = try parseStringArray(self.allocator, v.array);
+            }
+            if (tl.object.get("trigger_punctuation")) |v| {
+                if (v == .string) self.tools.trigger_punctuation = try self.allocator.dupe(u8, v.string);
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
@@ -2178,18 +2400,8 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                     if (sb.object.get("backend")) |v| {
                         if (v == .string) {
-                            if (std.mem.eql(u8, v.string, "auto")) {
-                                self.security.sandbox.backend = .auto;
-                            } else if (std.mem.eql(u8, v.string, "landlock")) {
-                                self.security.sandbox.backend = .landlock;
-                            } else if (std.mem.eql(u8, v.string, "firejail")) {
-                                self.security.sandbox.backend = .firejail;
-                            } else if (std.mem.eql(u8, v.string, "bubblewrap")) {
-                                self.security.sandbox.backend = .bubblewrap;
-                            } else if (std.mem.eql(u8, v.string, "docker")) {
-                                self.security.sandbox.backend = .docker;
-                            } else if (std.mem.eql(u8, v.string, "none")) {
-                                self.security.sandbox.backend = .none;
+                            if (std.meta.stringToEnum(types.SandboxBackend, v.string)) |backend| {
+                                self.security.sandbox.backend = backend;
                             }
                         }
                     }
@@ -2250,7 +2462,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (cf == .object) {
                     var cf_cfg = types.CloudflareTunnelConfig{};
                     if (cf.object.get("token")) |tok| {
-                        if (tok == .string) cf_cfg.token = try self.allocator.dupe(u8, tok.string);
+                        if (tok == .string) cf_cfg.token = try decryptSecretField(self.allocator, self.config_path, tok.string);
                     }
                     self.tunnel.cloudflare = cf_cfg;
                 }
@@ -2260,7 +2472,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (ng == .object) {
                     var ng_cfg = types.NgrokTunnelConfig{};
                     if (ng.object.get("auth_token")) |tok| {
-                        if (tok == .string) ng_cfg.auth_token = try self.allocator.dupe(u8, tok.string);
+                        if (tok == .string) ng_cfg.auth_token = try decryptSecretField(self.allocator, self.config_path, tok.string);
                     }
                     if (ng.object.get("domain")) |dom| {
                         if (dom == .string) ng_cfg.domain = try self.allocator.dupe(u8, dom.string);
@@ -2277,6 +2489,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                     if (ts.object.get("hostname")) |hn| {
                         if (hn == .string) ts_cfg.hostname = try self.allocator.dupe(u8, hn.string);
+                    }
+                    if (ts.object.get("auth_key")) |ak| {
+                        if (ak == .string) ts_cfg.auth_key = try decryptSecretField(self.allocator, self.config_path, ak.string);
                     }
                     self.tunnel.tailscale = ts_cfg;
                 }
@@ -2340,6 +2555,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                         if (val.object.get("max_streaming_prompt_bytes")) |mb| {
                             if (mb == .integer and mb.integer >= 0) pe.max_streaming_prompt_bytes = @intCast(mb.integer);
+                        }
+                        if (val.object.get("extra_body_params")) |eb| {
+                            if (eb == .object) {
+                                pe.extra_body_params = try std.json.Stringify.valueAlloc(self.allocator, eb, .{});
+                            }
                         }
                         try prov_list.append(self.allocator, pe);
                     }
@@ -2459,6 +2679,83 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+fn findToolCustomizationForTest(items: []const types.ToolCustomization, name: []const u8) ?types.ToolCustomization {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.name, name)) return item;
+    }
+    return null;
+}
+
+test "mergeToolCustomizations object overrides inline and appends tools" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+
+    const inline_json =
+        \\{"tools": {
+        \\  "tool_customizations": [
+        \\    {"name": "shell", "system_prompt": "inline shell", "triggers": ["inline"], "priority": 1}
+        \\  ],
+        \\  "trigger_modifiers": ["please"],
+        \\  "trigger_punctuation": "!"
+        \\}}
+    ;
+    try cfg.parseJson(inline_json);
+
+    const external_json =
+        \\{
+        \\  "shell": {"system_prompt": "external shell", "triggers": ["external"], "priority": 9, "enabled": false},
+        \\  "file_read": {"system_prompt": "external read", "triggers": ["inspect"], "priority": 4}
+        \\}
+    ;
+    try mergeToolCustomizations(&cfg, external_json);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.tool_customizations.len);
+    const shell = findToolCustomizationForTest(cfg.tools.tool_customizations, "shell").?;
+    try std.testing.expectEqualStrings("external shell", shell.system_prompt.?);
+    try std.testing.expectEqualStrings("external", shell.triggers[0]);
+    try std.testing.expectEqual(@as(u8, 9), shell.priority);
+    try std.testing.expect(!shell.enabled);
+
+    const file_read = findToolCustomizationForTest(cfg.tools.tool_customizations, "file_read").?;
+    try std.testing.expectEqualStrings("external read", file_read.system_prompt.?);
+    try std.testing.expectEqualStrings("inspect", file_read.triggers[0]);
+    try std.testing.expectEqual(@as(u8, 4), file_read.priority);
+    try std.testing.expect(file_read.enabled);
+    try std.testing.expectEqualStrings("please", cfg.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("!", cfg.tools.trigger_punctuation);
+}
+
+test "mergeToolCustomizations array keeps latest duplicate external entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+
+    const external_json =
+        \\[
+        \\  {"name": "shell", "system_prompt": "first", "triggers": ["first"], "priority": 1},
+        \\  {"name": "shell", "system_prompt": "second", "triggers": ["second"], "priority": 2}
+        \\]
+    ;
+    try mergeToolCustomizations(&cfg, external_json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.tools.tool_customizations.len);
+    try std.testing.expectEqualStrings("shell", cfg.tools.tool_customizations[0].name);
+    try std.testing.expectEqualStrings("second", cfg.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqualStrings("second", cfg.tools.tool_customizations[0].triggers[0]);
+    try std.testing.expectEqual(@as(u8, 2), cfg.tools.tool_customizations[0].priority);
+}
 
 test "normalizePeerId converts legacy #topic: format to canonical :thread: format" {
     const allocator = std.testing.allocator;

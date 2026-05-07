@@ -43,6 +43,8 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw onboard --api-key ... --provider ... --model ... --memory ...` | Set provider, model, and memory backend in one command |
 | `nullclaw onboard --channels-only` | Reconfigure channels and allowlists only |
 | `nullclaw agent -m "..."` | Run a single prompt |
+| `nullclaw agent --workspace /path/to/workspace -m "..."` | Run the agent against a specific workspace for this process |
+| `nullclaw agent --skill news-digest -m "..."` | Run a single prompt with a named skill active |
 | `nullclaw agent` | Start interactive chat mode |
 
 ### Interactive model routing
@@ -56,6 +58,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 - `/model auto` clears the user pin, restores the configured default model, and re-enables `model_routes` for later turns in the same session.
 - If no `model_routes` are configured, `/model auto` still clears the pin and returns the session to the configured default model.
 - Starting `nullclaw agent` with `--model` or `--provider` also pins the run and bypasses `model_routes`.
+- Starting `nullclaw agent` with `--skill <name>` activates that skill before the first message or REPL turn.
 
 ## Runtime and operations
 
@@ -64,13 +67,14 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw gateway` | Start the long-running runtime using configured host and port |
 | `nullclaw gateway --port 8080` | Override the gateway port from the CLI |
 | `nullclaw gateway --host 0.0.0.0 --port 8080` | Override host and port from the CLI |
+| `nullclaw gateway --workspace /path/to/workspace` | Override the workspace directory for this gateway process |
 | `nullclaw service install` | Install the background service |
 | `nullclaw service start` | Start the background service |
 | `nullclaw service stop` | Stop the background service |
 | `nullclaw service restart` | Restart the background service |
 | `nullclaw service status` | Show service status |
 | `nullclaw service uninstall` | Remove the background service |
-| `nullclaw status` | Show overall system status |
+| `nullclaw status [--json]` | Show overall system status or emit the machine-readable runtime snapshot |
 | `nullclaw doctor` | Run diagnostics |
 | `nullclaw update --check` | Check for updates without installing |
 | `nullclaw update --yes` | Install updates without prompting |
@@ -83,6 +87,7 @@ Notes:
 
 - `auth` currently supports only `openai-codex`.
 - `gateway --host/--port` overrides only the bind settings; the rest of gateway security still comes from config.
+- `agent --workspace` and `gateway --workspace` override the resolved workspace for the current process, equivalent to setting `NULLCLAW_WORKSPACE`.
 
 ## Channels, scheduling, and extensions
 
@@ -90,10 +95,11 @@ Notes:
 
 | Command | Purpose |
 |---|---|
-| `nullclaw channel list` | List known and configured channels |
+| `nullclaw channel list [--json]` | List known and configured channels |
 | `nullclaw channel start` | Start the default available channel |
 | `nullclaw channel start telegram` | Start a specific channel |
 | `nullclaw channel status` | Show channel health |
+| `nullclaw channel info <type> [--json]` | Show configured accounts for one channel type |
 | `nullclaw channel add <type>` | Print guidance for adding a channel to config |
 | `nullclaw channel remove <name>` | Print guidance for removing a channel from config |
 
@@ -101,7 +107,8 @@ Notes:
 
 | Command | Purpose |
 |---|---|
-| `nullclaw cron list` | List scheduled tasks |
+| `nullclaw cron list [--json]` | List scheduled tasks |
+| `nullclaw cron status [--json]` | Show scheduler-level status and job counters |
 | `nullclaw cron add "0 * * * *" "command"` | Add a recurring shell task |
 | `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | Add a recurring agent task |
 | `nullclaw cron once 10m "command"` | Add a one-shot delayed shell task |
@@ -117,7 +124,8 @@ Notes:
 | Command | Purpose |
 |---|---|
 | `nullclaw skills list` | List installed skills |
-| `nullclaw skills install <source>` | Install from a GitHub URL or local path |
+| `nullclaw skills install <source>` | Install from a Git URL, local path, or HTTPS well-known skill endpoint |
+| `nullclaw skills install --name <query>` | Search the skill registry and install the best matching skill |
 | `nullclaw skills remove <name>` | Remove a skill |
 | `nullclaw skills info <name>` | Show skill metadata |
 
@@ -152,8 +160,11 @@ Notes:
 | `nullclaw workspace reset-md --include-bootstrap --clear-memory-md` | Reset bundled markdown files and optionally clear extra files |
 | `nullclaw capabilities` | Show a text capability summary |
 | `nullclaw capabilities --json` | Show a JSON capability manifest |
+| `nullclaw config show [--json]` | Print the full on-disk config |
+| `nullclaw config get <path> [--json]` | Read one dotted config value from disk |
 | `nullclaw models list` | List providers and default models |
 | `nullclaw models info <model>` | Show model details |
+| `nullclaw models summary [--json]` | Print the provider/key-safe admin summary used by integrations |
 | `nullclaw models benchmark` | Run model latency benchmark |
 | `nullclaw models refresh` | Refresh the model catalog |
 | `nullclaw migrate openclaw --dry-run` | Preview OpenClaw migration |
@@ -163,6 +174,7 @@ Notes:
 
 - `workspace edit` works only with file-based backends such as `markdown` and `hybrid`.
 - If bootstrap data is stored in the database backend, the CLI will tell you to use the agent's `memory_store` tool instead.
+- The `--json` read-side commands are intended for automation and for NullHub's managed-instance admin API boundary.
 
 ## Hardware and automation-facing entry points
 

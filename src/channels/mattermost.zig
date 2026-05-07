@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const websocket = @import("../websocket.zig");
@@ -11,9 +12,77 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.mattermost);
 
-const SocketFd = std.net.Stream.Handle;
+fn buildTypingRequestBody(
+    allocator: std.mem.Allocator,
+    channel_id: []const u8,
+    thread_id: ?[]const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
+    errdefer body_writer.deinit();
+    const bw = &body_writer.writer;
+    try bw.writeAll("{\"channel_id\":");
+    try root.appendJsonStringW(bw, channel_id);
+    if (thread_id) |tid| {
+        if (tid.len > 0) {
+            try bw.writeAll(",\"parent_id\":");
+            try root.appendJsonStringW(bw, tid);
+        }
+    }
+    try bw.writeByte('}');
+    body = body_writer.toArrayList();
+    return try body.toOwnedSlice(allocator);
+}
+
+fn buildPostRequestBody(
+    allocator: std.mem.Allocator,
+    channel_id: []const u8,
+    text: []const u8,
+    thread_id: ?[]const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
+    errdefer body_writer.deinit();
+    const bw = &body_writer.writer;
+    try bw.writeAll("{\"channel_id\":");
+    try root.appendJsonStringW(bw, channel_id);
+    try bw.writeAll(",\"message\":");
+    try root.appendJsonStringW(bw, text);
+    if (thread_id) |tid| {
+        if (tid.len > 0) {
+            try bw.writeAll(",\"root_id\":");
+            try root.appendJsonStringW(bw, tid);
+        }
+    }
+    try bw.writeByte('}');
+    body = body_writer.toArrayList();
+    return try body.toOwnedSlice(allocator);
+}
+
+fn buildDirectChannelRequestBody(
+    allocator: std.mem.Allocator,
+    bot_id: []const u8,
+    user_id: []const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
+    errdefer body_writer.deinit();
+    const bw = &body_writer.writer;
+    try bw.writeByte('[');
+    try root.appendJsonStringW(bw, bot_id);
+    try bw.writeByte(',');
+    try root.appendJsonStringW(bw, user_id);
+    try bw.writeByte(']');
+    body = body_writer.toArrayList();
+    return try body.toOwnedSlice(allocator);
+}
+
+const SocketFd = std_compat.net.Stream.Handle;
 const invalid_socket: SocketFd = switch (builtin.os.tag) {
-    .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+    .windows => std_compat.net.invalidHandle(SocketFd),
     else => -1,
 };
 
@@ -86,7 +155,7 @@ pub const MattermostChannel = struct {
     ws_fd: Atomic(SocketFd) = Atomic(SocketFd).init(invalid_socket),
     gateway_thread: ?std.Thread = null,
 
-    bot_state_mu: std.Thread.Mutex = .{},
+    bot_state_mu: std_compat.sync.Mutex = .{},
     bot_user_id: ?[]u8 = null,
     bot_username: ?[]u8 = null,
 
@@ -187,24 +256,14 @@ pub const MattermostChannel = struct {
         const url = std.fmt.allocPrint(self.allocator, "{s}/api/v4/users/me/typing", .{self.base_url}) catch return;
         defer self.allocator.free(url);
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
-        const bw = body.writer(self.allocator);
-        bw.writeAll("{\"channel_id\":") catch return;
-        root.appendJsonStringW(bw, channel_id) catch return;
-        if (parsed_target.thread_id) |tid| {
-            if (tid.len > 0) {
-                bw.writeAll(",\"parent_id\":") catch return;
-                root.appendJsonStringW(bw, tid) catch return;
-            }
-        }
-        bw.writeByte('}') catch return;
+        const body = buildTypingRequestBody(self.allocator, channel_id, parsed_target.thread_id) catch return;
+        defer self.allocator.free(body);
 
         const auth_header = std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token}) catch return;
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlPost(self.allocator, url, body.items, &headers) catch return;
+        const resp = root.http_util.curlPost(self.allocator, url, body, &headers) catch return;
         self.allocator.free(resp);
     }
 
@@ -219,26 +278,14 @@ pub const MattermostChannel = struct {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/api/v4/posts", .{self.base_url});
         defer self.allocator.free(url);
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
-        const bw = body.writer(self.allocator);
-        try bw.writeAll("{\"channel_id\":");
-        try root.appendJsonStringW(bw, channel_id);
-        try bw.writeAll(",\"message\":");
-        try root.appendJsonStringW(bw, text);
-        if (thread_id) |tid| {
-            if (tid.len > 0) {
-                try bw.writeAll(",\"root_id\":");
-                try root.appendJsonStringW(bw, tid);
-            }
-        }
-        try bw.writeByte('}');
+        const body = try buildPostRequestBody(self.allocator, channel_id, text, thread_id);
+        defer self.allocator.free(body);
 
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token});
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlPost(self.allocator, url, body.items, &headers) catch return error.MattermostApiError;
+        const resp = root.http_util.curlPost(self.allocator, url, body, &headers) catch return error.MattermostApiError;
         defer self.allocator.free(resp);
 
         if (std.mem.indexOf(u8, resp, "\"id\"") == null) {
@@ -248,11 +295,10 @@ pub const MattermostChannel = struct {
 
     fn resolveUserIdByUsername(self: *MattermostChannel, username: []const u8) ![]u8 {
         var url_buf: [2048]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&url_buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(&url_buf);
         try w.print("{s}/api/v4/users/username/", .{self.base_url});
         try appendUrlEncoded(w, username);
-        const url = fbs.getWritten();
+        const url = w.buffered();
 
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token});
         defer self.allocator.free(auth_header);
@@ -275,20 +321,14 @@ pub const MattermostChannel = struct {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/api/v4/channels/direct", .{self.base_url});
         defer self.allocator.free(url);
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
-        const bw = body.writer(self.allocator);
-        try bw.writeByte('[');
-        try root.appendJsonStringW(bw, bot_id);
-        try bw.writeByte(',');
-        try root.appendJsonStringW(bw, user_id);
-        try bw.writeByte(']');
+        const body = try buildDirectChannelRequestBody(self.allocator, bot_id, user_id);
+        defer self.allocator.free(body);
 
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token});
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlPost(self.allocator, url, body.items, &headers) catch return error.MattermostApiError;
+        const resp = root.http_util.curlPost(self.allocator, url, body, &headers) catch return error.MattermostApiError;
         defer self.allocator.free(resp);
 
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.MattermostApiError;
@@ -346,11 +386,7 @@ pub const MattermostChannel = struct {
 
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
-            if (comptime builtin.os.tag == .windows) {
-                _ = std.os.windows.ws2_32.closesocket(fd);
-            } else {
-                std.posix.close(fd);
-            }
+            (std_compat.net.Stream{ .handle = fd }).close();
             self.ws_fd.store(invalid_socket, .release);
         }
 
@@ -419,7 +455,7 @@ pub const MattermostChannel = struct {
 
             var slept: u64 = 0;
             while (slept < RECONNECT_DELAY_NS and self.running.load(.acquire)) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std_compat.thread.sleep(100 * std.time.ns_per_ms);
                 slept += 100 * std.time.ns_per_ms;
             }
         }
@@ -431,7 +467,7 @@ pub const MattermostChannel = struct {
         // self-message filtering are reliable.
         _ = try self.fetchBotUserId();
 
-        var host_buf: [512]u8 = undefined;
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         var path_buf: [1024]u8 = undefined;
         const parts = try self.websocketConnectParts(&host_buf, &path_buf);
 
@@ -486,14 +522,14 @@ pub const MattermostChannel = struct {
 
     fn websocketConnectParts(
         self: *const MattermostChannel,
-        host_buf: []u8,
+        host_buf: *[std.Io.net.HostName.max_len]u8,
         path_buf: []u8,
     ) !struct { host: []const u8, port: u16, path: []const u8 } {
         const uri = std.Uri.parse(self.base_url) catch return error.InvalidBaseUrl;
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
             return error.MattermostRequiresHttps;
         }
-        const host = uri.getHost(host_buf) catch return error.InvalidBaseUrl;
+        const host = (uri.getHost(host_buf) catch return error.InvalidBaseUrl).bytes;
         const port = uri.port orelse 443;
         const raw_path = componentAsSlice(uri.path);
         var prefix = raw_path;
@@ -502,8 +538,7 @@ pub const MattermostChannel = struct {
             prefix = prefix[0 .. prefix.len - 1];
         }
 
-        var fbs = std.io.fixedBufferStream(path_buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(path_buf);
         if (prefix.len > 0) {
             if (prefix[0] != '/') try w.writeByte('/');
             try w.writeAll(prefix);
@@ -512,7 +547,7 @@ pub const MattermostChannel = struct {
         return .{
             .host = host,
             .port = port,
-            .path = fbs.getWritten(),
+            .path = w.buffered(),
         };
     }
 
@@ -650,7 +685,8 @@ pub const MattermostChannel = struct {
 
         var meta: std.ArrayListUnmanaged(u8) = .empty;
         defer meta.deinit(self.allocator);
-        const mw = meta.writer(self.allocator);
+        var meta_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &meta);
+        const mw = &meta_writer.writer;
         try mw.writeByte('{');
         try mw.writeAll("\"account_id\":");
         try root.appendJsonStringW(mw, self.account_id);
@@ -675,6 +711,7 @@ pub const MattermostChannel = struct {
             try root.appendJsonStringW(mw, sname);
         }
         try mw.writeByte('}');
+        meta = meta_writer.toArrayList();
 
         const content_owned = try content.toOwnedSlice(self.allocator);
         defer self.allocator.free(content_owned);
@@ -712,11 +749,11 @@ pub const MattermostChannel = struct {
         defer self.allocator.free(data);
         if (data.len == 0) return null;
 
-        const tmp_env = std.process.getEnvVarOwned(self.allocator, "TMPDIR") catch null;
+        const tmp_env = std_compat.process.getEnvVarOwned(self.allocator, "TMPDIR") catch null;
         defer if (tmp_env) |v| self.allocator.free(v);
         const tmp_dir = blk: {
             if (tmp_env) |v| {
-                const trimmed = std.mem.trimRight(u8, v, "/");
+                const trimmed = std_compat.mem.trimRight(u8, v, "/");
                 if (trimmed.len > 0) break :blk trimmed;
             }
             break :blk "/tmp";
@@ -726,11 +763,11 @@ pub const MattermostChannel = struct {
         const path = std.fmt.allocPrint(
             self.allocator,
             "{s}/nullclaw_mattermost_{d}_{d}.bin",
-            .{ tmp_dir, std.time.timestamp(), counter },
+            .{ tmp_dir, std_compat.time.timestamp(), counter },
         ) catch return null;
         errdefer self.allocator.free(path);
 
-        const file = std.fs.createFileAbsolute(path, .{ .read = false }) catch return null;
+        const file = std_compat.fs.createFileAbsolute(path, .{ .read = false }) catch return null;
         defer file.close();
         file.writeAll(data) catch return null;
         return path;
@@ -772,7 +809,7 @@ pub const MattermostChannel = struct {
             const p = std.mem.trim(u8, prefix, " \t\r\n");
             if (p.len == 0) continue;
             if (std.mem.startsWith(u8, trimmed, p)) {
-                return std.mem.trimLeft(u8, trimmed[p.len..], " \t\r\n");
+                return std.mem.trimStart(u8, trimmed[p.len..], " \t\r\n");
             }
         }
         return null;
@@ -946,6 +983,28 @@ test "mattermost parseTarget supports prefixes and thread suffix" {
     const f = try parseTarget("#town-square");
     try std.testing.expect(f.kind == .channel);
     try std.testing.expectEqualStrings("town-square", f.value);
+}
+
+test "mattermost buildTypingRequestBody includes channel and thread" {
+    const alloc = std.testing.allocator;
+    const body = try buildTypingRequestBody(alloc, "town", "root-9");
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"channel_id\":\"town\",\"parent_id\":\"root-9\"}", body);
+}
+
+test "mattermost buildPostRequestBody includes non-empty message body" {
+    const alloc = std.testing.allocator;
+    // Regression: Zig 0.16 allocating writer migration must finalize before POST, or Mattermost receives EOF.
+    const body = try buildPostRequestBody(alloc, "town", "hello", null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"channel_id\":\"town\",\"message\":\"hello\"}", body);
+}
+
+test "mattermost buildDirectChannelRequestBody includes both user ids" {
+    const alloc = std.testing.allocator;
+    const body = try buildDirectChannelRequestBody(alloc, "bot-1", "user-2");
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("[\"bot-1\",\"user-2\"]", body);
 }
 
 test "mattermost sendTypingIndicator is no-op in tests" {
@@ -1202,4 +1261,16 @@ test "mattermost chatmode onchar strips configured prefix before publish" {
     try std.testing.expectEqualStrings("status now", msg.content);
     try std.testing.expectEqualStrings("mattermost:mm-main:channel:town", msg.session_key);
     try std.testing.expect(eb.consumeInbound() == null);
+}
+
+test "MattermostChannel create + healthCheck + stop leaks zero bytes" {
+    // MattermostChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = MattermostChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-bot-token",
+        .base_url = "https://mattermost.example.com",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
 }

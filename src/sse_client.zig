@@ -8,6 +8,9 @@
 //! support for real-time message delivery.
 
 const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
+const http_util = @import("http_util.zig");
 const log = std.log.scoped(.sse_client);
 
 /// Maximum SSE event size (256KB)
@@ -25,7 +28,7 @@ const READ_TIMEOUT_MS: i32 = 1000;
 /// SSE connection that maintains a persistent HTTP connection for streaming
 pub const SseConnection = struct {
     allocator: std.mem.Allocator,
-    client: std.http.Client,
+    client: http_util.ProxyHttpClient,
     request: ?std.http.Client.Request,
     /// The body reader for streaming response data
     body_reader: ?*std.Io.Reader,
@@ -44,10 +47,10 @@ pub const SseConnection = struct {
     };
 
     /// Initialize a new SSE connection (not yet connected)
-    pub fn init(allocator: std.mem.Allocator, url: []const u8) SseConnection {
+    pub fn init(allocator: std.mem.Allocator, url: []const u8) !SseConnection {
         return .{
             .allocator = allocator,
-            .client = std.http.Client{ .allocator = allocator },
+            .client = try http_util.ProxyHttpClient.init(allocator),
             .request = null,
             .body_reader = null,
             .url = url,
@@ -102,7 +105,7 @@ pub const SseConnection = struct {
             self.request = null;
         }
 
-        self.request = try self.client.request(.GET, uri, options);
+        self.request = try self.client.client.request(.GET, uri, options);
         const req = &self.request.?;
         errdefer {
             req.deinit();
@@ -219,11 +222,19 @@ pub const SseConnection = struct {
         // For TLS and buffered transports, data may already be decoded and
         // available even when the socket is not currently poll-readable.
         if (conn.reader().bufferedLen() > 0) return true;
-        const stream = conn.stream_reader.getStream();
+
+        if (comptime builtin.os.tag == .windows) {
+            if (timeout_ms > 0) {
+                std_compat.thread.sleep(@as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms);
+            }
+            return conn.reader().bufferedLen() > 0;
+        }
+
+        const stream = conn.stream_reader.stream;
 
         var poll_fds = [_]std.posix.pollfd{
             .{
-                .fd = stream.handle,
+                .fd = stream.socket.handle,
                 .events = std.posix.POLL.IN,
                 .revents = undefined,
             },
@@ -279,7 +290,17 @@ fn ownOrFreeList(list: *std.ArrayList(u8), allocator: std.mem.Allocator) ![]u8 {
 /// Returns a slice of events (caller must free each event.data and the slice itself)
 ///
 /// Safety: Truncates events larger than MAX_EVENT_SIZE to prevent memory exhaustion.
-/// Events are delimited by double newlines (\n\n).
+/// Events are dispatched on double newline delimiters (\n\n). Two non-spec
+/// extensions are deliberate, to support providers that do not strictly
+/// follow the W3C SSE spec on stream termination:
+/// 1. A single trailing newline (\n with no following blank line) flushes
+///    the pending event — many real-world providers (OpenAI/Anthropic
+///    streaming endpoints) end the final event this way after the
+///    `[DONE]` sentinel.
+/// 2. End-of-buffer with a non-empty pending event (no terminating
+///    newline) is also flushed.
+/// Strict W3C consumers can detect this by checking whether the buffer
+/// the parser was handed already had a terminating `\n\n`.
 /// Each data: line contributes to the event data, with newlines preserved.
 ///
 /// Per the W3C SSE specification:
@@ -288,16 +309,16 @@ fn ownOrFreeList(list: *std.ArrayList(u8), allocator: std.mem.Allocator) ![]u8 {
 /// - After "field:", exactly ONE leading space is stripped from the value
 /// - Empty data: lines append an empty string (producing a newline in multi-line data)
 pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent {
-    var events: std.ArrayList(SseEvent) = .{};
+    var events: std.ArrayList(SseEvent) = .empty;
     defer events.deinit(allocator);
 
-    var current_data: std.ArrayList(u8) = .{};
+    var current_data: std.ArrayList(u8) = .empty;
     defer current_data.deinit(allocator);
 
-    var current_event_type: std.ArrayList(u8) = .{};
+    var current_event_type: std.ArrayList(u8) = .empty;
     defer current_event_type.deinit(allocator);
 
-    var current_id: std.ArrayList(u8) = .{};
+    var current_id: std.ArrayList(u8) = .empty;
     defer current_id.deinit(allocator);
 
     var total_event_size: usize = 0;
@@ -306,7 +327,7 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
     var lines = std.mem.splitScalar(u8, buffer, '\n');
     while (lines.next()) |raw_line| {
         // Strip trailing CR for CRLF line endings
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std_compat.mem.trimRight(u8, raw_line, "\r");
 
         if (line.len == 0) {
             // Empty line marks end of event — dispatch if we have data
@@ -323,9 +344,9 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
                     .id = id,
                 });
 
-                current_data = .{};
-                current_event_type = .{};
-                current_id = .{};
+                current_data = .empty;
+                current_event_type = .empty;
+                current_id = .empty;
                 total_event_size = 0;
                 has_data = false;
             }
@@ -364,9 +385,9 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
                     current_event_type.deinit(allocator);
                     current_id.deinit(allocator);
                 }
-                current_data = .{};
-                current_event_type = .{};
-                current_id = .{};
+                current_data = .empty;
+                current_event_type = .empty;
+                current_id = .empty;
                 total_event_size = 0;
                 has_data = false;
                 continue;
@@ -409,9 +430,9 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
             .id = id,
         });
         // Mark as consumed so the defers don't double-free
-        current_data = .{};
-        current_event_type = .{};
-        current_id = .{};
+        current_data = .empty;
+        current_event_type = .empty;
+        current_id = .empty;
     }
 
     return try events.toOwnedSlice(allocator);
@@ -542,4 +563,56 @@ test "parseField parses field:value correctly" {
     const r4 = parseField("data:");
     try std.testing.expectEqualStrings("data", r4.field);
     try std.testing.expectEqualStrings("", r4.value);
+}
+
+test "parseEvents flushes pending event on single trailing newline" {
+    // The Zig multiline literal below ends with one `\n` (no following blank
+    // line), so the buffer is `event: update\nid: evt-1\ndata: hello\n` —
+    // exactly the shape OpenAI/Anthropic emit for the final event of a
+    // stream. The parser must flush it; a strict W3C parser would discard.
+    // See the parseEvents docstring for the rationale.
+    const allocator = std.testing.allocator;
+    const trailing =
+        \\event: update
+        \\id: evt-1
+        \\data: hello
+        \\
+    ;
+    const events = try parseEvents(allocator, trailing);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("hello", events[0].data);
+    try std.testing.expectEqualStrings("update", events[0].event_type);
+    try std.testing.expectEqualStrings("evt-1", events[0].id);
+}
+
+test "parseEvents flushes pending event at end of buffer with no trailing newline" {
+    // No terminating `\n` at all — exercises the EOF-flush path explicitly,
+    // which the prior test does NOT (single `\n` triggers the empty-line
+    // dispatch path, not the EOF dispatch path).
+    const allocator = std.testing.allocator;
+    const partial = "event: ping\ndata: bye";
+    const events = try parseEvents(allocator, partial);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("bye", events[0].data);
+    try std.testing.expectEqualStrings("ping", events[0].event_type);
+}
+
+test "parseEvents emits [DONE] sentinel as plain data (no special handling here)" {
+    // [DONE] is an OpenAI-specific terminator. parseEvents does NOT recognize
+    // it; the recognition lives in providers/sse.zig and providers/openai_codex.zig
+    // which inspect `event.data` after parsing. This test pins the contract that
+    // this layer is content-agnostic — any future caller that adds [DONE]
+    // handling here would change the behavior other layers depend on.
+    const allocator = std.testing.allocator;
+    const stream = "data: [DONE]\n\n";
+    const events = try parseEvents(allocator, stream);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("[DONE]", events[0].data);
+    try std.testing.expectEqualStrings("", events[0].event_type);
 }

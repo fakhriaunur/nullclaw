@@ -1,12 +1,14 @@
 const std = @import("std");
+const json_util = @import("../json_util.zig");
 
 pub const START_TAG = "<nc_choices>";
 pub const END_TAG = "</nc_choices>";
-pub const MAX_OPTIONS: usize = 6;
+pub const MAX_OPTIONS: usize = 12;
 pub const MIN_OPTIONS: usize = 2;
 pub const MAX_ID_LEN: usize = 24;
 pub const MAX_LABEL_LEN: usize = 64;
 pub const MAX_SUBMIT_TEXT_LEN: usize = 256;
+pub const MAX_COLUMNS: u8 = 4;
 pub const CALLBACK_PREFIX = "nc1:";
 
 pub const ChoiceCallbackData = struct {
@@ -29,6 +31,8 @@ pub const ChoiceOption = struct {
 pub const ChoicesDirective = struct {
     version: u8 = 1,
     options: []ChoiceOption,
+    columns: u8 = 1,
+    remove_on_click: bool = true,
 
     pub fn deinit(self: *const ChoicesDirective, allocator: std.mem.Allocator) void {
         for (self.options) |opt| opt.deinit(allocator);
@@ -45,6 +49,52 @@ pub const ParsedAssistantChoices = struct {
         if (self.choices) |*choices| choices.deinit(allocator);
     }
 };
+
+fn validateRenderableOption(id: []const u8, label: []const u8, submit_text: []const u8) !void {
+    if (!isValidChoiceId(id)) return error.InvalidChoices;
+    if (label.len == 0 or label.len > MAX_LABEL_LEN) return error.InvalidChoices;
+    if (submit_text.len == 0 or submit_text.len > MAX_SUBMIT_TEXT_LEN) return error.InvalidChoices;
+}
+
+pub fn renderAssistantChoices(allocator: std.mem.Allocator, visible_text: []const u8, options_src: anytype) ![]u8 {
+    const options = switch (@typeInfo(@TypeOf(options_src))) {
+        .pointer => |ptr| switch (ptr.size) {
+            .slice => options_src,
+            .one => switch (@typeInfo(ptr.child)) {
+                .array => options_src[0..],
+                else => @compileError("options_src must be a slice or pointer to array"),
+            },
+            else => @compileError("options_src must be a slice or pointer to array"),
+        },
+        else => @compileError("options_src must be a slice or pointer to array"),
+    };
+
+    if (options.len < MIN_OPTIONS or options.len > MAX_OPTIONS) return error.InvalidChoices;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, visible_text);
+    if (visible_text.len > 0 and visible_text[visible_text.len - 1] != '\n') {
+        try out.appendSlice(allocator, "\n\n");
+    }
+    try out.appendSlice(allocator, START_TAG);
+    try out.appendSlice(allocator, "{\"v\":1,\"options\":[");
+    for (options, 0..) |option, idx| {
+        try validateRenderableOption(option.id, option.label, option.submit_text);
+        if (idx > 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, "{\"id\":");
+        try json_util.appendJsonString(&out, allocator, option.id);
+        try out.appendSlice(allocator, ",\"label\":");
+        try json_util.appendJsonString(&out, allocator, option.label);
+        try out.appendSlice(allocator, ",\"submit_text\":");
+        try json_util.appendJsonString(&out, allocator, option.submit_text);
+        try out.append(allocator, '}');
+    }
+    try out.appendSlice(allocator, "]}");
+    try out.appendSlice(allocator, END_TAG);
+    return try out.toOwnedSlice(allocator);
+}
 
 const ChoicesBlockSpan = struct {
     open_start: usize,
@@ -199,6 +249,22 @@ fn parseChoicesDirective(allocator: std.mem.Allocator, json_payload: []const u8)
     const items = options_val.array.items;
     if (items.len < MIN_OPTIONS or items.len > MAX_OPTIONS) return null;
 
+    const columns: u8 = blk: {
+        const columns_val = parsed.value.object.get("columns") orelse break :blk 1;
+        const raw = switch (columns_val) {
+            .integer => |value| value,
+            else => return null,
+        };
+        if (raw < 1 or raw > MAX_COLUMNS) return null;
+        break :blk @intCast(raw);
+    };
+
+    const remove_on_click = blk: {
+        const remove_val = parsed.value.object.get("remove_on_click") orelse break :blk true;
+        if (remove_val != .bool) return null;
+        break :blk remove_val.bool;
+    };
+
     var opts: std.ArrayListUnmanaged(ChoiceOption) = .empty;
     var completed = false;
     defer if (!completed) {
@@ -249,6 +315,8 @@ fn parseChoicesDirective(allocator: std.mem.Allocator, json_payload: []const u8)
     return .{
         .version = 1,
         .options = try opts.toOwnedSlice(allocator),
+        .columns = columns,
+        .remove_on_click = remove_on_click,
     };
 }
 
@@ -276,6 +344,21 @@ test "choices parse valid directive and strip block" {
     try std.testing.expectEqualStrings("Da", parsed.choices.?.options[0].label);
     try std.testing.expectEqualStrings("Da, sdelal", parsed.choices.?.options[0].submit_text);
     try std.testing.expectEqualStrings("Net", parsed.choices.?.options[1].submit_text); // fallback to label
+    try std.testing.expectEqual(@as(u8, 1), parsed.choices.?.columns);
+    try std.testing.expect(parsed.choices.?.remove_on_click);
+}
+
+test "choices parse accepts layout metadata" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseAssistantChoices(
+        allocator,
+        "Pick\n<nc_choices>{\"v\":1,\"columns\":3,\"remove_on_click\":false,\"options\":[{\"id\":\"a\",\"label\":\"A\"},{\"id\":\"b\",\"label\":\"B\"}]}</nc_choices>",
+    );
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.choices != null);
+    try std.testing.expectEqual(@as(u8, 3), parsed.choices.?.columns);
+    try std.testing.expect(!parsed.choices.?.remove_on_click);
 }
 
 test "choices parse invalid json returns no choices and strips block when visible text remains" {
@@ -324,7 +407,13 @@ test "choices parse rejects too many options" {
         "{\"id\":\"d\",\"label\":\"D\"}," ++
         "{\"id\":\"e\",\"label\":\"E\"}," ++
         "{\"id\":\"f\",\"label\":\"F\"}," ++
-        "{\"id\":\"g\",\"label\":\"G\"}" ++
+        "{\"id\":\"g\",\"label\":\"G\"}," ++
+        "{\"id\":\"h\",\"label\":\"H\"}," ++
+        "{\"id\":\"i\",\"label\":\"I\"}," ++
+        "{\"id\":\"j\",\"label\":\"J\"}," ++
+        "{\"id\":\"k\",\"label\":\"K\"}," ++
+        "{\"id\":\"l\",\"label\":\"L\"}," ++
+        "{\"id\":\"m\",\"label\":\"M\"}" ++
         "]}</nc_choices>";
     var parsed = try parseAssistantChoices(allocator, text);
     defer parsed.deinit(allocator);
@@ -350,6 +439,30 @@ test "choices parse rejects invalid id chars" {
     );
     defer parsed.deinit(allocator);
     try std.testing.expect(parsed.choices == null);
+}
+
+test "choices render helper round-trips through parser" {
+    const allocator = std.testing.allocator;
+    const options = [_]struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    }{
+        .{ .id = "one", .label = "One", .submit_text = "/model alpha" },
+        .{ .id = "two", .label = "Two", .submit_text = "/model beta" },
+    };
+
+    const rendered = try renderAssistantChoices(allocator, "Pick a model.", &options);
+    defer allocator.free(rendered);
+
+    var parsed = try parseAssistantChoices(allocator, rendered);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.choices != null);
+    try std.testing.expectEqualStrings("Pick a model.\n\n", parsed.visible_text);
+    try std.testing.expectEqual(@as(usize, 2), parsed.choices.?.options.len);
+    try std.testing.expectEqualStrings("/model alpha", parsed.choices.?.options[0].submit_text);
+    try std.testing.expectEqualStrings("/model beta", parsed.choices.?.options[1].submit_text);
 }
 
 test "choices callback data roundtrip" {

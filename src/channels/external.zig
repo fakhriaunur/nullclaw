@@ -4,6 +4,7 @@
 //! speak line-delimited JSON-RPC over stdio.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus_mod = @import("../bus.zig");
@@ -23,7 +24,7 @@ pub const ExternalChannel = struct {
     allocator: std.mem.Allocator,
     config: config_types.ExternalChannelConfig,
     event_bus: ?*bus_mod.Bus = null,
-    lifecycle_mutex: std.Thread.Mutex = .{},
+    lifecycle_mutex: std_compat.sync.Mutex = .{},
     rpc: stdio_jsonrpc.StdioJsonRpc,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     health_rpc_mode: std.atomic.Value(i8) = std.atomic.Value(i8).init(HEALTH_RPC_UNKNOWN),
@@ -286,7 +287,7 @@ pub const ExternalChannel = struct {
             return true;
         }
 
-        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        const now_ns: i64 = @intCast(std_compat.time.nanoTimestamp());
         if (self.last_health_probe_ns != 0 and (now_ns - self.last_health_probe_ns) < HEALTH_CHECK_CACHE_TTL_NS) {
             return self.last_health_result;
         }
@@ -665,4 +666,16 @@ test "handleInboundMessage publishes nested notification to bus with injected ac
     try std.testing.expect(msg.metadata_json != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"account_id\":\"main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"peer_kind\":\"group\"") != null);
+}
+
+test "ExternalChannel create + healthCheck + stop leaks zero bytes" {
+    // ExternalChannel holds no heap allocations at init-time.  No deinit needed.
+    // healthCheckLocked() returns false immediately when running=false and no child process.
+    var ch_struct = ExternalChannel.initFromConfig(std.testing.allocator, .{
+        .runtime_name = "test-external",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
 }

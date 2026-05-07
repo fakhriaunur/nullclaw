@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const root = @import("root.zig");
@@ -89,13 +90,13 @@ pub const IMessageChannel = struct {
     fn currentChatDbPath(self: *const IMessageChannel, allocator: std.mem.Allocator) ![]u8 {
         if (self.db_path) |path| return allocator.dupe(u8, path);
 
-        if (std.process.getEnvVarOwned(allocator, "IMESSAGE_CHAT_DB_PATH")) |env_path| {
+        if (std_compat.process.getEnvVarOwned(allocator, "IMESSAGE_CHAT_DB_PATH")) |env_path| {
             return env_path;
         } else |_| {}
 
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
+        const home = std_compat.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
         defer allocator.free(home);
-        return std.fs.path.join(allocator, &.{ home, "Library", "Messages", "chat.db" });
+        return std_compat.fs.path.join(allocator, &.{ home, "Library", "Messages", "chat.db" });
     }
 
     fn isLikelyGroupChatGuid(chat_guid: []const u8) bool {
@@ -120,7 +121,7 @@ pub const IMessageChannel = struct {
 
         const db_path = self.currentChatDbPath(self.allocator) catch return false;
         defer self.allocator.free(db_path);
-        std.fs.accessAbsolute(db_path, .{}) catch return false;
+        std_compat.fs.accessAbsolute(db_path, .{}) catch return false;
         return true;
     }
 
@@ -147,7 +148,7 @@ pub const IMessageChannel = struct {
     fn sleepWithStopCheck(self: *IMessageChannel) void {
         var slept: u64 = 0;
         while (self.running.load(.acquire) and slept < self.poll_interval_secs) {
-            std.Thread.sleep(1 * std.time.ns_per_s);
+            std_compat.thread.sleep(1 * std.time.ns_per_s);
             slept += 1;
         }
     }
@@ -164,7 +165,8 @@ pub const IMessageChannel = struct {
 
         var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer metadata_buf.deinit(self.allocator);
-        const mw = metadata_buf.writer(self.allocator);
+        var metadata_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &metadata_buf);
+        const mw = &metadata_writer.writer;
         mw.writeByte('{') catch return;
         mw.writeAll("\"account_id\":") catch return;
         root.appendJsonStringW(mw, self.account_id) catch return;
@@ -177,6 +179,7 @@ pub const IMessageChannel = struct {
             root.appendJsonStringW(mw, group_peer_id) catch return;
         }
         mw.writeByte('}') catch return;
+        metadata_buf = metadata_writer.toArrayList();
 
         const inbound = bus_mod.makeInboundFull(
             self.allocator,
@@ -335,7 +338,7 @@ pub const IMessageChannel = struct {
         const db_path = try self.currentChatDbPath(allocator);
         defer allocator.free(db_path);
 
-        std.fs.accessAbsolute(db_path, .{}) catch return &.{};
+        std_compat.fs.accessAbsolute(db_path, .{}) catch return &.{};
 
         if (!self.cursor_initialized) {
             self.last_rowid = try self.queryMaxRowId(allocator, db_path);
@@ -388,7 +391,7 @@ pub const IMessageChannel = struct {
         };
         defer self.allocator.free(script);
 
-        const result = std.process.Child.run(.{
+        const result = std_compat.process.Child.run(.{
             .allocator = self.allocator,
             .argv = &.{ "osascript", "-e", script },
         }) catch return error.IMessageSendFailed;
@@ -396,7 +399,7 @@ pub const IMessageChannel = struct {
         defer self.allocator.free(result.stderr);
 
         switch (result.term) {
-            .Exited => |code| if (code != 0) return error.IMessageSendFailed,
+            .exited => |code| if (code != 0) return error.IMessageSendFailed,
             else => return error.IMessageSendFailed,
         }
     }
@@ -563,11 +566,11 @@ fn createTestDb(allocator: std.mem.Allocator) ![]u8 {
     const tmp_dir = try platform.getTempDir(allocator);
     defer allocator.free(tmp_dir);
     const filename = try std.fmt.allocPrint(allocator, "nullclaw_imessage_{d}_{x}.db", .{
-        std.time.microTimestamp(),
-        std.crypto.random.int(u32),
+        std_compat.time.microTimestamp(),
+        std_compat.crypto.random.int(u32),
     });
     defer allocator.free(filename);
-    const path = try std.fs.path.join(allocator, &.{ tmp_dir, filename });
+    const path = try std_compat.fs.path.join(allocator, &.{ tmp_dir, filename });
 
     var db: ?*c.sqlite3 = null;
     const path_z = try allocator.dupeZ(u8, path);
@@ -744,7 +747,7 @@ test "pollMessagesFromDb parses direct message" {
     const allocator = std.testing.allocator;
     const db_path = try createTestDb(allocator);
     defer allocator.free(db_path);
-    defer std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std_compat.fs.deleteFileAbsolute(db_path) catch {};
 
     try insertTestMessage(allocator, db_path, 1, "+1234567890", "hello", false, null);
 
@@ -767,7 +770,7 @@ test "pollMessagesFromDb parses group chat and uses chat reply target" {
     const allocator = std.testing.allocator;
     const db_path = try createTestDb(allocator);
     defer allocator.free(db_path);
-    defer std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std_compat.fs.deleteFileAbsolute(db_path) catch {};
 
     try insertTestMessage(allocator, db_path, 2, "+1234567890", "group hello", false, "chat12345");
 
@@ -789,7 +792,7 @@ test "pollMessages initializes cursor and skips backlog on first call" {
     const allocator = std.testing.allocator;
     const db_path = try createTestDb(allocator);
     defer allocator.free(db_path);
-    defer std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std_compat.fs.deleteFileAbsolute(db_path) catch {};
 
     try insertTestMessage(allocator, db_path, 10, "+1234567890", "old", false, null);
 
@@ -913,4 +916,26 @@ test "imessage publishInboundMessage emits direct session key and dm metadata" {
     try std.testing.expect(meta.value.object.get("is_dm").?.bool);
     try std.testing.expect(!meta.value.object.get("is_group").?.bool);
     try std.testing.expect(meta.value.object.get("channel_id") == null);
+}
+
+test "IMessageChannel create + healthCheck + stop leaks zero bytes" {
+    // IMessageChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = IMessageChannel.initFromConfig(std.testing.allocator, .{});
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "IMessageChannel start + stop under is_test leaks zero bytes" {
+    // vtableStart has `if (builtin.is_test) return;` — no poll thread is
+    // spawned.  Double stop must be idempotent per Channel contract
+    // (poll_thread stays null, so the join path is never reached).
+    var ch_struct = IMessageChannel.initFromConfig(std.testing.allocator, .{});
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
 }

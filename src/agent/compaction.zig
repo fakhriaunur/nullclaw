@@ -4,11 +4,14 @@
 //! passed by the caller; no dependency on the Agent struct.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
+const fs_compat = @import("../fs_compat.zig");
 const log = std.log.scoped(.agent);
 const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
 const path_prefix = @import("../path_prefix.zig");
+const util = @import("../util.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 const bootstrap_mod = @import("../bootstrap/root.zig");
@@ -97,10 +100,12 @@ pub fn autoCompactHistory(
     if (!count_trigger and !token_trigger) return false;
 
     const keep_recent = @min(config.keep_recent, @as(u32, @intCast(non_system_count)));
-    const compact_count = non_system_count - keep_recent;
+    var compact_count = non_system_count - keep_recent;
     if (compact_count == 0) return false;
 
-    const compact_end = start + compact_count;
+    const compact_end = adjustKeepStartForToolResultPair(history.items, start, start + compact_count);
+    compact_count = compact_end - start;
+    if (compact_count == 0) return false;
 
     // Multi-part strategy: if >10 messages to summarize, split into halves
     const summary = if (compact_count > 10) blk: {
@@ -123,7 +128,7 @@ pub fn autoCompactHistory(
 
         // Truncate if too long
         if (merged.len > config.max_summary_chars) {
-            const truncated = try allocator.dupe(u8, merged[0..config.max_summary_chars]);
+            const truncated = try allocator.dupe(u8, util.truncateUtf8(merged, config.max_summary_chars));
             allocator.free(merged);
             break :blk truncated;
         }
@@ -165,8 +170,22 @@ pub fn autoCompactHistory(
     return true;
 }
 
+fn adjustKeepStartForToolResultPair(
+    history: []const OwnedMessage,
+    start: usize,
+    keep_start: usize,
+) usize {
+    var adjusted = keep_start;
+    while (adjusted > start and adjusted < history.len and history[adjusted].role == .tool) {
+        adjusted -= 1;
+    }
+    return adjusted;
+}
+
 /// Force-compress history for context exhaustion recovery.
-/// Keeps system prompt (if any) + last CONTEXT_RECOVERY_KEEP messages.
+/// Keeps system prompt (if any) + last CONTEXT_RECOVERY_KEEP messages. If the
+/// keep window would start with a tool result, it is extended backward so the
+/// result is not orphaned from the assistant turn that produced it.
 /// Everything in between is dropped without LLM summarization (we can't call
 /// the LLM since the context is exhausted). Returns true if compression was performed.
 pub fn forceCompressHistory(
@@ -179,7 +198,12 @@ pub fn forceCompressHistory(
 
     if (non_system_count <= CONTEXT_RECOVERY_KEEP) return false;
 
-    const keep_start = history.items.len - CONTEXT_RECOVERY_KEEP;
+    const keep_start = adjustKeepStartForToolResultPair(
+        history.items,
+        start,
+        history.items.len - CONTEXT_RECOVERY_KEEP,
+    );
+    if (keep_start == start) return false;
     const to_remove = keep_start - start;
 
     // Free messages being removed
@@ -211,7 +235,10 @@ pub fn trimHistory(
 
     if (non_system_count <= max) return;
 
-    const to_remove = non_system_count - max;
+    var to_remove = non_system_count - max;
+    const keep_start = adjustKeepStartForToolResultPair(history.items, start, start + to_remove);
+    to_remove = keep_start - start;
+    if (to_remove == 0) return;
     // Free the messages being removed
     for (history.items[start .. start + to_remove]) |*msg| {
         msg.deinit(allocator);
@@ -253,7 +280,7 @@ fn buildCompactionTranscript(
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, ": ");
         // Truncate very long messages in transcript
-        const content = if (msg.content.len > 500) msg.content[0..500] else msg.content;
+        const content = if (msg.content.len > 500) util.truncateUtf8(msg.content, 500) else msg.content;
         try buf.appendSlice(allocator, content);
         try buf.append(allocator, '\n');
 
@@ -262,7 +289,7 @@ fn buildCompactionTranscript(
     }
 
     if (buf.items.len > max_source_chars) {
-        buf.items.len = max_source_chars;
+        buf.items.len = util.truncateUtf8(buf.items, max_source_chars).len;
     }
 
     return buf.toOwnedSlice(allocator);
@@ -306,7 +333,7 @@ fn summarizeSlice(
     ) catch {
         // Fallback: use a local truncation of the transcript
         const max_len = @min(transcript.len, config.max_summary_chars);
-        return try allocator.dupe(u8, transcript[0..max_len]);
+        return try allocator.dupe(u8, util.truncateUtf8(transcript, max_len));
     };
     // Free response's heap-allocated fields after extracting what we need
     defer {
@@ -328,7 +355,7 @@ fn summarizeSlice(
 
     const raw_summary = summary_resp.contentOrEmpty();
     const max_len = @min(raw_summary.len, config.max_summary_chars);
-    return try allocator.dupe(u8, raw_summary[0..max_len]);
+    return try allocator.dupe(u8, util.truncateUtf8(raw_summary, max_len));
 }
 
 const HeadingInfo = struct {
@@ -337,7 +364,7 @@ const HeadingInfo = struct {
 };
 
 fn parseHeadingLine(line: []const u8) ?HeadingInfo {
-    const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+    const trimmed_left = std.mem.trimStart(u8, line, " \t");
     if (trimmed_left.len < 4) return null;
 
     var level: u8 = 0;
@@ -384,7 +411,7 @@ fn extractNamedSection(
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
-        const left_trimmed = std.mem.trimLeft(u8, line, " \t");
+        const left_trimmed = std.mem.trimStart(u8, line, " \t");
         if (std.mem.startsWith(u8, left_trimmed, "```")) {
             in_code_block = !in_code_block;
             if (in_section) {
@@ -462,21 +489,21 @@ fn extractSections(
 fn openWorkspaceAgentsFileGuarded(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
-) ?std.fs.File {
-    const workspace_root = std.fs.cwd().realpathAlloc(allocator, workspace_dir) catch return null;
+) ?std_compat.fs.File {
+    const workspace_root = fs_compat.realpathAllocPath(allocator, workspace_dir) catch return null;
     defer allocator.free(workspace_root);
 
-    const agents_candidate = std.fs.path.join(allocator, &.{ workspace_root, "AGENTS.md" }) catch return null;
+    const agents_candidate = std_compat.fs.path.join(allocator, &.{ workspace_root, "AGENTS.md" }) catch return null;
     defer allocator.free(agents_candidate);
 
-    const agents_canonical = std.fs.cwd().realpathAlloc(allocator, agents_candidate) catch |err| switch (err) {
+    const agents_canonical = fs_compat.realpathAllocPath(allocator, agents_candidate) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return null,
     };
     defer allocator.free(agents_canonical);
 
     if (!pathStartsWith(agents_canonical, workspace_root)) return null;
-    return std.fs.openFileAbsolute(agents_canonical, .{}) catch null;
+    return std_compat.fs.openFileAbsolute(agents_canonical, .{}) catch null;
 }
 
 fn readWorkspaceContextForSummary(
@@ -494,7 +521,7 @@ fn readWorkspaceContextForSummary(
             if (sections.len == 0) return try allocator.dupe(u8, "");
 
             const safe_content = if (sections.len > MAX_WORKSPACE_CONTEXT_CHARS)
-                try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{sections[0..MAX_WORKSPACE_CONTEXT_CHARS]})
+                try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{util.truncateUtf8(sections, MAX_WORKSPACE_CONTEXT_CHARS)})
             else
                 try allocator.dupe(u8, sections);
             defer allocator.free(safe_content);
@@ -521,7 +548,7 @@ fn readWorkspaceContextForSummary(
     if (sections.len == 0) return try allocator.dupe(u8, "");
 
     const safe_content = if (sections.len > MAX_WORKSPACE_CONTEXT_CHARS)
-        try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{sections[0..MAX_WORKSPACE_CONTEXT_CHARS]})
+        try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{util.truncateUtf8(sections, MAX_WORKSPACE_CONTEXT_CHARS)})
     else
         try allocator.dupe(u8, sections);
     defer allocator.free(safe_content);
@@ -630,6 +657,104 @@ test "autoCompactHistory no-op below count and token thresholds" {
     try std.testing.expectEqual(@as(usize, 2), agent.history.items.len);
 }
 
+test "autoCompactHistory does not orphan leading tool result" {
+    const SummarizingProvider = struct {
+        const Self = @This();
+
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .content = try allocator.dupe(u8, "auto summary"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "summarizing-test-provider";
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SummarizingProvider.chatWithSystem,
+        .chat = SummarizingProvider.chat,
+        .supportsNativeTools = SummarizingProvider.supportsNativeTools,
+        .getName = SummarizingProvider.getName,
+        .deinit = SummarizingProvider.deinit,
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = SummarizingProvider{};
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+    var agent = try makeTestAgent(allocator);
+    agent.provider = provider;
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..7) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "filler-{d}", .{i}),
+        });
+    }
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "assistant tool-call"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, "tool result"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "after tool"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "final reply"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "next prompt"),
+    });
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .keep_recent = 4,
+        .max_history_messages = 4,
+        .workspace_dir = null,
+    });
+
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 7), agent.history.items.len);
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[1].content, "[Compaction summary]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[1].content, "auto summary") != null);
+    try std.testing.expect(agent.history.items[2].role == .assistant);
+    try std.testing.expectEqualStrings("assistant tool-call", agent.history.items[2].content);
+    try std.testing.expect(agent.history.items[3].role == .tool);
+    try std.testing.expectEqualStrings("tool result", agent.history.items[3].content);
+    try std.testing.expectEqualStrings("next prompt", agent.history.items[6].content);
+}
+
 test "DEFAULT_TOKEN_LIMIT constant" {
     try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, DEFAULT_TOKEN_LIMIT);
 }
@@ -661,6 +786,100 @@ test "forceCompressHistory keeps system + last 4 messages" {
     try std.testing.expectEqualStrings("system prompt", agent.history.items[0].content);
     try std.testing.expectEqualStrings("msg-4", agent.history.items[1].content);
     try std.testing.expectEqualStrings("msg-7", agent.history.items[4].content);
+}
+
+test "forceCompressHistory does not orphan leading tool result" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..7) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "filler-{d}", .{i}),
+        });
+    }
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "assistant tool-call"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, "tool result"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "after tool"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "final reply"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "next prompt"),
+    });
+
+    const compressed = forceCompressHistory(allocator, &agent.history);
+    try std.testing.expect(compressed);
+
+    try std.testing.expectEqual(@as(usize, 6), agent.history.items.len);
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expectEqualStrings("assistant tool-call", agent.history.items[1].content);
+    try std.testing.expect(agent.history.items[2].role == .tool);
+    try std.testing.expectEqualStrings("tool result", agent.history.items[2].content);
+    try std.testing.expectEqualStrings("next prompt", agent.history.items[5].content);
+}
+
+test "trimHistory does not orphan leading tool result" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..7) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "filler-{d}", .{i}),
+        });
+    }
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "assistant tool-call"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, "tool result"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "after tool"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "final reply"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "next prompt"),
+    });
+
+    trimHistory(allocator, &agent.history, 4);
+
+    try std.testing.expectEqual(@as(usize, 6), agent.history.items.len);
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expectEqualStrings("assistant tool-call", agent.history.items[1].content);
+    try std.testing.expect(agent.history.items[2].role == .tool);
+    try std.testing.expectEqualStrings("tool result", agent.history.items[2].content);
 }
 
 test "forceCompressHistory without system prompt" {
@@ -746,7 +965,7 @@ test "readWorkspaceContextForSummary wraps AGENTS critical sections" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{});
         defer f.close();
         try f.writeAll(
             \\## Session Startup
@@ -758,7 +977,7 @@ test "readWorkspaceContextForSummary wraps AGENTS critical sections" {
         );
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
@@ -773,7 +992,7 @@ test "readWorkspaceContextForSummary returns empty when AGENTS missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
@@ -790,7 +1009,7 @@ test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    try outside_tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(outside_tmp.dir).writeFile(.{
         .sub_path = "outside-agents.md",
         .data =
         \\## Session Startup
@@ -801,18 +1020,39 @@ test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
         ,
     });
 
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
-    const outside_agents = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
+    const outside_agents = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
     defer std.testing.allocator.free(outside_agents);
 
-    try ws_tmp.dir.symLink(outside_agents, "AGENTS.md", .{});
+    try @import("compat").fs.Dir.wrap(ws_tmp.dir).symLink(outside_agents, "AGENTS.md", .{});
 
-    const workspace = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
     defer std.testing.allocator.free(context);
 
     try std.testing.expectEqual(@as(usize, 0), context.len);
+}
+
+test "buildCompactionTranscript keeps UTF-8 valid when truncating long message content" {
+    const allocator = std.testing.allocator;
+    const prefix = try allocator.alloc(u8, 499);
+    defer allocator.free(prefix);
+    @memset(prefix, 'a');
+
+    // Regression: the 500-byte message cap must not split the emoji below.
+    const content = try std.fmt.allocPrint(allocator, "{s}\xf0\x9f\x98\x80tail", .{prefix});
+    defer allocator.free(content);
+
+    const history = [_]OwnedMessage{
+        .{ .role = .user, .content = content },
+    };
+
+    const transcript = try buildCompactionTranscript(allocator, &history, 0, history.len, 4_096);
+    defer allocator.free(transcript);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(transcript));
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "tail") == null);
 }

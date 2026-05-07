@@ -15,6 +15,7 @@ Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](ht
 
 <p align="center">
   <a href="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/nullclaw/nullclaw/actions/workflows/nightly.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/nightly.yml/badge.svg" alt="Nightly" /></a>
   <a href="https://nullclaw.github.io"><img src="https://img.shields.io/badge/docs-nullclaw.github.io-informational" alt="Documentation" /></a>
   <a href="https://discord.gg/Bfmdua22Ud"><img src="https://img.shields.io/badge/discord-join%20community-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
@@ -118,9 +119,9 @@ nullclaw --help
 
 ### 2) Build from source
 
-> **Prerequisite:** use **Zig 0.15.2** (exact version).
-> `0.16.0-dev` and other Zig versions are currently unsupported and may fail to build.
-> Verify before building: `zig version` should print `0.15.2`.
+> **Prerequisite:** use **Zig 0.16.0** (exact version).
+> Other Zig versions are currently unsupported and may fail to build.
+> Verify before building: `zig version` should print `0.16.0`.
 
 ```bash
 git clone https://github.com/nullclaw/nullclaw.git
@@ -196,6 +197,10 @@ nullclaw channel start signal
 # Linux supports systemd user services and OpenRC
 nullclaw service install
 nullclaw service status
+
+# Optional secret injection hook for service mode:
+# if ~/.nullclaw/service-env is executable, the installed service launcher runs it
+# before starting `nullclaw gateway` (for example via dotenvx or sops)
 
 # Migrate memory from OpenClaw
 nullclaw migrate openclaw --dry-run
@@ -619,6 +624,7 @@ Use this when you want full web-search provider control plus unrestricted shell 
     "allowed_commands": ["*"],
     "allowed_paths": ["*"],
     "require_approval_for_medium_risk": false,
+    "block_medium_risk_commands": false,
     "block_high_risk_commands": false
   }
 }
@@ -632,6 +638,7 @@ Use this when you want full web-search provider control plus unrestricted shell 
 - `allowed_commands` entries support `"cmd"`, `"cmd *"`, and `"*"` formats.
   - `"cmd"` and `"cmd *"` both allow that command family at the allowlist stage.
   - `"*"` allows any command at the allowlist stage.
+- High-risk and medium-risk runtime gates still apply after the allowlist check; set `block_medium_risk_commands: false` when you intentionally allow network/transfer commands such as `curl`/`wget` or other medium-risk mutations.
 - `allowed_paths: ["*"]` allows access outside workspace, except system-protected paths.
 
 ### Web UI / Browser Relay
@@ -664,6 +671,7 @@ Use `channels.web` for browser UI events (WebChannel v1):
   - `"token"` (local transport only): include `auth_token` in each `user_message` payload (`access_token` is also accepted for compatibility).
 - `auth_token` hardens the WebSocket upgrade and becomes required when binding non-loopback addresses.
 - Unauthenticated WebSocket upgrade is loopback-only. Pairing-first local UX works on `127.0.0.1`, but a public/LAN bind must authenticate the `/ws` upgrade on the first hop with `?token=<auth_token>` or `Authorization: Bearer <auth_token>`.
+- Local loopback pairing no longer depends on a fixed shared code. `pairing_request` may omit `payload.pairing_code`, and legacy loopback clients that still send `123456` remain compatible.
 - `/ws` is the WebSocket endpoint. `/pair` belongs to the HTTP gateway API and is not part of the web channel handshake.
 - Remote/headless host: if you bind `"listen": "0.0.0.0"`, prefer a stable configured token plus `message_auth_mode: "token"` behind TLS/reverse proxy, or keep loopback bind and expose it through SSH tunnel/proxy.
 - UI/extension should live in a separate repository and connect via this WebSocket endpoint.
@@ -740,7 +748,8 @@ Enable in `~/.nullclaw/config.json`:
 
 ```bash
 # 1. Get a bearer token
-TOKEN=$(curl -s -X POST -H "X-Pairing-Code: 123456" http://localhost:3000/pair | jq -r .token)
+# Set PAIRING_CODE to the one-time code for this gateway session.
+TOKEN=$(curl -s -X POST -H "X-Pairing-Code: $PAIRING_CODE" http://localhost:3000/pair | jq -r .token)
 
 # 2. Discover the agent
 curl http://localhost:3000/.well-known/agent-card.json
@@ -766,14 +775,14 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
 | `service install\|start\|stop\|restart\|status\|uninstall` | Manage background service |
 | `doctor` | Diagnose system health |
-| `status` | Show full system status |
-| `channel list\|start\|status\|add\|remove` | Manage channels |
-| `cron list\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
-| `skills list\|install\|remove\|info` | Manage skill packs |
+| `status [--json]` | Show full system status or emit the machine-readable runtime snapshot |
+| `channel list\|info\|start\|status\|add\|remove` | Manage channels, including JSON account inventory for automation |
+| `cron list\|status\|add\|add-agent\|once\|once-agent\|remove\|pause\|resume\|run\|update\|runs` | Manage scheduled tasks |
+| `skills list\|install\|remove\|info` | Manage skill packs, including `install --name <query>` registry search |
 | `history list\|show` | View session conversation history |
 | `memory stats\|count\|reindex\|search\|get\|list\|drain-outbox\|forget` | Inspect and maintain memory |
 | `hardware scan\|flash\|monitor` | Hardware device management |
-| `models list\|info\|benchmark\|refresh` | Model catalog |
+| `config show\|get`, `models list\|summary\|info\|benchmark\|refresh` | Read config/model admin state and manage the model catalog |
 | `workspace edit\|reset-md` | Maintain workspace markdown/bootstrap files |
 | `capabilities [--json]` | Show runtime capabilities manifest |
 | `auth login\|status\|logout` | Manage OAuth authentication |
@@ -782,7 +791,7 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 
 ## Development
 
-Build and tests are pinned to **Zig 0.15.2**.
+Build and tests are pinned to **Zig 0.16.0**.
 
 ```bash
 zig build                          # Dev build
@@ -803,7 +812,7 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 ### Project Stats
 
 ```
-Language:     Zig 0.15.2
+Language:     Zig 0.16.0
 Source files: ~250
 Lines of code: ~249,000
 Tests:        5,300+
@@ -860,7 +869,7 @@ Implement a vtable interface, submit a PR:
 - New `Tunnel` -> `src/tunnel.zig`
 - New `Sandbox` backend -> `src/security/`
 - New `Peripheral` -> `src/peripherals.zig`
-- New `Skill` -> `~/.nullclaw/workspace/skills/<name>/`
+- New `Skill` -> `~/.nullclaw/workspace/skills/<name>/` or `~/.nullclaw/workspace/skills/<category>/<name>/`
 
 ## Chinese Docs (中文文档)
 
